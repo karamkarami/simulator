@@ -10,6 +10,11 @@ nOut = size(x, 3) - L + 1;
 y = 0;
 for l = 1:L
     w = coeffs(staggerIdx(1:nOut), l);                      % weight l of every output
-    y = y + x(:, :, l:l+nOut-1) .* reshape(w, 1, 1, nOut);
+    if all(w == w(1))
+        w = w(1);                                           % fixed PRF: one weight (faster)
+    else
+        w = reshape(w, 1, 1, nOut);
+    end
+    y = y + x(:, :, l:l+nOut-1) .* w;
 end
 end

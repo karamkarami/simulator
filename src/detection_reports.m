@@ -2,7 +2,8 @@ function rep = detection_reports(dets, P, sys, wv, info)
 %DETECTION_REPORTS  Convert pruned CFAR detections to physical quantities.
 %   rep = DETECTION_REPORTS(dets, P, sys, wv, info) returns a struct array with
 %   range, radial velocity (ambiguous, + = away), elevation (interpolated
-%   between adjacent beams), azimuth and time of the CPI centre and the SNR.
+%   between adjacent beams; NaN without beamforming), azimuth and time of the
+%   CPI centre and the SNR.
 %   The SNR uses the noise floor of the beam (median of its range-Doppler map
 %   scaled to the mean), which, unlike the CFAR noise estimate, is not raised
 %   by the range sidelobes of strong targets.

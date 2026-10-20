@@ -34,12 +34,12 @@ clut.rho = ampRms .* (randn(nAz, nR) + 1j*randn(nAz, nR)) / sqrt(2);
 clut.fd_Hz = 2*cc.icmStd_mps/sys.lambda * randn(nAz, nR); % internal clutter motion
 
 % IF transmit waveforms at the ADC rate and their FFTs (for the fast convolution)
-names = {'long', 'short'};
+names = {'short', 'long'};
 for i = 1:2
     wv = sys.wave.(names{i});
     nTx = round(wv.width_s * fs);
     t   = (0:nTx-1)' / fs;
-    tx  = waveform_envelope(wv, t) .* exp(1j*2*pi*wv.fIF_Hz*t);
+    tx  = waveform_envelope(wv, t) .* exp(1j*2*pi*sys.fIF*t);
     nFft = 2^nextpow2(sys.nAdc + nTx - 1);
     clut.(names{i}).nTx    = nTx;
     clut.(names{i}).nFft   = nFft;

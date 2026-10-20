@@ -4,16 +4,18 @@ function results = run_radar_sim(cfg)
 %   results = RUN_RADAR_SIM()    runs the simulation with radar_config().
 %   results = RUN_RADAR_SIM(cfg) runs it with a modified configuration.
 %
-%   Processing chain of every PRI (one long + one short sub-pulse):
-%     1. Signal generation : target echoes + ground clutter + noise at the IF,
-%                            48 elements, fs = 120 MHz, 16-bit ADC (12.7 ENOB)
+%   Processing chain of every PRI (a short and then a long sub-pulse):
+%     1. Signal generation : target echoes + ground clutter + noise on the 30 MHz
+%                            IF, 48 elements, fs = 120 MHz, 16-bit ADC (12.7 ENOB)
 %     2. Recording         : raw ADC data of every PRI -> <rawFolder>/pulse_<n>.mat
-%                            (optional UDP streaming)
-%     3. DDC               : two stages, decimation 10 and 6 (valid convolutions)
-%     4. DBF               : 48 elements -> 21 elevation beams
+%     3. DDC               : I/Q mixer (cos / -sin 30 MHz), two filter stages with
+%                            decimation 10 and 6 (valid convolutions)
+%                            (optional UDP streaming of the DDC output)
+%     4. DBF               : 48 elements -> 21 elevation beams (off for 1 element)
 %     5. Matched filter    : per beam (valid convolution, Taylor window for LFM)
-%     6. CPI buffers       : circular buffers holding the pulses of one beamwidth
-%     7. MTI + Doppler     : 3-pulse canceller + 32-point FFT (fixed PRF), or
+%     6. CPI buffers       : circular buffers holding the pulses of one CPI (the
+%                            time a target stays in the 3 dB azimuth beam)
+%     7. MTI + Doppler     : 3-pulse canceller + FFT over the CPI (fixed PRF), or
 %                            stagger MTI + de-interleaving + FFT + NCI (staggered PRF)
 %     8. 2-D CFAR          : on every range-Doppler map
 %     9. Pruning           : local peaks only, then azimuth peak picking (plots)
@@ -34,7 +36,7 @@ sched = pulse_schedule(sys);
 names = {'short', 'long'};
 if cfg.sim.verbose
     print_summary(sys, sched);
-    results.budget = print_snr_budget(sys, cfg.targets, 0);
+    results.budget = print_snr_budget(sys, cfg.targets);
 end
 
 clut = [];
@@ -99,21 +101,28 @@ for k = 1:sched.nPulses
     end
     adcData = adc_sample(generate_rx_signal(sys, cfg.targets, t, az, clutterIf), sys);
 
-    % 2) Raw data recording and streaming
+    % 2) Raw data recording
     hdr = pulse_header(sys, sched, k);
     if cfg.io.saveRaw
         save_pulse_file(cfg.io.rawFolder, cfg.io.matFormat, hdr, adcData);
     end
+
+    % 3) DDC of the whole record (both sub-pulses) and streaming of its output
+    bb = ddc(adcData, sys);                             % [nDdc x nElements]
     if ~isempty(udp)
-        udp_send_pulse(udp, hdr, adcData);
+        udp_send_pulse(udp, hdr, bb);
     end
 
-    % 3-9) Processing chain, separately for the short and the long sub-pulse
+    % 4-9) Processing chain, separately for the short and the long sub-pulse
     for i = 1:2
         p  = names{i};
         wv = sys.wave.(p);
-        bb = ddc(adcData, sys, wv);                    % [nSamples x nElements]
-        bm = digital_beamforming(bb, sys.dbf.W);        % [nBeams x nDdc]
+        seg = bb(wv.ddcIdx, :);                         % DDC samples of this sub-pulse
+        if sys.dbf.enabled
+            bm = digital_beamforming(seg, sys.dbf.W);   % [nBeams x nSamples]
+        else
+            bm = seg.';                                 % single element: no beamforming
+        end
         rp = matched_filter(bm, wv);                    % [nBeams x nRange]
         if k == cfg.display.rangeProfilePulse
             plot_range_profile(rp, wv, cfg.display.rangeProfileAxis);
@@ -168,7 +177,7 @@ end
 end
 
 function hdr = pulse_header(sys, sched, k)
-% Information stored with the raw data of PRI k.
+% Information stored with the raw data of PRI k (and sent with its DDC output).
 hdr.pulseNumber    = k;
 hdr.scanNumber     = sched.scan(k);
 hdr.time_s         = sched.time_s(k);
@@ -176,30 +185,36 @@ hdr.antennaAz_deg  = sched.az_deg(k);
 hdr.pri_s          = sched.pri_s(k);
 hdr.staggerIndex   = sched.staggerIdx(k);
 hdr.fs_Hz          = sys.fs;
-hdr.rxStart_s      = sys.rxStart_s;
+hdr.fIF_Hz         = sys.fIF;
 hdr.fc_Hz          = sys.cfg.fc;
+hdr.rxStart_s      = sys.rxStart_s;                  % time of the first ADC sample in the PRI
+hdr.shortTx_s      = [sys.wave.short.tTx_s, sys.wave.short.width_s];   % [start width]
 hdr.longTx_s       = [sys.wave.long.tTx_s,  sys.wave.long.width_s];
-hdr.shortTx_s      = [sys.wave.short.tTx_s, sys.wave.short.width_s];
-hdr.longIF_Hz      = sys.wave.long.fIF_Hz;
-hdr.shortIF_Hz     = sys.wave.short.fIF_Hz;
+hdr.ddcFs_Hz       = sys.fsOut;
+hdr.ddcT0_s        = sys.tDdc(1);                    % time of the first DDC sample in the PRI
+hdr.shortDdcIdx    = sys.wave.short.ddcIdx([1 end]); % DDC samples of the short pulse [first last]
+hdr.longDdcIdx     = sys.wave.long.ddcIdx([1 end]);
 end
 
 function print_summary(sys, sched)
 % Short description of the simulated radar.
 cfg = sys.cfg;
 fprintf('\n=== Rotating search radar simulation ===\n');
-fprintf('fc = %.2f GHz, Pt = %.0f kW, NF = %.1f dB, %d elements -> %d beams\n', cfg.fc/1e9, ...
-    cfg.tx.peakPower_W/1e3, cfg.rx.noiseFigure_dB, sys.nCh, sys.nBeams);
+if sys.dbf.enabled, dbfText = sprintf('%d beams', sys.nBeams); else, dbfText = 'no beamforming'; end
+fprintf('fc = %.2f GHz, Pt = %.0f kW, NF = %.1f dB, %d element(s) -> %s\n', cfg.fc/1e9, ...
+    cfg.tx.peakPower_W/1e3, cfg.rx.noiseFigure_dB, sys.nCh, dbfText);
 fprintf('PRF mode: %s, mean PRI = %.0f us, %d rpm, azimuth beamwidth %.2f deg\n', cfg.prf.mode, ...
     mean(sys.pri)*1e6, cfg.ant.rpm, sys.ant.azBeamwidth_deg);
-fprintf('Receive window: %.1f ... %.1f us (%d ADC samples, %.1f MB per PRI)\n', sys.rxStart_s*1e6, ...
-    sys.tAdc(end)*1e6, sys.nAdc, sys.nAdc*sys.nCh*2/2^20);
-fprintf('Long  pulse: %s %3.0f us, IF %.0f MHz, range %.2f ... %.2f km (%d cells)\n', sys.wave.long.type, ...
-    sys.wave.long.width_s*1e6, sys.wave.long.fIF_Hz/1e6, sys.wave.long.range_m([1 end])/1e3, sys.wave.long.nRange);
-fprintf('Short pulse: %s %3.0f us, IF %.0f MHz, range %.2f ... %.2f km (%d cells)\n', sys.wave.short.type, ...
-    sys.wave.short.width_s*1e6, sys.wave.short.fIF_Hz/1e6, sys.wave.short.range_m([1 end])/1e3, sys.wave.short.nRange);
-fprintf('CPI: %d pulses = %d row(s) x %d samples, FFT %d, Doppler bin %.2f m/s, unambiguous +-%.1f m/s\n', ...
-    sys.cpi.length, sys.cpi.nRows, sys.cpi.rowLen, sys.dop.nfft, abs(diff(sys.dop.v_mps(1:2))), ...
+fprintf('ADC record: %.1f ... %.1f us of the PRI, IF %.0f MHz (%d samples, %.1f MB per PRI)\n', ...
+    sys.rxStart_s*1e6, sys.tAdc(end)*1e6, sys.fIF/1e6, sys.nAdc, sys.nAdc*sys.nCh*2/2^20);
+names = {'short', 'long'};
+for i = 1:2
+    wv = sys.wave.(names{i});
+    fprintf('%-5s pulse: %s %3.0f us at t = %3.0f us, range %.2f ... %.2f km (%d cells)\n', wv.name, wv.type, ...
+        wv.width_s*1e6, wv.tTx_s*1e6, wv.range_m([1 end])/1e3, wv.nRange);
+end
+fprintf('CPI: %.1f ms in the beam -> %d pulses = %d row(s) x %d samples, FFT %d, Doppler bin %.2f m/s, unambiguous +-%.1f m/s\n', ...
+    sys.cpi.time_s*1e3, sys.cpi.length, sys.cpi.nRows, sys.cpi.rowLen, sys.dop.nfft, abs(diff(sys.dop.v_mps(1:2))), ...
     sys.lambda/(4*sys.dop.rowPri_s));
 fprintf('CFAR: Pfa = %.0e, %d training cells, %.1f looks, alpha = %.2f (%.1f dB)\n', cfg.cfar.pfa, ...
     sys.cfar.nTrain, sys.dop.nLooks, sys.cfar.alpha, 10*log10(sys.cfar.alpha));

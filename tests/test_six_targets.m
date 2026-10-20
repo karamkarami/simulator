@@ -1,12 +1,13 @@
-function [ok, results] = test_six_targets(prfMode, clutterOn)
+function [ok, results] = test_six_targets(prfMode, clutterOn, keepRaw)
 %TEST_SIX_TARGETS  End-to-end test: six targets around the radar must be detected.
 %
-%   [ok, results] = TEST_SIX_TARGETS(prfMode, clutterOn) runs one antenna scan
+%   [ok, results] = TEST_SIX_TARGETS(prfMode, clutterOn, keepRaw) runs one antenna scan
 %   with the six targets of six_targets_scenario.m (RCS 0.5 ... 10 m^2,
 %   8 ... 46 km, radial speeds up to 290 m/s) and checks that every target
 %   gives a plot with the right range, azimuth, elevation and (ambiguous)
 %   radial velocity. prfMode is 'fixed' (default) or 'staggered'; clutterOn
-%   (default true) switches the ground clutter on.
+%   (default true) switches the ground clutter on; keepRaw = false (default
+%   true) deletes the raw files after they have been checked.
 %
 %   To save time only the azimuth sectors around the targets are simulated
 %   (cfg.sim.sectors_deg); time and antenna rotation still run over the whole
@@ -15,6 +16,7 @@ function [ok, results] = test_six_targets(prfMode, clutterOn)
 
 if nargin < 1, prfMode = 'fixed'; end
 if nargin < 2, clutterOn = true; end
+if nargin < 3, keepRaw = true; end
 root = fileparts(fileparts(mfilename('fullpath')));
 addpath(root, fullfile(root, 'src'));
 
@@ -27,7 +29,10 @@ cfg.targets        = six_targets_scenario();
 cfg.io.outFolder   = fullfile(root, 'output', ['test_' prfMode]);
 cfg.io.rawFolder   = fullfile(cfg.io.outFolder, 'raw_pulses');
 cfg.display.visible = ~isempty(get(0, 'ScreenSize')) && usejava('awt');
-cfg.sim.sectors_deg = target_sectors(cfg);
+cfg.sim.sectors_deg = target_sectors(setup_radar(cfg), cfg.targets);
+if exist(cfg.io.rawFolder, 'dir')
+    delete(fullfile(cfg.io.rawFolder, 'pulse_*.mat'));    % only count the files of this run
+end
 
 %% Run
 results = run_radar_sim(cfg);
@@ -53,8 +58,9 @@ for i = 1:numel(cfg.targets)
         vSpan = wv.lambda_m / (2*sys.dop.rowPri_s);                 % unambiguous velocity span
         vFold = fold_velocity(vr, vSpan);
         dv = abs(mod(p.vr_mps - vFold + vSpan/2, vSpan) - vSpan/2);
+        elOk = isnan(p.el_deg) || abs(p.el_deg - el) < gate.el_deg;   % no elevation without DBF
         match = abs(p.range_m - R) < gate.range_m && abs(wrap180(p.az_deg - az)) < gate.az_deg ...
-             && abs(p.el_deg - el) < gate.el_deg && dv < gate.vrBins*vSpan/sys.dop.nfft;
+             && elOk && dv < gate.vrBins*vSpan/sys.dop.nfft;
         if match
             used(j) = true;
             if best == 0 || p.snr_dB > plots(best).snr_dB
@@ -88,31 +94,19 @@ if nFalse > 2
     ok = false;
 end
 
-%% Raw data files
+%% Raw data files: one per simulated PRI, named by the pulse number
 files = dir(fullfile(cfg.io.rawFolder, 'pulse_*.mat'));
 raw = load(fullfile(cfg.io.rawFolder, files(end).name));
-rawOk = numel(files) >= results.nProcessed && isa(raw.adcData, 'int16') ...
-     && isequal(size(raw.adcData), [sys.nAdc sys.nCh]) && isfield(raw.hdr, 'antennaAz_deg');
+rawOk = numel(files) == results.nProcessed && isa(raw.adcData, 'int16') ...
+     && isequal(size(raw.adcData), [sys.nAdc sys.nCh]) ...
+     && strcmp(files(end).name, sprintf('pulse_%07d.mat', raw.hdr.pulseNumber)) ...
+     && all(isfield(raw.hdr, {'scanNumber', 'antennaAz_deg', 'time_s', 'pri_s'}));
 fprintf('Raw data: %d files in %s (%s)\n', numel(files), cfg.io.rawFolder, ternary(rawOk, 'ok', 'FAIL'));
 ok = ok && rawOk;
+if ~keepRaw
+    delete(fullfile(cfg.io.rawFolder, 'pulse_*.mat'));
+end
 fprintf('Result (%s PRF, clutter %s): %s\n', prfMode, ternary(clutterOn, 'on', 'off'), ternary(ok, 'PASS', 'FAIL'));
-end
-
-function sectors = target_sectors(cfg)
-% Azimuth sectors to simulate: every target +- (beamwidth + CPI span + 1 deg).
-rate = cfg.ant.rpm * 6;                                  % [deg/s]
-bw   = 4.1;
-cpiSpan = bw;                                            % a CPI spans about one beamwidth
-sectors = zeros(numel(cfg.targets), 2);
-for i = 1:numel(cfg.targets)
-    t = 0;
-    for it = 1:3                                         % azimuth when the antenna passes it
-        [~, az] = target_geometry(cfg.targets(i), t, cfg.ant.height_m);
-        t = mod(az - cfg.ant.az0_deg, 360) / rate;
-    end
-    half = bw + cpiSpan/2 + 1;
-    sectors(i, :) = mod([az - half, az + half], 360);
-end
 end
 
 function v = fold_velocity(vr, vSpan)

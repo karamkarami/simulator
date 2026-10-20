@@ -10,10 +10,10 @@ function cfg = radar_config()
 %       cfg.clutter.enable = false;
 %       results = run_radar_sim(cfg);
 %
-%   Quantities that come from input .mat files (antenna patterns, number of
-%   receive elements, DDC filters, DBF matrix, staggered PRIs and MTI weights)
-%   are listed under "Input files". Default files are created by
-%   make_input_files.m when they are missing.
+%   Quantities that come from input .mat files (antenna patterns, DDC
+%   filters, DBF matrix, staggered PRIs and MTI weights) are listed under
+%   "Input files". Default files are created by make_input_files.m when they
+%   are missing.
 
 root = fileparts(mfilename('fullpath'));
 addpath(fullfile(root, 'src'));
@@ -24,23 +24,24 @@ cfg.const.kB = 1.380649e-23;    % Boltzmann constant [J/K]
 cfg.const.T0 = 290;             % reference noise temperature [K]
 
 %% Input files
-cfg.files.antenna = fullfile(root, 'inputs', 'antenna_pattern.mat'); % patterns, nElements, spacing, gains
+cfg.files.antenna = fullfile(root, 'inputs', 'antenna_pattern.mat'); % patterns, element spacing, gains
 cfg.files.ddc     = fullfile(root, 'inputs', 'ddc_filters.mat');     % low-pass filters of the 2 DDC stages
 cfg.files.dbf     = fullfile(root, 'inputs', 'dbf_matrix.mat');      % elevation beamforming matrix
 cfg.files.stagger = fullfile(root, 'inputs', 'stagger_prf.mat');     % staggered PRIs + MTI weights
 
 %% Radar site and antenna
-cfg.fc           = 3e9;   % center frequency [Hz]
-cfg.ant.height_m = 6;     % antenna height above the ground [m]
-cfg.ant.tilt_deg = 11;    % array tilt above the horizon [deg]
-cfg.ant.rpm      = 6;     % rotation speed [rev/min]
-cfg.ant.az0_deg  = 0;     % antenna azimuth at t = 0, clockwise from North [deg]
+cfg.fc            = 3e9;  % center frequency [Hz]
+cfg.ant.nElements = 48;   % receive elements in elevation (1 = single antenna, beamforming disabled)
+cfg.ant.height_m  = 6;    % antenna height above the ground [m]
+cfg.ant.tilt_deg  = 11;   % array tilt above the horizon [deg]
+cfg.ant.rpm       = 6;    % rotation speed [rev/min]
+cfg.ant.az0_deg   = 0;    % antenna azimuth at t = 0, clockwise from North [deg]
 
 %% Transmitter and receiver
 cfg.tx.peakPower_W     = 20e3;   % peak transmit power [W]
 cfg.rx.noiseFigure_dB  = 4;      % receiver noise figure [dB]
 cfg.rx.losses_dB       = 3;      % system losses not modelled elsewhere (RF, radome, ...) [dB]
-cfg.rx.maxRange_m      = 100e3;  % instrumented range: sets the length of the receive window [m]
+cfg.rx.maxRange_m      = 80e3;   % instrumented range of the long pulse: sets the receive window [m]
 cfg.rx.addThermalNoise = true;   % false only for debugging / SNR measurements
 
 %% ADC
@@ -49,24 +50,25 @@ cfg.adc.nBits            = 16;     % ADC word length [bit]
 cfg.adc.enob             = 12.7;   % effective number of bits
 cfg.adc.noiseAboveAdc_dB = 10;     % receiver gain: thermal noise level above the ADC noise floor [dB]
 cfg.adc.addAdcNoise      = true;   % false only for debugging / SNR measurements
-cfg.adc.fIFcenter_Hz     = 30e6;   % IF of the center frequency fc (receiver LO = fc - 30 MHz)
+cfg.adc.fIF_Hz           = 30e6;   % IF carrier of the received signal (receiver LO = fc - 30 MHz)
 
-%% Waveforms: every PRI holds a long and a short sub-pulse
-% The long pulse is transmitted first and the short pulse right after it.
-% Both use a different IF (RF = fc + fIF - fIFcenter) so the two DDC channels separate them.
-cfg.wave.long.type         = 'lfm';     % 'lfm' or 'phasecode' (P4 polyphase code)
-cfg.wave.long.width_s      = 150e-6;    % pulse width [s]
-cfg.wave.long.bandwidth_Hz = 1e6;       % LFM sweep bandwidth [Hz]
-cfg.wave.long.chip_s       = 1e-6;      % phase-code chip length [s]
-cfg.wave.long.fIF_Hz       = 22e6;      % IF carrier at the ADC [Hz]
-cfg.wave.long.procRange_m  = [0 inf];   % range interval kept after the matched filter [m]
+%% Waveforms: every PRI holds a short and a long sub-pulse (short first)
+% PRI timeline: short pulse at tTx = 0 -> receive (near range) -> long pulse
+% at its tTx -> receive (far range) until the end of the window. The
+% receiver is blanked while transmitting. Both sub-pulses are on the same
+% 30 MHz IF and are separated in time. The long pulse is blind up to
+% c*150us/2 = 22.5 km; with tTx = 200 us the short pulse covers 4.2 ... 25 km.
+cfg.wave.short.type         = 'lfm';    % 'lfm' or 'phasecode' (P4 polyphase code)
+cfg.wave.short.width_s      = 25e-6;    % pulse width [s]
+cfg.wave.short.bandwidth_Hz = 1e6;      % LFM sweep bandwidth [Hz]
+cfg.wave.short.chip_s       = 1e-6;     % phase-code chip length [s]
+cfg.wave.short.tTx_s        = 0;        % transmit time inside the PRI [s]
 
-cfg.wave.short.type         = 'lfm';
-cfg.wave.short.width_s      = 25e-6;
-cfg.wave.short.bandwidth_Hz = 1e6;
-cfg.wave.short.chip_s       = 1e-6;
-cfg.wave.short.fIF_Hz       = 38e6;
-cfg.wave.short.procRange_m  = [0 30e3]; % short pulse only fills the blind zone of the long pulse
+cfg.wave.long.type          = 'lfm';
+cfg.wave.long.width_s       = 150e-6;
+cfg.wave.long.bandwidth_Hz  = 1e6;
+cfg.wave.long.chip_s        = 1e-6;
+cfg.wave.long.tTx_s         = 200e-6;
 
 %% PRF
 cfg.prf.mode  = 'fixed';   % 'fixed' or 'staggered' (staggered PRIs come from cfg.files.stagger)
@@ -78,24 +80,27 @@ cfg.ddc.decimation = [10 6];   % decimation factor of stage 1 and stage 2 (120 -
 %% Matched filter and Doppler processing
 cfg.proc.taylorNbar   = 4;     % Taylor window (LFM only): number of nearly constant sidelobes
 cfg.proc.taylorSll_dB = -35;   % Taylor window peak sidelobe level [dB]
-cfg.proc.cpiLength    = [];    % pulses per CPI buffer ([] = pulses inside the 3 dB azimuth beam)
-cfg.proc.nfft         = 32;    % Doppler FFT length
+cfg.proc.cpiLength    = [];    % pulses per CPI buffer ([] = pulses arriving while a target is in the
+                               % 3 dB azimuth beam: round(beamwidth / (rotation rate * PRI)) = 114)
+cfg.proc.nfft         = [];    % Doppler FFT length ([] = next power of 2: of the pulses in the buffer
+                               % with a fixed PRF (114 -> 128), of the samples per row when staggered (28 -> 32))
 cfg.proc.updateEvery  = 1;     % run MTI/Doppler/CFAR every N new pulses (1 = every pulse)
 
 %% 2-D CA-CFAR on every range-Doppler map
-cfg.cfar.pfa          = 1e-7;  % design probability of false alarm
+cfg.cfar.pfa          = 1e-8;  % design probability of false alarm (per cell and CPI)
 cfg.cfar.guardRange   = 3;     % guard cells on each side in range
 cfg.cfar.trainRange   = 8;     % training cells on each side in range
-cfg.cfar.guardDoppler = 2;     % guard cells on each side in Doppler
-cfg.cfar.trainDoppler = 2;     % training cells on each side in Doppler
-cfg.cfar.notchBins    = 1;     % Doppler bins on each side of zero that are not tested (MTI notch)
+cfg.cfar.guardDoppler = 3;     % guard cells on each side in Doppler
+cfg.cfar.trainDoppler = 4;     % training cells on each side in Doppler
+cfg.cfar.notchWidth   = 1;     % half-width of the zero-Doppler band that is not tested (MTI notch,
+                               % clutter residue), in Doppler window mainlobes (1 -> +-2 bins)
 
 %% Pruning of the CFAR detections
 cfg.prune.sidelobeMargin_dB = 20;  % a peak this much weaker than a peak on the same range, beam
                                    % or Doppler line is treated as its sidelobe and removed
 
 %% Plot extraction (azimuth peak picking over successive CPIs)
-cfg.extract.minExtent_deg = 1; % minimum azimuth extent of the detections of a plot [deg]
+cfg.extract.minExtent_deg = 2; % minimum azimuth extent of the detections of a plot [deg]
                                % (noise false alarms last only a few CPIs, targets about one beamwidth)
 cfg.extract.maxMiss = 2;       % CPIs without a detection before a plot is closed
 
@@ -118,16 +123,17 @@ cfg.sim.verbose     = true;
 %% Targets (see make_target.m)
 cfg.targets = six_targets_scenario();
 
-%% Recording and streaming of the raw ADC data
+%% Recording of the raw ADC data and streaming of the DDC output
 cfg.io.outFolder = fullfile(root, 'output');
-cfg.io.saveRaw   = true;                                    % one .mat file per PRI
+cfg.io.saveRaw   = true;                                    % raw ADC data: one .mat file per PRI
 cfg.io.rawFolder = fullfile(root, 'output', 'raw_pulses');
 cfg.io.matFormat = '-v6';                                   % '-v6' fast/uncompressed, '-v7' compressed
 
-cfg.udp.enable       = false;        % stream the raw data of every PRI over Ethernet/UDP
+cfg.udp.enable       = false;        % stream the DDC output of every PRI over Ethernet/UDP
 cfg.udp.host         = '127.0.0.1';
 cfg.udp.port         = 50000;
-cfg.udp.payloadBytes = 8192;         % ADC bytes per datagram (a 40-byte header is added)
+cfg.udp.payloadBytes = 1400;         % DDC data bytes per datagram (+ 64-byte header: fits a 1500-byte
+                                     % Ethernet MTU; use up to 65400 with jumbo frames / localhost)
 
 %% Display
 cfg.display.enable            = true;

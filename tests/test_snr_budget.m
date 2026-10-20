@@ -1,18 +1,20 @@
-function ok = test_snr_budget(prfMode, pulseName, waveType)
+function ok = test_snr_budget(prfMode, pulseName, waveType, nElements)
 %TEST_SNR_BUDGET  Compare the expected SNR of every processing block with a measurement.
 %
-%   ok = TEST_SNR_BUDGET(prfMode, pulseName) places one target in the middle
+%   ok = TEST_SNR_BUDGET(prfMode, pulseName, waveType, nElements) places one target in the middle
 %   of the coverage of sub-pulse pulseName ('short' or 'long'), sweeps the
 %   antenna over it for one CPI and runs the processing chain twice:
 %     - signal only (no thermal noise, no ADC noise, no quantization)
 %     - noise only  (no target)
 %   The SNR measured after the ADC, DDC, DBF, matched filter, MTI and Doppler
 %   blocks is compared with snr_budget.m. prfMode is 'fixed' or 'staggered',
-%   waveType is 'lfm' (default) or 'phasecode'.
+%   waveType is 'lfm' (default) or 'phasecode', nElements is the number of
+%   receive elements (default 48; 1 = no beamforming).
 
 if nargin < 1, prfMode = 'fixed'; end
 if nargin < 2, pulseName = 'long'; end
 if nargin < 3, waveType = 'lfm'; end
+if nargin < 4, nElements = 48; end
 root = fileparts(fileparts(mfilename('fullpath')));
 addpath(root, fullfile(root, 'src'));
 rng(7);
@@ -20,6 +22,7 @@ rng(7);
 cfg = radar_config();
 cfg.prf.mode = prfMode;
 cfg.wave.(pulseName).type = waveType;
+cfg.ant.nElements = nElements;
 cfg.rx.maxRange_m = 50e3;
 cfg.clutter.enable = false;
 sys = setup_radar(cfg);
@@ -54,10 +57,11 @@ sysS = sys;  sysS.cfg = cfgS;
 tau = 2*R0/c;
 inEcho = @(t) t >= wv.tTx_s + tau + 0.25*wv.width_s & t <= wv.tTx_s + tau + 0.75*wv.width_s;
 
-m.adc = mean(double(xS.adc(inEcho(sys.tAdc), 1)).^2) / var(double(xN.adc(:, 1)));
-m.ddc = mean(abs(xS.ddc(inEcho(sys.tDdc(1:size(xS.ddc, 1))), 1)).^2) / mean(abs(xN.ddc(:, 1)).^2);
+tSeg = sys.tDdc(wv.ddcIdx);                          % times of the DDC samples of this sub-pulse
+m.adc = mean(double(xS.adc(inEcho(sys.tAdc), 1)).^2) / var(double(xN.adc(sys.rxGate == 1, 1)));
+m.ddc = mean(abs(xS.ddc(inEcho(sys.tDdc), 1)).^2) / mean(abs(xN.ddc(wv.ddcIdx, 1)).^2);
 beam  = budget.beam;
-m.dbf = mean(abs(xS.dbf(beam, inEcho(sys.tDdc(1:size(xS.dbf, 2))))).^2) / mean(abs(xN.dbf(beam, :)).^2);
+m.dbf = mean(abs(xS.dbf(beam, inEcho(tSeg))).^2) / mean(abs(xN.dbf(beam, :)).^2);
 [pk, r] = max(abs(xS.mf(beam, :)).^2);
 m.mf  = pk / mean(abs(xN.mf(beam, :)).^2);
 
@@ -74,8 +78,8 @@ m.doppler = pk / mean(pN(beam, :, kd));
 %% Compare
 blocks = {'adc', 'ddc', 'dbf', 'mf', 'mti', 'doppler'};
 tol    = [0.5, 0.5, 0.5, 1.0, 1.0, 1.5];               % [dB]
-fprintf('\nSNR budget check: %s PRF, %s pulse (%s), R = %.1f km, el = %.1f deg, vr = %.0f m/s, beam %d\n', ...
-    prfMode, pulseName, waveType, R0/1e3, el, vr, beam);
+fprintf('\nSNR budget check: %s PRF, %s pulse (%s), %d element(s), R = %.1f km, el = %.1f deg, vr = %.0f m/s, beam %d\n', ...
+    prfMode, pulseName, waveType, nElements, R0/1e3, el, vr, beam);
 fprintf('%-8s %10s %10s %8s\n', 'Block', 'Expected', 'Measured', 'Diff');
 ok = true;
 for i = 1:numel(blocks)
@@ -98,8 +102,12 @@ for k = 1:n
     if quantize
         x = adc_sample(x, sys);
     end
-    bb = ddc(x, sys, wv);
-    bm = digital_beamforming(bb, sys.dbf.W);
+    bb = ddc(x, sys);
+    if sys.dbf.enabled
+        bm = digital_beamforming(bb(wv.ddcIdx, :), sys.dbf.W);
+    else
+        bm = bb(wv.ddcIdx, :).';
+    end
     rp = matched_filter(bm, wv);
     rpCpi(:, :, k) = rp;
     if k == k0                                       % keep the centre pulse of every block

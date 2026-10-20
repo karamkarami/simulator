@@ -1,16 +1,17 @@
 function x = generate_rx_signal(sys, targets, t_s, azAnt_deg, clutterIf)
-%GENERATE_RX_SIGNAL  Received IF signal of all elements during one receive window.
+%GENERATE_RX_SIGNAL  Received IF signal of all elements during the receive record of one PRI.
 %   x = GENERATE_RX_SIGNAL(sys, targets, t_s, azAnt_deg, clutterIf) returns
 %   the real signal [nAdc x nElements] at the ADC input, in ADC units (LSB),
-%   before quantization: target echoes of both sub-pulses + clutter + thermal
-%   noise. t_s is the start time of the PRI and azAnt_deg the antenna azimuth.
-%   clutterIf is the output of clutter_signal.m ([] = no clutter).
+%   before quantization: target echoes of both sub-pulses on the 30 MHz IF +
+%   clutter + thermal noise, set to zero while the long pulse is transmitted
+%   (receiver blanked). t_s is the start time of the PRI and azAnt_deg the
+%   antenna azimuth. clutterIf is the output of clutter_signal.m ([] = no clutter).
 
 c   = sys.cfg.const.c;
 fs  = sys.fs;
 % Single precision is plenty for a 16-bit ADC and about twice as fast
 x   = zeros(sys.nAdc, sys.nCh, 'single');
-names = {'long', 'short'};
+names = {'short', 'long'};
 
 %% Target echoes
 for i = 1:numel(targets)
@@ -39,7 +40,7 @@ for i = 1:numel(targets)
         tau = 2*(R + vr*t)/c;                       % delay of every sample (intra-pulse Doppler)
         % RF echo mixed down by the LO: IF carrier plus the carrier phase -2*pi*fLO*tau
         echo = amp * waveform_envelope(wv, t - wv.tTx_s - tau0) ...
-             .* exp(1j*2*pi*(wv.fIF_Hz*(t - wv.tTx_s - tau) - sys.fLO*tau));
+             .* exp(1j*2*pi*(sys.fIF*(t - wv.tTx_s - tau) - sys.fLO*tau));
         x(n, :) = x(n, :) + real(single(echo) * single(v).');
     end
 end
@@ -53,4 +54,7 @@ end
 if sys.cfg.rx.addThermalNoise
     x = x + sys.adc.sigmaTh * randn(sys.nAdc, sys.nCh, 'single');
 end
+
+%% Receiver blanked while the long pulse is transmitted
+x = x .* sys.rxGate;
 end

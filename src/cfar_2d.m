@@ -4,8 +4,8 @@ function [isDet, noise] = cfar_2d(P, sys)
 %   The noise of a cell is the mean of the training cells of a rectangular
 %   window (range x Doppler) around it, excluding the guard cells. The Doppler
 %   axis is circular. Cells closer than the window size to the first or last
-%   range cell, and the Doppler bins within +-notchBins of zero (MTI notch,
-%   where the clutter residue is), are not tested.
+%   range cell, and the sys.dop.notchBins Doppler bins on each side of zero
+%   (MTI notch, where the clutter residue is), are not tested.
 
 c  = sys.cfar;
 oR = c.guardRange + c.trainRange;      % half size of the outer window in range
@@ -17,7 +17,7 @@ isDet = P > c.alpha * noise;
 [~, nR, nD] = size(P);
 isDet(:, [1:oR, nR-oR+1:nR], :) = false;
 zeroBin = floor(nD/2) + 1;                                     % zero Doppler after fftshift
-isDet(:, :, zeroBin-c.notchBins:zeroBin+c.notchBins) = false;
+isDet(:, :, zeroBin-sys.dop.notchBins:zeroBin+sys.dop.notchBins) = false;
 end
 
 function S = box_sum(P, hr, hd)

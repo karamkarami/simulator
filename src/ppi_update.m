@@ -19,7 +19,9 @@ end
 
 if ~isempty(plots)
     isShort = strcmp({plots.pulse}, 'short');
-    groundRange = [plots.range_m] .* cosd([plots.el_deg]) / 1e3;
+    el = [plots.el_deg];
+    el(isnan(el)) = 0;                                 % no elevation without beamforming
+    groundRange = [plots.range_m] .* cosd(el) / 1e3;
     x = groundRange .* sind([plots.az_deg]);
     y = groundRange .* cosd([plots.az_deg]);
     set(ppi.hShort, 'XData', x(isShort),  'YData', y(isShort));

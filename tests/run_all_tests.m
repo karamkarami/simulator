@@ -1,6 +1,7 @@
 % RUN_ALL_TESTS  Run every test of the radar simulator and print a summary.
-%   The six-target tests take about 10 minutes each in Octave and write about
-%   8 GB of raw data each (output/test_<mode>/raw_pulses).
+%   The six-target tests take about 15-20 minutes each in Octave. Each writes
+%   about 18 GB of raw data (output/test_<mode>/raw_pulses), checks it and
+%   deletes it again (call test_six_targets(mode, true) to keep the files).
 
 addpath(fileparts(mfilename('fullpath')));
 names  = {};
@@ -13,16 +14,24 @@ for mode = {'fixed', 'staggered'}
     end
 end
 
-names{end+1}  = 'UDP streaming';
+names{end+1}  = 'SNR budget (fixed PRF, long pulse, P4 phase code)';
+passed(end+1) = test_snr_budget('fixed', 'long', 'phasecode');
+names{end+1}  = 'SNR budget (single element, no beamforming)';
+passed(end+1) = test_snr_budget('fixed', 'short', 'lfm', 1);
+
+names{end+1}  = 'UDP streaming of the DDC output';
 passed(end+1) = test_udp_stream();
+
+names{end+1}  = 'No ghost of the short-pulse echo (same IF)';
+passed(end+1) = test_short_pulse_ghost();
 
 for mode = {'fixed', 'staggered'}
     names{end+1}  = sprintf('Six targets with clutter (%s PRF)', mode{1});  %#ok<SAGROW>
-    passed(end+1) = test_six_targets(mode{1}, true);                       %#ok<SAGROW>
+    passed(end+1) = test_six_targets(mode{1}, true, false);                %#ok<SAGROW>
 end
 
 fprintf('\n===== Test summary =====\n');
 for i = 1:numel(names)
     if passed(i), s = 'PASS'; else, s = 'FAIL'; end
-    fprintf('%-45s %s\n', names{i}, s);
+    fprintf('%-55s %s\n', names{i}, s);
 end

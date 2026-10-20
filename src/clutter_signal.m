@@ -13,7 +13,7 @@ gAz   = pattern_gain(sys.ant.az_deg, sys.ant.azGain_dB, azRel(sel));     % one-w
 refl  = gAz.' * (clut.rho(sel, :) .* exp(1j*2*pi*clut.fd_Hz(sel, :)*t_s)); % [1 x nRange]
 
 xc = zeros(sys.nAdc, 1);
-names = {'long', 'short'};
+names = {'short', 'long'};
 for i = 1:2
     w = clut.(names{i});
     % Echo of each range cell starts at ADC sample n0 (0-based, may be negative)

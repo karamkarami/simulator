@@ -4,7 +4,7 @@ function b = snr_budget(sys, tgt, t_s)
 %   t_s, assuming the CPI is centred on the target azimuth:
 %     b.adc      ADC output, one element, one real sample (noise in fs/2, incl. ADC noise)
 %     b.ddc      DDC output, one element, one complex sample
-%     b.dbf      beamformer output (best beam b.beam)
+%     b.dbf      beamformer output (best beam b.beam; = b.ddc without beamforming)
 %     b.mf       matched filter output (peak), incl. the window, DDC filtering
 %                and intra-pulse Doppler losses (b.mfLoss)
 %     b.mti      MTI output (gain at the target Doppler)
@@ -37,23 +37,34 @@ gEl = pattern_gain(sys.ant.elRel_deg, sys.ant.txElGain_dB, asind(u)) ...
 Pr  = sys.radarConst * tgt.rcs_m2 / R^4 * gEl;                     % per element [W]
 snrAdc = Pr / (sys.N0eff * sys.fs/2);
 snrDdc = Pr / (sys.N0eff * sys.ddc.noiseBw_Hz);
-arrayGain = abs(sys.dbf.W * v).^2 ./ sum(abs(sys.dbf.W).^2, 2);
-[gDbf, b.beam] = max(arrayGain);
+if sys.dbf.enabled
+    arrayGain = abs(sys.dbf.W * v).^2 ./ sum(abs(sys.dbf.W).^2, 2);
+    [gDbf, b.beam] = max(arrayGain);
+else
+    gDbf = 1;                                                       % single element: no array gain
+    b.beam = 1;
+end
 snrDbf = snrDdc * gDbf;
 % Matched filter: the noise-free pulse (with its Doppler shift) goes through the DDC
 % filters and the matched filter. tEff = |peak|^2 / (noise gain * fs) is the effective
 % pulse length: equal to the pulse width for an ideal matched filter, smaller with the
-% window, the DDC filtering of the waveform and the Doppler mismatch.
+% window, the DDC filtering of the waveform and the Doppler mismatch. The echo is
+% shifted by fractions of an output sample and the best one is kept (target on a
+% range cell, no straddle loss).
 fd    = -2*vr/wv.lambda_m;                                          % Doppler [Hz]
 D     = prod(sys.ddc.decim);
 nPad  = numel(sys.ddc.hEq);
-t     = ((0:round(wv.width_s*sys.fs) + 2*nPad - 1)' - nPad) / sys.fs;
-s     = waveform_envelope(wv, t) .* exp(1j*2*pi*fd*t);              % baseband echo at the ADC rate
-y     = fir_decimate_valid(fir_decimate_valid(s, sys.ddc.h1, sys.ddc.decim(1)), sys.ddc.h2, sys.ddc.decim(2));
 tapsUp = zeros(D*(numel(wv.mfTaps)-1) + 1, 1);
 tapsUp(1:D:end) = wv.mfTaps;
 noiseGain = sum(abs(conv(sys.ddc.hEq, tapsUp)).^2);                % ADC input -> MF output
-tEff  = max(abs(conv(y, wv.mfTaps.')).^2) / (noiseGain * sys.fs);
+peak = 0;
+for shift = 0:D/6:D-1
+    t = ((0:round(wv.width_s*sys.fs) + 2*nPad - 1)' - nPad - shift) / sys.fs;
+    s = waveform_envelope(wv, t) .* exp(1j*2*pi*fd*t);              % baseband echo at the ADC rate
+    y = fir_decimate_valid(fir_decimate_valid(s, sys.ddc.h1, sys.ddc.decim(1)), sys.ddc.h2, sys.ddc.decim(2));
+    peak = max(peak, max(abs(conv(y, wv.mfTaps.')).^2));
+end
+tEff  = peak / (noiseGain * sys.fs);
 b.mfLoss = 10*log10(tEff / wv.width_s);
 snrMf = Pr * gDbf * tEff / sys.N0eff;                               % energy / noise density
 

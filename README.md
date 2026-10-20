@@ -159,24 +159,67 @@ Each datagram has a 40-byte little-endian header followed by int16 samples
 `print_snr_budget` (called at the start of every run) prints the expected
 SNR of every target after the ADC, DDC, DBF, matched filter, MTI and Doppler
 blocks. It also prints the SNR needed for Pd = 0.9 (Albersheim) and the
-margin. The slow-time gains come from running the real MTI and Doppler
-functions on a noise-free target and on white noise. They therefore include
-the MTI response, the Hamming loss, Doppler straddle and the azimuth beam
-shape. `tests/test_snr_budget.m` measures the SNR after every block in the
-simulated chain and compares it with this budget.
+margin. Where a closed form would be approximate, the budget runs the real
+processing functions on a noise-free target:
+* the matched-filter loss: the pulse, with its Doppler shift, goes through
+  the DDC filters and the matched filter. This covers the Taylor window,
+  the DDC filtering of phase-code chips, and the Doppler mismatch, which is
+  about -3.3 dB for a 150 us P4 code at 180 m/s.
+* the slow-time gain: the MTI and Doppler functions run on the target and
+  on white noise. This covers the MTI response, the Hamming loss, Doppler
+  straddle and the azimuth beam shape over the CPI.
+
+`tests/test_snr_budget.m` measures the SNR after every block of the
+simulated chain (signal-only and noise-only runs) and compares it with the
+budget. All blocks agree within 0.6 dB for LFM and P4, both pulses and both
+PRF modes:
+
+```
+SNR budget check: fixed PRF, long pulse (lfm), R = 41.1 km, el = 6.0 deg, vr = -180 m/s, beam 3
+Block      Expected   Measured     Diff
+adc          -36.71     -36.76    -0.05
+ddc          -21.50     -21.59    -0.09
+dbf           -6.60      -6.71    -0.11
+mf            16.81      16.46    -0.35
+mti           20.32      20.25    -0.06
+doppler       29.25      29.22    -0.03
+```
 
 ## Tests
 
 | Test | What it checks |
 |---|---|
-| `test_snr_budget(mode, pulse)` | measured vs. expected SNR after each block |
+| `test_snr_budget(mode, pulse, type)` | measured vs. expected SNR after each block (`type` = `'lfm'` or `'phasecode'`) |
 | `test_udp_stream` | one PRI sent over UDP to localhost is received bit-exact |
 | `test_six_targets(mode, clutterOn)` | 6 targets (0.5 - 10 m^2, 8 - 46 km, up to 290 m/s) are detected with the right range, azimuth, elevation and ambiguous velocity, with few false plots; raw files are written |
 
 `tests/run_all_tests.m` runs all of them for the fixed and the staggered
 PRF. The six-target test simulates only the azimuth sectors around the
 targets, about 2400 PRIs. It needs about 8 GB for the raw files. It takes
-about 10 minutes per PRF mode in Octave, and should be faster in MATLAB.
+about 10 minutes per PRF mode in Octave (about 230 ms per PRI at 50 km
+instrumented range, 390 ms at 100 km), and should be faster in MATLAB.
+
+Six-target test, fixed PRF, clutter on (Octave 8.4). All targets were
+detected and there were no false plots:
+
+```
+Tgt   pulse |   R true   R meas |  az tru  az mea | el tru el mea |  v fold  v meas | SNRexp SNRmea
+T1    short |   11.844   11.841 |   30.00   29.97 |   4.81   4.76 |   13.00   12.46 |   43.8   43.4
+T2    short |   20.563   20.610 |   95.30   95.17 |   8.37   8.39 |  -20.68  -20.24 |   30.0   29.6
+T3     long |   34.240   34.101 |  160.00  160.04 |  10.08  10.14 |   15.07   15.66 |   39.2   38.9
+T4     long |   43.236   43.244 |  216.22  216.27 |  10.65  10.71 |  -18.47  -18.79 |   37.9   37.6
+T5    short |    7.706    7.719 |  271.12  271.17 |   2.19   2.11 |   10.26    9.34 |   52.8   52.4
+T6     long |   47.965   48.041 |  329.45  329.45 |   2.38   2.34 |    9.89    9.39 |   32.0   32.0
+Plots: 6, associated with targets: 6, false plots: 0
+```
+
+![PPI of the six-target test](docs/ppi_six_targets_fixed.png)
+
+The staggered PRF gives the same picture: 6 of 6 targets and 0 false plots,
+with folded velocities in +-6.4 m/s. The range errors of T3 (-140 m) and
+T6 (+76 m) come from LFM range-Doppler coupling and range sampling (75 m
+cells). "v fold" is the true radial velocity folded into the unambiguous
+interval.
 
 ## Assumptions and limits
 

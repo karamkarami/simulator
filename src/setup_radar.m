@@ -37,12 +37,17 @@ sys.N0 = cfg.const.kB * cfg.const.T0 * 10^(cfg.rx.noiseFigure_dB/10);   % noise 
 sys.rx.sigmaTh   = sqrt(sys.N0 * fs/2);                       % thermal noise per real sample [sqrt(W)]
 sys.rx.voltGain  = 10^(cfg.rx.gain_dB/20);                    % receiver path gain (amplitude)
 sys.rx.leakAmp   = sqrt(2 * cfg.tx.peakPower_W * 10^(-cfg.rx.txIsolation_dB/10));  % leakage [sqrt(W)]
+if cfg.adc.nBits > 16
+    error('cfg.adc.nBits = %d: the ADC samples are stored as int16 (at most 16 bits)', cfg.adc.nBits);
+end
 sys.adc.fullScale = 2^(cfg.adc.nBits - 1);
 fullScale_W      = 1e-3 * 10^(cfg.adc.fullScale_dBm/10);      % full-scale sine power at the ADC [W]
 sys.adc.lsbPerUnit = sys.adc.fullScale / sqrt(2*fullScale_W); % ADC input [sqrt(W)] -> LSB
 sinad      = 10^((6.02*cfg.adc.enob + 1.76)/10);              % full-scale sine / ADC noise
 adcNoise2  = sys.adc.fullScale^2/2 / sinad;                   % total ADC noise power [LSB^2]
-sys.adc.sigmaAdc = sqrt(max(adcNoise2 - 1/12, 0));            % ADC noise added before rounding [LSB]
+% the noise added after the 16-bit quantization; with the two roundings
+% (1/12 LSB^2 each) the total is adcNoise2
+sys.adc.sigmaAdc = sqrt(max(adcNoise2 - 2/12, 0));            % [LSB]
 sys.adc.sigmaTh  = sys.rx.sigmaTh * sys.rx.voltGain * sys.adc.lsbPerUnit;   % thermal noise at the ADC [LSB]
 sys.N0eff = sys.N0 * (sys.adc.sigmaTh^2 + adcNoise2) / sys.adc.sigmaTh^2;    % incl. ADC noise
 

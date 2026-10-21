@@ -86,6 +86,13 @@ static void *xcalloc(size_t n, size_t size)
     return p;
 }
 
+static void *xrealloc(void *p, size_t size)
+{
+    p = realloc(p, size ? size : 1);
+    if (!p) abort();
+    return p;
+}
+
 static void reset_buffers(PulseState *s)
 {
     s->last = -1;
@@ -574,8 +581,7 @@ static void add_report(PulseState *s, const Detection *d)
 {
     if (s->nReports == s->capReports) {
         s->capReports = s->capReports ? 2 * s->capReports : 64;
-        s->reports = realloc(s->reports, sizeof(Detection) * s->capReports);
-        if (!s->reports) abort();
+        s->reports = xrealloc(s->reports, sizeof(Detection) * s->capReports);
     }
     s->reports[s->nReports++] = *d;
 }
@@ -612,8 +618,7 @@ static void prune_and_report(const RadarConfig *cfg, int pulse, PulseState *s)
                 if (!peak) continue;
                 if (n == cap) {
                     cap = cap ? 2 * cap : 64;
-                    cells = realloc(cells, sizeof(Cell) * cap);
-                    if (!cells) abort();
+                    cells = xrealloc(cells, sizeof(Cell) * cap);
                 }
                 cells[n++] = (Cell){ b, r, d, v };
             }
@@ -624,7 +629,7 @@ static void prune_and_report(const RadarConfig *cfg, int pulse, PulseState *s)
     /* 2) sidelobe blanking (range, elevation and Doppler sidelobes) */
     const double ratio = pow(10.0, cfg->sidelobeMargin_dB / 10.0);
     const int pulseCells = pc->nTaps;
-    unsigned char *keep = malloc(n ? n : 1);
+    unsigned char *keep = xcalloc(n, 1);
     for (int i = 0; i < n; i++) {
         keep[i] = 1;
         for (int j = 0; j < n && keep[i]; j++) {
@@ -653,9 +658,9 @@ static void prune_and_report(const RadarConfig *cfg, int pulse, PulseState *s)
         if (!keep[i]) continue;
         const Cell *c = &cells[i];
         if (!floors) {
-            floors = malloc(sizeof(double) * nB);
+            floors = xcalloc(nB, sizeof(double));
             for (int b = 0; b < nB; b++) floors[b] = -1;
-            work = malloc(sizeof(float) * (size_t)nfft * nR);
+            work = xcalloc((size_t)nfft * nR, sizeof(float));
         }
         if (floors[c->b] < 0) floors[c->b] = beam_noise_floor(cfg, s, c->b, work);
         Detection d;
@@ -672,8 +677,8 @@ static void prune_and_report(const RadarConfig *cfg, int pulse, PulseState *s)
                 const double p1 = 10 * log10(P_at(s, c->d, c->b, c->r));
                 const double p2 = 10 * log10(P_at(s, c->d, c->b + 1, c->r));
                 const double den = p0 - 2 * p1 + p2;
-                if (den < 0) {
-                    const double pos = c->b + 0.5 * (p0 - p2) / den;   /* fractional beam index */
+                const double pos = c->b + 0.5 * (p0 - p2) / den;       /* fractional beam index */
+                if (den < 0 && isfinite(pos)) {                        /* (a zero power gives -Inf dB) */
                     const int i0 = (int)floor(pos);
                     const double f = pos - i0;
                     u = (i0 + 1 < nB) ? cfg->beamU[i0] * (1 - f) + cfg->beamU[i0 + 1] * f : cfg->beamU[i0];
@@ -713,6 +718,20 @@ static void plot_callback(void *user, const Detection *plot)
     if (cb && cb->plot) cb->plot(cb->user, plot);
 }
 
+/* The PRI has the layout of the configuration: channels, DDC samples, the DDC
+ * samples of both sub-pulses (header, 1-based) and the DDC rate. */
+static int pri_matches_config(const RadarConfig *cfg, const PriData *pri)
+{
+    if (pri->nCh != cfg->nCh || pri->nSamples != cfg->nDdc || !pri->iq) return 0;
+    const uint32_t *idx[N_PULSES] = { pri->shortIdx, pri->longIdx };
+    for (int i = 0; i < N_PULSES; i++) {
+        const PulseConfig *pc = &cfg->pulse[i];
+        if (idx[i][0] != (uint32_t)pc->ddcFirst + 1 || idx[i][1] != (uint32_t)(pc->ddcFirst + pc->ddcCount))
+            return 0;
+    }
+    return fabs(pri->ddcFs_Hz - cfg->fsOut_Hz) <= 1e-3 * cfg->fsOut_Hz;
+}
+
 void processor_flush(Processor *p, const ProcessorCallbacks *cb)
 {
     for (int i = 0; i < N_PULSES; i++)
@@ -722,7 +741,10 @@ void processor_flush(Processor *p, const ProcessorCallbacks *cb)
 void processor_process(Processor *p, const PriData *pri, const ProcessorCallbacks *cb)
 {
     const RadarConfig *cfg = p->cfg;
-    if (pri->nCh != cfg->nCh || pri->nSamples != cfg->nDdc) return;    /* not for this configuration */
+    if (!pri_matches_config(cfg, pri)) {                    /* made for another configuration */
+        p->timing.rejected++;
+        return;
+    }
 
     /* a gap in the pulse numbers (skipped sector): restart the CPIs, close the plots */
     if (p->havePulse && pri->pulseNumber != p->lastPulse + 1) {
@@ -751,13 +773,13 @@ void processor_process(Processor *p, const PriData *pri, const ProcessorCallback
         s->time[slot] = pri->time_s;
         s->newestPulse = pri->pulseNumber;
         if (s->count < s->nSlots) s->count++;
-        s->nPushed++;
+        s->nPushed = (s->nPushed + 1) % cfg->updateEvery;  /* pulses since the last update (mod N) */
         p->timing.mf_ms += elapsed_ms(&t0);
 
         /* slow time */
         if (s->count >= cfg->nMtiTaps) mti_newest(cfg, s);
         p->timing.mti_ms += elapsed_ms(&t0);
-        if (s->count < s->nSlots || s->nPushed % cfg->updateEvery != 0) continue;
+        if (s->count < s->nSlots || s->nPushed != 0) continue;
         doppler(p, s);
         p->timing.doppler_ms += elapsed_ms(&t0);
         cfar(p, s);

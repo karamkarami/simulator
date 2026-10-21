@@ -118,9 +118,13 @@ static int read_records(FILE *f, RecordSet *rs)
         set_error(rs, "not a receiver configuration file (version 1)");
         return -1;
     }
-    rs->n = (int)head[1];
-    rs->rec = calloc(rs->n > 0 ? rs->n : 1, sizeof(Record));
+    if (head[1] > 10000) {
+        set_error(rs, "corrupt configuration file (%u records)", head[1]);
+        return -1;
+    }
+    rs->rec = calloc(head[1] > 0 ? head[1] : 1, sizeof(Record));
     if (!rs->rec) { set_error(rs, "out of memory"); return -1; }
+    rs->n = (int)head[1];
     for (int i = 0; i < rs->n; i++) {
         Record *r = &rs->rec[i];
         uint32_t dims[3];
@@ -229,9 +233,22 @@ int radar_config_load(const char *path, RadarConfig *cfg, char *err, size_t errL
         cfg->minExtent_deg = get_scalar(&rs, "minExtent_deg");
         cfg->meanPri_s    = get_scalar(&rs, "meanPri_s");
 
-        if (!rs.failed && (cfg->updateEvery < 1 || cfg->minHits < 1 || cfg->cpiLength < 1 || cfg->nfft < 1 ||
-                           cfg->nRows < 1 || cfg->nBeams < 1 || cfg->nCh < 1))
+        if (!rs.failed && (cfg->updateEvery < 1 || cfg->minHits < 1 || cfg->maxMiss < 0 || cfg->cpiLength < 1 ||
+                           cfg->nfft < 1 || cfg->nRows < 1 || cfg->rowLen < 1 || cfg->rowLen > cfg->nfft ||
+                           cfg->nBeams < 1 || cfg->nCh < 1 || cfg->nStagger < 1 || cfg->nMtiTaps < 1 ||
+                           !cfg->mtiCoeffs || cfg->notchBins < 0))
             set_error(&rs, "invalid sizes in the configuration");
+        for (int p = 0; p < N_PULSES && !rs.failed; p++)
+            if (cfg->pulse[p].nTaps < 1 || cfg->pulse[p].nRange < 1)
+                set_error(&rs, "invalid matched filter or range axis in the configuration");
+        if (!rs.failed) {                                  /* CFAR window */
+            const int gR = cfg->guardRange, oR = gR + cfg->trainRange;
+            const int gD = cfg->guardDoppler, oD = gD + cfg->trainDoppler;
+            const int nTrain = (2 * oR + 1) * (2 * oD + 1) - (2 * gR + 1) * (2 * gD + 1);
+            if (gR < 0 || gD < 0 || cfg->trainRange < 0 || cfg->trainDoppler < 0 || nTrain < 1 ||
+                nTrain != cfg->nTrain || 2 * oD + 1 > cfg->nfft)
+                set_error(&rs, "invalid CFAR window in the configuration");
+        }
         if (!rs.failed && (cfg->nfft & (cfg->nfft - 1)) != 0)
             set_error(&rs, "the Doppler FFT length %d is not a power of 2", cfg->nfft);
         if (!rs.failed && cfg->nRows * cfg->rowLen + cfg->nMtiTaps - 1 > cfg->cpiLength)

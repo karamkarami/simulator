@@ -18,5 +18,10 @@ end
 fprintf(['ADC: one element, one real sample | DDC: one element, one complex sample | ', ...
          'Doppler: per row, %d row(s) (%.1f independent looks) integrated non-coherently\n'], ...
          sys.cpi.nRows, sys.dop.nLooks);
-fprintf('Req.: SNR per row for Pd = 0.9 at Pfa = %.0e (Albersheim, steady target)\n\n', sys.cfar.pfa);
+if isfield(sys.cfg.sim, 'swerling') && sys.cfg.sim.swerling == 1
+    model = 'Swerling 1 target, Shnidman';
+else
+    model = 'Albersheim, steady target';
+end
+fprintf('Req.: SNR per row for Pd = 0.9 at Pfa = %.0e (%s)\n\n', sys.cfar.pfa, model);
 end

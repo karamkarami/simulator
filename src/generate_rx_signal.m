@@ -1,11 +1,11 @@
-function x = generate_rx_signal(sys, targets, t_s, azAnt_deg, clutterIf, scan)
+function x = generate_rx_signal(sys, targets, t_s, azAnt_deg, clutterIf)
 %GENERATE_RX_SIGNAL  Received IF signal of all elements at the ADC input for one PRI.
-%   x = GENERATE_RX_SIGNAL(sys, targets, t_s, azAnt_deg, clutterIf, scan)
+%   x = GENERATE_RX_SIGNAL(sys, targets, t_s, azAnt_deg, clutterIf)
 %   returns the real signal [nAdc x nElements] at the ADC input in sqrt(W)
 %   (a sine of amplitude A has power A^2/2), for the PRI starting at t_s with
 %   the antenna at azAnt_deg:
 %     1. every target: position from its motion, received power from the
-%        radar equation (RCS of this scan, Swerling 1), echo of both
+%        radar equation (RCS of this antenna pass, Swerling 1), echo of both
 %        sub-pulses on the 30 MHz IF with the element phases
 %     2. ground clutter (clutterIf from clutter_signal.m, [] = none)
 %     3. transmitter leakage while a pulse is transmitted (isolation)
@@ -13,7 +13,6 @@ function x = generate_rx_signal(sys, targets, t_s, azAnt_deg, clutterIf, scan)
 %     5. receiver path gain
 %   adc_sample.m then converts the result to 16-bit ADC samples.
 
-if nargin < 6, scan = 1; end
 c   = sys.cfg.const.c;
 fs  = sys.fs;
 % Single precision is plenty for a 16-bit ADC and about twice as fast
@@ -33,7 +32,8 @@ for i = 1:numel(targets)
     gain = pattern_gain(sys.ant.az_deg, sys.ant.azGain_dB, azRel)^2 ...
          * pattern_gain(sys.ant.elRel_deg, sys.ant.txElGain_dB, elRel) ...
          * pattern_gain(sys.ant.elRel_deg, sys.ant.elElemGain_dB, elRel);
-    power = sys.radarConst * target_rcs(targets(i), scan) / R^4 * gain;   % per element [W]
+    rcs   = target_rcs(targets(i), target_look(sys, az, t_s));        % Swerling 1: one value per pass
+    power = sys.radarConst * rcs / R^4 * gain;                         % per element [W]
     amp   = sqrt(2*power);                                                % [sqrt(W)]
     for p = 1:2
         wv   = sys.wave.(names{p});

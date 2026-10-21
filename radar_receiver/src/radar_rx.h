@@ -14,6 +14,7 @@
 #ifndef RADAR_RX_H
 #define RADAR_RX_H
 
+#include <signal.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -162,6 +163,8 @@ typedef struct {
 typedef struct {
     double dbf_ms, mf_ms, mti_ms, doppler_ms, cfar_ms, extract_ms, total_ms;
     uint64_t pris, updates;
+    uint64_t rejected;   /* PRIs whose layout (channels, DDC samples, sub-pulse samples,
+                            DDC rate) differs from the configuration: not processed */
 } ProcessorTiming;     /* accumulated times */
 
 typedef struct Processor Processor;
@@ -205,7 +208,7 @@ uint16_t crc16_ccitt(const uint8_t *data, size_t len);
  * when the worker has finished (then the window closes by itself).
  * Returns the exit code of the application. */
 int  ppi_run(int argc, char **argv, double maxRange_m, int (*worker)(void *), void *arg,
-             volatile int *stopFlag, const char *snapshotPath);
+             volatile sig_atomic_t *stopFlag, const char *snapshotPath);
 /* Thread-safe calls from the worker thread. */
 void ppi_post_antenna(double az_deg, double time_s, uint32_t scan);
 void ppi_post_plot(const Detection *plot);

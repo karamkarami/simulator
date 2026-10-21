@@ -163,7 +163,7 @@ QFont pixel_font(const QFont &base, int pixels, bool bold = false)
 
 class PpiWidget : public QWidget {
 public:
-    PpiWidget(double maxRange_m, volatile int *stopFlag)
+    PpiWidget(double maxRange_m, volatile sig_atomic_t *stopFlag)
         : maxRange_m_(maxRange_m), ringStep_m_(ring_step_m(maxRange_m)), stopFlag_(stopFlag)
     {
         setAttribute(Qt::WA_OpaquePaintEvent);
@@ -203,7 +203,7 @@ private:
 
     double                maxRange_m_;
     double                ringStep_m_;
-    volatile int         *stopFlag_;
+    volatile sig_atomic_t *stopFlag_;
     AntennaState          antenna_;
     std::deque<PlotMark>  plots_;
     std::vector<PlotMark> incoming_;    /* buffer swapped with Shared::newPlots */
@@ -480,7 +480,7 @@ extern "C" void ppi_post_plot(const Detection *plot)
 }
 
 extern "C" int ppi_run(int argc, char **argv, double maxRange_m, int (*worker)(void *), void *arg,
-                       volatile int *stopFlag, const char *snapshotPath)
+                       volatile sig_atomic_t *stopFlag, const char *snapshotPath)
 {
     static char defaultName[] = "radar_receiver";
     static char *defaultArgv[] = { defaultName, nullptr };

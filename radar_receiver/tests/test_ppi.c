@@ -55,7 +55,7 @@ static const TestPlot kPlots[] = {
 };
 #define N_PLOTS ((int)(sizeof kPlots / sizeof kPlots[0]))
 
-static volatile int g_stop = 0;
+static volatile sig_atomic_t g_stop = 0;
 
 static void sleep_ms(int ms)
 {

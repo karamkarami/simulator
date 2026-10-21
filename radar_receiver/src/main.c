@@ -16,7 +16,7 @@
  *     --update-every N       run Doppler/CFAR every N pulses (default from the configuration)
  *     --plots-csv FILE       plot list (default plots.csv, '' = none)
  *     --detections-csv FILE  list of all pruned CFAR detections (default: none)
- *     --idle-timeout S       stop after S seconds without data (network mode, default 0 = never)
+ *     --idle-timeout S       stop when no data came for S seconds after the first PRI (default 0 = never)
  *     --quiet                do not print every plot
  */
 #include "radar_rx.h"
@@ -43,7 +43,7 @@ typedef struct {
     int exitCode;
 } App;
 
-static volatile int g_stop = 0;
+static volatile sig_atomic_t g_stop = 0;
 
 static void on_signal(int sig)
 {
@@ -169,6 +169,9 @@ static void print_timing(const Processor *proc, const UdpInput *in, double wall_
     fprintf(stderr, "Processing time per PRI: %.3f ms (DBF %.3f, MF %.3f, MTI %.3f, Doppler %.3f, "
             "CFAR+pruning %.3f, extraction %.3f)\n", t.total_ms / n, t.dbf_ms / n, t.mf_ms / n,
             t.mti_ms / n, t.doppler_ms / n, t.cfar_ms / n, t.extract_ms / n);
+    if (t.rejected)
+        fprintf(stderr, "PRIs ignored: %llu (their DDC layout differs from the configuration: export it again "
+                "with export_receiver_config.m)\n", (unsigned long long)t.rejected);
 }
 
 static int worker(void *arg)
@@ -194,12 +197,12 @@ static int worker(void *arg)
     if (!app->opt.replayPath)
         fprintf(stderr, "Waiting for the DDC stream on UDP port %d ...\n", app->opt.port);
     const double t0 = now_seconds();
-    double lastData = t0;
+    double lastData = 0;                                        /* 0: no PRI yet */
     while (!g_stop) {
         int r = udp_input_next(in, &pri, 200);
         if (r < 0) break;                                      /* end of the replay file */
         if (r == 0) {
-            if (app->opt.idleTimeout_s > 0 && now_seconds() - lastData > app->opt.idleTimeout_s) break;
+            if (app->opt.idleTimeout_s > 0 && lastData > 0 && now_seconds() - lastData > app->opt.idleTimeout_s) break;
             continue;
         }
         lastData = now_seconds();

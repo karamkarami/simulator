@@ -79,7 +79,7 @@ for i = 1:numel(cfg.targets)
     vFold = fold_velocity(vr, wv.lambda_m / (2*sys.dop.rowPri_s));
     % Expected SNR with the RCS this target had during the scan (Swerling 1)
     tgtScan = results.targets(i);
-    tgtScan.rcs_m2 = target_rcs(tgtScan, 1 + floor(p.time_s * sys.ant.rate_dps / 360));
+    tgtScan.rcs_m2 = target_rcs(tgtScan, target_look(sys, az, p.time_s));
     b = snr_budget(sys, tgtScan, p.time_s);
     fprintf('%-4s %6.2f %6s | %8.3f %8.3f | %7.2f %7.2f | %6.2f %6.2f | %7.2f %7.2f | %6.1f %6.1f | ok\n', ...
         tgt.name, tgtScan.rcs_m2, p.pulse, R/1e3, p.range_m/1e3, az, p.az_deg, el, p.el_deg, vFold, p.vr_mps, ...

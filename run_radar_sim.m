@@ -34,7 +34,7 @@ tStart = tic;
 %% Setup
 sys   = setup_radar(cfg);
 sched = pulse_schedule(sys);
-targets = draw_target_rcs(cfg.targets, max(sched.scan), cfg.sim.swerling);
+targets = draw_target_rcs(cfg.targets, max(sched.scan) + 1, cfg.sim.swerling);   % RCS of every antenna pass
 names = {'short', 'long'};
 if cfg.sim.verbose
     print_summary(sys, sched);
@@ -101,7 +101,7 @@ for k = 1:sched.nPulses
     if ~isempty(clut)
         clutterIf = clutter_signal(clut, sys, az, t);
     end
-    adcData = adc_sample(generate_rx_signal(sys, targets, t, az, clutterIf, sched.scan(k)), sys);
+    adcData = adc_sample(generate_rx_signal(sys, targets, t, az, clutterIf), sys);
 
     % 2) Raw data recording
     hdr = pulse_header(sys, sched, k);

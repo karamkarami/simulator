@@ -1,7 +1,8 @@
 # Radar receiver: processes the DDC output that the MATLAB simulator streams
 # over UDP (DBF, matched filter, MTI, Doppler, 2-D CFAR, plot extraction),
 # with an optional Qt PPI and an optional serial output of the detections.
-cmake_minimum_required(VERSION 3.16)
+# CMake 3.21: C_STANDARD 11 gives MSVC /std:c11 (needed for 'restrict').
+cmake_minimum_required(VERSION 3.21)
 project(radar_receiver LANGUAGES C)
 
 option(RADAR_WITH_QT     "Build the Qt PPI display (Qt 6 or Qt 5 Widgets)" ON)
@@ -19,10 +20,12 @@ set(CMAKE_C_EXTENSIONS OFF)
 
 # Compiler flags. No -ffast-math: the elevation of a plot is NaN without
 # beamforming and the processing relies on IEEE behaviour.
+include(CheckCCompilerFlag)
 if(MSVC)
     add_compile_options(/W3 /fp:precise)
     string(APPEND CMAKE_C_FLAGS_RELEASE " /O2")
     if(RADAR_NATIVE)
+        # MSVC has no "native": AVX2 (every Intel Core CPU since 2013)
         add_compile_options(/arch:AVX2)
     endif()
     add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
@@ -31,7 +34,12 @@ else()
     set(CMAKE_C_FLAGS_RELEASE "-O3 -DNDEBUG")
     set(CMAKE_CXX_FLAGS_RELEASE "-O2 -DNDEBUG")
     if(RADAR_NATIVE)
-        add_compile_options(-march=native)
+        check_c_compiler_flag(-march=native RADAR_HAS_MARCH_NATIVE)
+        if(RADAR_HAS_MARCH_NATIVE)
+            add_compile_options(-march=native)
+        else()
+            message(STATUS "The compiler does not accept -march=native: generic optimisation")
+        endif()
     endif()
 endif()
 
@@ -68,12 +76,23 @@ endif()
 # ---------------------------------------------------------------------------
 set(RADAR_QT_FOUND OFF)
 if(RADAR_WITH_QT)
-    find_package(QT NAMES Qt6 Qt5 COMPONENTS Widgets QUIET)
-    if(QT_FOUND)
-        find_package(Qt${QT_VERSION_MAJOR} COMPONENTS Widgets REQUIRED)
+    # Qt's CMake packages need C++ enabled before they are searched
+    include(CheckLanguage)
+    check_language(CXX)
+    if(CMAKE_CXX_COMPILER)
         enable_language(CXX)
         set(CMAKE_CXX_STANDARD 17)
         set(CMAKE_CXX_STANDARD_REQUIRED ON)
+        find_package(QT NAMES Qt6 Qt5 COMPONENTS Widgets QUIET)
+    else()
+        message(WARNING "No C++ compiler: building without the PPI display")
+    endif()
+    if(QT_FOUND AND QT_VERSION VERSION_LESS 5.12)
+        message(WARNING "Qt ${QT_VERSION} is too old (5.12 or newer is needed): building without the PPI display")
+        set(QT_FOUND OFF)
+    endif()
+    if(QT_FOUND)
+        find_package(Qt${QT_VERSION_MAJOR} COMPONENTS Widgets REQUIRED)
         find_package(Threads REQUIRED)
         add_library(radar_ppi STATIC src/ppi_qt.cpp)
         set_target_properties(radar_ppi PROPERTIES AUTOMOC ON)
@@ -97,6 +116,24 @@ if(RADAR_QT_FOUND)
     # The C main program links with the C++ PPI library.
     set_target_properties(radar_receiver PROPERTIES LINKER_LANGUAGE CXX)
 endif()
+
+# Windows: copy the Qt DLLs and plugins next to a program that uses the PPI,
+# so it starts without Qt's bin folder on PATH.
+function(radar_deploy_qt target)
+    if(WIN32 AND RADAR_QT_FOUND)
+        get_target_property(qmake Qt${QT_VERSION_MAJOR}::qmake IMPORTED_LOCATION)
+        get_filename_component(qtBin "${qmake}" DIRECTORY)
+        find_program(WINDEPLOYQT windeployqt HINTS "${qtBin}")
+        if(WINDEPLOYQT)
+            add_custom_command(TARGET ${target} POST_BUILD
+                COMMAND "${WINDEPLOYQT}" --no-translations --no-compiler-runtime "$<TARGET_FILE:${target}>"
+                COMMENT "windeployqt ${target}")
+        else()
+            message(WARNING "windeployqt not found: add Qt's bin folder to PATH to run ${target}")
+        endif()
+    endif()
+endfunction()
+radar_deploy_qt(radar_receiver)
 
 # ---------------------------------------------------------------------------
 # Tests
@@ -128,5 +165,6 @@ if(RADAR_BUILD_TESTS)
         set_target_properties(test_ppi PROPERTIES LINKER_LANGUAGE CXX)
         add_test(NAME ppi COMMAND test_ppi ${CMAKE_CURRENT_BINARY_DIR}/ppi_test.png)
         set_tests_properties(ppi PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+        radar_deploy_qt(test_ppi)
     endif()
 endif()

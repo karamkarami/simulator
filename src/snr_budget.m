@@ -13,7 +13,9 @@ function b = snr_budget(sys, tgt, t_s)
 %                this is the mean S/N per row before non-coherent integration.
 %     b.required SNR per row needed for Pd = 0.9 at the CFAR Pfa with the
 %                effective number of independent rows (sys.dop.nLooks)
-%                integrated non-coherently (Albersheim), b.margin = doppler - required
+%                integrated non-coherently: Swerling 1 (Shnidman) when
+%                cfg.sim.swerling = 1, else a steady target (Albersheim);
+%                b.margin = doppler - required
 %   The slow-time gains are obtained by running the actual MTI and Doppler
 %   functions on a noise-free target and on unit impulses (white noise).
 
@@ -23,8 +25,8 @@ b.rcs_m2  = tgt.rcs_m2;
 b.range_m = R;
 b.el_deg  = el;
 b.vr_mps  = vr;
-if R < sys.wave.long.range_m(1)
-    b.pulse = 'short';                     % inside the blind zone of the long pulse
+if R < sys.handover_m
+    b.pulse = 'short';                     % the short pulse is tested up to the handover range
 else
     b.pulse = 'long';
 end
@@ -92,8 +94,32 @@ b.dbf      = 10*log10(snrDbf);
 b.mf       = 10*log10(snrMf);
 b.mti      = 10*log10(snrMf * gMti);
 b.doppler  = 10*log10(snrMf * gSlow);
-b.required = albersheim_snr(0.9, sys.cfar.pfa, sys.dop.nLooks);
+if isfield(sys.cfg, 'sim') && isfield(sys.cfg.sim, 'swerling') && sys.cfg.sim.swerling == 1
+    b.required = shnidman_swerling1_snr(0.9, sys.cfar.pfa, sys.dop.nLooks);
+else
+    b.required = albersheim_snr(0.9, sys.cfar.pfa, sys.dop.nLooks);
+end
 b.margin   = b.doppler - b.required;
+end
+
+function snr_dB = shnidman_swerling1_snr(pd, pfa, n)
+% SNR per sample for a Swerling 1 target (constant during the dwell) with n
+% samples integrated non-coherently: exact for one sample (Pd = Pfa^(1/(1+SNR))),
+% else Shnidman's approximation (+-0.5 dB, 0.1 <= pd <= 0.99, n < 40).
+if abs(n - 1) < 1e-9
+    snr_dB = 10*log10(log(pfa)/log(pd) - 1);
+    return
+end
+eta  = sqrt(-0.8*log(4*pfa*(1 - pfa))) + sign(pd - 0.5)*sqrt(-0.8*log(4*pd*(1 - pd)));
+xInf = eta * (eta + 2*sqrt(n/2 - 0.25));
+c1 = ((17.7006*pd - 18.4496)*pd + 14.5339)*pd - 3.525;
+c2 = exp(27.31*pd - 25.14) + (pd - 0.8)*(0.7*log(1e-5/pfa) + (2*n - 20)/80);
+if pd <= 0.872
+    cdB = c1;
+else
+    cdB = c1 + c2;
+end
+snr_dB = 10*log10(10^(cdB/10) * xInf / n);
 end
 
 function snr_dB = albersheim_snr(pd, pfa, n)

@@ -94,7 +94,7 @@ plots of both programs.
 | `--port N` | UDP port of the DDC stream (default 50000) |
 | `--record FILE` | also store every received datagram in FILE |
 | `--replay FILE` | read the datagrams from a recorded FILE instead of the network (as fast as possible) |
-| `--ppi` | show the PPI (Qt build) |
+| `--ppi` | show the interactive PPI (Qt build, see below) |
 | `--ppi-snapshot FILE` | save the PPI as a PNG at the end and close it |
 | `--serial DEVICE` | send the CFAR output to a serial port (`/dev/ttyUSB0`, `COM3`, ...) |
 | `--baud N` | serial baud rate (default 921600) |
@@ -160,8 +160,24 @@ file (`decode_serial.py /dev/ttyUSB0`, `decode_serial.py capture.bin --csv`).
 
 **PPI:** range rings, azimuth spokes (0 = North, clockwise) and the antenna
 line. Short-pulse plots are cyan and long-pulse plots yellow. They are drawn
-at ground range and removed when the antenna passes them again in the next
-scan.
+at ground range and, by default, removed when the antenna passes them again
+in the next scan. The PPI is interactive:
+
+| Action | Effect |
+|---|---|
+| mouse wheel | zoom in/out around the cursor (up to x500); rings adapt to the visible range |
+| left drag | pan |
+| double click, `R`, `Home` | reset the view |
+| hover over a plot | data tip: range, azimuth, elevation, radial velocity, SNR, time, sub-pulse, CPI hits, beam/cell/bin, pulse number |
+| click on a plot | pin its data tip on the display (click again to remove it) |
+| right click | options: short/long-pulse plots, plot labels, range rings, antenna trail, plots shown (until the antenna passes again / two scans / all until cleared), minimum SNR, reset view, clear plots, remove data tips, pause, save as PNG |
+| `+` `-`, arrows | zoom, pan |
+| `C` | remove the pinned data tips |
+| space | pause/resume the display (the processing continues; the plots are shown on resume) |
+| `S` | save as PNG |
+
+The status line shows the zoom and the range, azimuth and east/north
+position of the cursor.
 
 ## Speed
 
@@ -239,4 +255,5 @@ radar_stream_send stream.rec --port 50001
 | `udp_input` | reassembly with shuffled, duplicate, missing and foreign datagrams; timeouts; record and replay; fuzzing |
 | `serial` | frame encoding and CRC; real output to a pseudo-terminal (Linux): exact bytes, 200-detection split, non-blocking drops, close |
 | `ppi` | the Qt PPI runs off-screen with antenna updates and plots and saves a snapshot |
+| `ppi_interactive` | mouse, wheel and key events: data tips, cursor readout, zoom around the cursor, pan, pin/unpin, reset, filters, persistence options, pause, clear |
 | `../tests/test_c_receiver.m` (Octave/MATLAB) | the six-target scenario streamed over UDP to this receiver: the C plots must match the MATLAB plots; the recording is replayed to check that the result is repeatable and to measure the time |

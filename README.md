@@ -87,7 +87,7 @@ file was built for other values (for example after you change
 | `src/mti_filter.m`, `doppler_process.m` | clutter filter, Doppler processing |
 | `src/cfar_2d.m`, `cfar_alpha.m` | 2-D CA-CFAR |
 | `src/prune_peaks.m`, `detection_reports.m`, `plot_extractor*.m` | pruning and plot extraction |
-| `src/ppi_init.m`, `ppi_update.m` | PPI display |
+| `src/ppi_init.m`, `ppi_update.m`, `ppi_callbacks.m` | interactive PPI display |
 | `src/snr_budget.m`, `print_snr_budget.m` | expected SNR after every block |
 | `src/six_targets_scenario.m`, `make_target.m`, `target_geometry.m`, `illumination_time.m`, `target_sectors.m` | targets |
 | `tests/` | tests (see below) |
@@ -229,6 +229,31 @@ there, at the same beam and Doppler, behind very strong far targets.
   radial velocity is ambiguous (+-25 m/s with the fixed PRF, +-6.4 m/s with
   the default stagger).
 
+## Interactive PPI
+
+The PPI (`ppi_init.m`) is interactive, also while the simulation runs:
+
+| Action | Effect |
+|---|---|
+| mouse wheel | zoom in/out around the cursor (up to x500) |
+| left drag | pan |
+| double click, key `r` | reset the view (whole instrumented range) |
+| hover over a plot or a true target | data tip: range, azimuth, elevation, radial velocity, SNR, time, sub-pulse, CPI hits, beam/cell/bin (true target: range, azimuth, elevation, height, speed, RCS) |
+| click on a plot | pin its data tip (click again to remove it) |
+| keys `+` `-`, arrows | zoom, pan |
+| key `c` | remove the pinned data tips |
+| key space | pause/resume the display (the simulation continues) |
+
+The panel on the right shows or hides the short- and long-pulse plots, the
+true targets, range rings, plot labels (range and velocity next to each
+plot) and the antenna. It also has a minimum SNR, a choice of the plots shown
+(all, last scan, last 2 scans), Reset view, Clear plots, Remove data tips,
+Pause and Save PNG. The cursor position (range, azimuth, east/north) is shown
+under the buttons. In MATLAB the zoom, pan and data tip tools of the axes
+toolbar work as well; their data tips also list the plot values.
+`ppi_callbacks(action, fig, ...)` does the same from a script (see
+`tests/test_ppi_interactive.m`).
+
 ## Raw data and UDP format
 
 Every simulated PRI is saved as `output/raw_pulses/pulse_<number>.mat`
@@ -290,6 +315,7 @@ budget.
 | `test_udp_stream` | the DDC output of a PRI sent over UDP to localhost is received bit-exact, with its header |
 | `test_short_pulse_ghost` | a strong target at 65 km is detected, and its short-pulse echo in the long window gives no ghost plot |
 | `test_six_targets(mode, clutterOn, keepRaw)` | 6 targets (0.5 - 10 m^2 mean RCS, Swerling 1, 8 - 48 km, up to 290 m/s, around the radar) are detected with the right range, azimuth, elevation and ambiguous velocity, with at most 2 false plots; one raw file per PRI, named by the pulse number |
+| `test_ppi_interactive` | PPI interaction: data tips, zoom around the cursor, pan, keys, filters, pinned tips, pause, clear, PNG |
 | `test_c_receiver(mode)` | the six-target scenario streamed over UDP to the C receiver (`radar_receiver/`): its plots must match the MATLAB plots; the recorded stream is replayed to check repeatability and speed |
 
 Latest results (Octave 8.4): all SNR budget checks agree within 0.7 dB.

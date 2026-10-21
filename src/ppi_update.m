@@ -1,33 +1,16 @@
 function ppi_update(ppi, sys, az_deg, t_s, scan, plots)
 %PPI_UPDATE  Refresh the PPI: antenna position, true targets and extracted plots.
-set(ppi.hAnt, 'XData', [0 ppi.rMax*sind(az_deg)], 'YData', [0 ppi.rMax*cosd(az_deg)]);
-
-if sys.cfg.display.showTruth && ~isempty(sys.cfg.targets)
-    n = numel(sys.cfg.targets);
-    xy = zeros(n, 2);
-    for i = 1:n
-        p = sys.cfg.targets(i).pos0_m + sys.cfg.targets(i).vel_mps*t_s;
-        xy(i, :) = p(1:2) / 1e3;
-    end
-    set(ppi.hTruth, 'XData', xy(:, 1), 'YData', xy(:, 2));
-    for i = 1:n
-        p0 = sys.cfg.targets(i).pos0_m / 1e3;
-        set(ppi.hNames{i}, 'Position', [xy(i, :) 0]);
-        set(ppi.hTracks{i}, 'XData', [p0(1) xy(i, 1)], 'YData', [p0(2) xy(i, 2)]);
-    end
+%   The data is stored in the figure, so the interactive options of
+%   ppi_callbacks.m (filters, zoom, data tips) can redraw it at any time.
+%   While the display is paused (space key or the Pause button) the data is
+%   still stored but not drawn.
+if ~ishandle(ppi.fig), return; end                       % the window was closed
+S = getappdata(ppi.fig, 'ppi');
+S.sys = sys;
+S.data = struct('az_deg', az_deg, 't_s', t_s, 'scan', scan, 'plots', plots);
+setappdata(ppi.fig, 'ppi', S);
+if ~S.opt.paused
+    ppi_callbacks('redraw', ppi.fig);
 end
-
-if ~isempty(plots)
-    isShort = strcmp({plots.pulse}, 'short');
-    el = [plots.el_deg];
-    el(isnan(el)) = 0;                                 % no elevation without beamforming
-    groundRange = [plots.range_m] .* cosd(el) / 1e3;
-    x = groundRange .* sind([plots.az_deg]);
-    y = groundRange .* cosd([plots.az_deg]);
-    set(ppi.hShort, 'XData', x(isShort),  'YData', y(isShort));
-    set(ppi.hLong,  'XData', x(~isShort), 'YData', y(~isShort));
-end
-set(ppi.title, 'String', sprintf('Scan %d   t = %.2f s   az = %5.1f deg   plots = %d', ...
-    scan, t_s, az_deg, numel(plots)));
 drawnow;
 end

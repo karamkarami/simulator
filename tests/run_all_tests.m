@@ -25,6 +25,9 @@ passed(end+1) = test_snr_budget('fixed', 'short', 'lfm', 1);
 names{end+1}  = 'UDP streaming of the DDC output';
 passed(end+1) = test_udp_stream();
 
+names{end+1}  = 'Interactive PPI (data tips, zoom, pan, filters)';
+passed(end+1) = test_ppi_interactive();
+
 names{end+1}  = 'No ghost of the short-pulse echo (same IF)';
 passed(end+1) = test_short_pulse_ghost();
 

@@ -61,7 +61,7 @@ peak = 0;
 for shift = 0:D/6:D-1
     t = ((0:round(wv.width_s*sys.fs) + 2*nPad - 1)' - nPad - shift) / sys.fs;
     s = waveform_envelope(wv, t) .* exp(1j*2*pi*fd*t);              % baseband echo at the ADC rate
-    y = fir_decimate_valid(fir_decimate_valid(s, sys.ddc.h1, sys.ddc.decim(1)), sys.ddc.h2, sys.ddc.decim(2));
+    y = fir_decimate_valid(fir_decimate_valid(s, sys.ddc.h1real, sys.ddc.decim(1)), sys.ddc.h2real, sys.ddc.decim(2));
     peak = max(peak, max(abs(conv(y, wv.mfTaps.')).^2));
 end
 tEff  = peak / (noiseGain * sys.fs);

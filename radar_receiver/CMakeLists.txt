@@ -1,0 +1,132 @@
+# Radar receiver: processes the DDC output that the MATLAB simulator streams
+# over UDP (DBF, matched filter, MTI, Doppler, 2-D CFAR, plot extraction),
+# with an optional Qt PPI and an optional serial output of the detections.
+cmake_minimum_required(VERSION 3.16)
+project(radar_receiver LANGUAGES C)
+
+option(RADAR_WITH_QT     "Build the Qt PPI display (Qt 6 or Qt 5 Widgets)" ON)
+option(RADAR_OPENMP      "Use OpenMP threads"                              ON)
+option(RADAR_NATIVE      "Optimise for the CPU of the build machine"       ON)
+option(RADAR_BUILD_TESTS "Build the unit tests (ctest)"                    ON)
+
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+set(CMAKE_C_EXTENSIONS OFF)
+
+# Compiler flags. No -ffast-math: the elevation of a plot is NaN without
+# beamforming and the processing relies on IEEE behaviour.
+if(MSVC)
+    add_compile_options(/W3 /fp:precise)
+    string(APPEND CMAKE_C_FLAGS_RELEASE " /O2")
+    if(RADAR_NATIVE)
+        add_compile_options(/arch:AVX2)
+    endif()
+    add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
+else()
+    add_compile_options(-Wall -Wextra -fno-math-errno)
+    set(CMAKE_C_FLAGS_RELEASE "-O3 -DNDEBUG")
+    set(CMAKE_CXX_FLAGS_RELEASE "-O2 -DNDEBUG")
+    if(RADAR_NATIVE)
+        add_compile_options(-march=native)
+    endif()
+endif()
+
+# ---------------------------------------------------------------------------
+# Processing library
+# ---------------------------------------------------------------------------
+add_library(radar_core STATIC
+    src/config.c
+    src/fft.c
+    src/extractor.c
+    src/processor.c
+    src/udp_input.c
+    src/serial_out.c
+    src/platform.c
+)
+target_include_directories(radar_core PUBLIC src)
+
+if(RADAR_OPENMP)
+    find_package(OpenMP COMPONENTS C)
+    if(OpenMP_C_FOUND)
+        target_link_libraries(radar_core PUBLIC OpenMP::OpenMP_C)
+    else()
+        message(WARNING "OpenMP not found: the receiver runs single-threaded")
+    endif()
+endif()
+if(WIN32)
+    target_link_libraries(radar_core PUBLIC ws2_32)
+else()
+    target_link_libraries(radar_core PUBLIC m)
+endif()
+
+# ---------------------------------------------------------------------------
+# Optional Qt PPI
+# ---------------------------------------------------------------------------
+set(RADAR_QT_FOUND OFF)
+if(RADAR_WITH_QT)
+    find_package(QT NAMES Qt6 Qt5 COMPONENTS Widgets QUIET)
+    if(QT_FOUND)
+        find_package(Qt${QT_VERSION_MAJOR} COMPONENTS Widgets REQUIRED)
+        enable_language(CXX)
+        set(CMAKE_CXX_STANDARD 17)
+        set(CMAKE_CXX_STANDARD_REQUIRED ON)
+        find_package(Threads REQUIRED)
+        add_library(radar_ppi STATIC src/ppi_qt.cpp)
+        set_target_properties(radar_ppi PROPERTIES AUTOMOC ON)
+        target_include_directories(radar_ppi PUBLIC src)
+        target_link_libraries(radar_ppi PUBLIC Qt${QT_VERSION_MAJOR}::Widgets Threads::Threads)
+        set(RADAR_QT_FOUND ON)
+        message(STATUS "PPI display: Qt ${QT_VERSION}")
+    else()
+        message(WARNING "Qt Widgets not found: building without the PPI display")
+    endif()
+endif()
+
+# ---------------------------------------------------------------------------
+# Receiver program
+# ---------------------------------------------------------------------------
+add_executable(radar_receiver src/main.c)
+target_link_libraries(radar_receiver PRIVATE radar_core)
+if(RADAR_QT_FOUND)
+    target_compile_definitions(radar_receiver PRIVATE RADAR_WITH_QT)
+    target_link_libraries(radar_receiver PRIVATE radar_ppi)
+    # The C main program links with the C++ PPI library.
+    set_target_properties(radar_receiver PROPERTIES LINKER_LANGUAGE CXX)
+endif()
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+if(RADAR_BUILD_TESTS)
+    enable_testing()
+
+    add_executable(test_core tests/test_core.c)
+    target_link_libraries(test_core PRIVATE radar_core)
+    add_test(NAME core COMMAND test_core ${CMAKE_CURRENT_SOURCE_DIR}/config/radar_config.bin)
+
+    add_executable(test_udp_input tests/test_udp_input.c)
+    target_link_libraries(test_udp_input PRIVATE radar_core)
+    add_test(NAME udp_input COMMAND test_udp_input)
+
+    if(NOT WIN32)
+        add_executable(test_serial tests/test_serial.c)
+        target_link_libraries(test_serial PRIVATE radar_core)
+        find_library(UTIL_LIBRARY util)
+        if(UTIL_LIBRARY)
+            target_link_libraries(test_serial PRIVATE ${UTIL_LIBRARY})
+        endif()
+        add_test(NAME serial COMMAND test_serial)
+    endif()
+
+    if(RADAR_QT_FOUND)
+        add_executable(test_ppi tests/test_ppi.c)
+        target_link_libraries(test_ppi PRIVATE radar_ppi)
+        set_target_properties(test_ppi PROPERTIES LINKER_LANGUAGE CXX)
+        add_test(NAME ppi COMMAND test_ppi ${CMAKE_CURRENT_BINARY_DIR}/ppi_test.png)
+        set_tests_properties(ppi PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+    endif()
+endif()

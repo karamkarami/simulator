@@ -32,6 +32,8 @@ cfg.files.stagger = fullfile(root, 'inputs', 'stagger_prf.mat');     % staggered
 %% Radar site and antenna
 cfg.fc            = 3e9;  % center frequency [Hz]
 cfg.ant.nElements = 48;   % receive elements in elevation (1 = single antenna, beamforming disabled)
+cfg.ant.elementSpacing_lambda = 0.66;  % element spacing in elevation [wavelengths]
+% (azimuth: fixed 4.1 deg beam of every element; patterns come from the antenna file)
 cfg.ant.height_m  = 6;    % antenna height above the ground [m]
 cfg.ant.tilt_deg  = 11;   % array tilt above the horizon [deg]
 cfg.ant.rpm       = 6;    % rotation speed [rev/min]
@@ -41,23 +43,28 @@ cfg.ant.az0_deg   = 0;    % antenna azimuth at t = 0, clockwise from North [deg]
 cfg.tx.peakPower_W     = 20e3;   % peak transmit power [W]
 cfg.rx.noiseFigure_dB  = 4;      % receiver noise figure [dB]
 cfg.rx.losses_dB       = 3;      % system losses not modelled elsewhere (RF, radome, ...) [dB]
+cfg.rx.gain_dB         = 60;     % gain of the receiver path from the antenna to the ADC [dB]
+cfg.rx.txIsolation_dB  = 40;     % transmitter-to-receiver isolation (leakage while transmitting) [dB]
 cfg.rx.maxRange_m      = 80e3;   % instrumented range of the long pulse: sets the receive window [m]
 cfg.rx.addThermalNoise = true;   % false only for debugging / SNR measurements
+cfg.rx.addLeakage      = true;   % false only for debugging / SNR measurements
 
 %% ADC
 cfg.adc.fs_Hz            = 120e6;  % sampling frequency [Hz]
 cfg.adc.nBits            = 16;     % ADC word length [bit]
 cfg.adc.enob             = 12.7;   % effective number of bits
-cfg.adc.noiseAboveAdc_dB = 10;     % receiver gain: thermal noise level above the ADC noise floor [dB]
+cfg.adc.fullScale_dBm    = 10;     % power of a full-scale sine at the ADC input (2 Vpp into 50 ohm) [dBm]
 cfg.adc.addAdcNoise      = true;   % false only for debugging / SNR measurements
+cfg.adc.quantize         = true;   % false only for SNR measurements (keeps the analog values)
 cfg.adc.fIF_Hz           = 30e6;   % IF carrier of the received signal (receiver LO = fc - 30 MHz)
 
 %% Waveforms: every PRI holds a short and a long sub-pulse (short first)
-% PRI timeline: short pulse at tTx = 0 -> receive (near range) -> long pulse
-% at its tTx -> receive (far range) until the end of the window. The
-% receiver is blanked while transmitting. Both sub-pulses are on the same
-% 30 MHz IF and are separated in time. The long pulse is blind up to
-% c*150us/2 = 22.5 km; with tTx = 200 us the short pulse covers 4.2 ... 25 km.
+% PRI timeline: short pulse at its tTx -> receive (near range) -> long pulse
+% at its tTx -> receive (far range) until the end of the record. While a
+% pulse is transmitted the receiver sees the transmitter leakage. Both
+% sub-pulses are on the same 30 MHz IF and are separated in time. The long
+% pulse is blind up to c*150us/2 = 22.5 km; with tTx = 200 us the short
+% pulse covers 4.2 ... 23.7 km and hands over to the long pulse.
 cfg.wave.short.type         = 'lfm';    % 'lfm' or 'phasecode' (P4 polyphase code)
 cfg.wave.short.width_s      = 25e-6;    % pulse width [s]
 cfg.wave.short.bandwidth_Hz = 1e6;      % LFM sweep bandwidth [Hz]
@@ -76,6 +83,10 @@ cfg.prf.pri_s = 1e-3;      % PRI in fixed mode [s]
 
 %% DDC (filters come from cfg.files.ddc)
 cfg.ddc.decimation = [10 6];   % decimation factor of stage 1 and stage 2 (120 -> 12 -> 2 MHz)
+cfg.ddc.coefFracBits = 13;     % filter coefficients in the file: signed 16-bit, 13 fractional bits
+cfg.ddc.shift      = [13 13];  % right shift of the accumulator of each stage (13 = unit gain);
+                               % every stage output is rounded and saturated to signed 16 bit
+cfg.ddc.fixedPoint = true;     % false only for SNR measurements (no rounding / saturation)
 
 %% Matched filter and Doppler processing
 cfg.proc.taylorNbar   = 4;     % Taylor window (LFM only): number of nearly constant sidelobes
@@ -118,6 +129,7 @@ cfg.clutter.elevation_deg    = 0;     % elevation of the clutter returns [deg]
 cfg.sim.nScans      = 1;      % number of antenna revolutions
 cfg.sim.sectors_deg = [];     % [] = full 360 deg; else rows [azStart azEnd]: only these sectors are simulated
 cfg.sim.seed        = 1;      % random seed
+cfg.sim.swerling    = 1;      % target RCS model: 1 = Swerling 1 (new RCS every scan), 0 = constant
 cfg.sim.verbose     = true;
 
 %% Targets (see make_target.m)
@@ -132,7 +144,7 @@ cfg.io.matFormat = '-v6';                                   % '-v6' fast/uncompr
 cfg.udp.enable       = false;        % stream the DDC output of every PRI over Ethernet/UDP
 cfg.udp.host         = '127.0.0.1';
 cfg.udp.port         = 50000;
-cfg.udp.payloadBytes = 1400;         % DDC data bytes per datagram (+ 64-byte header: fits a 1500-byte
+cfg.udp.payloadBytes = 1400;         % DDC data bytes per datagram (int16 I/Q; + 64-byte header fits a 1500-byte
                                      % Ethernet MTU; use up to 65400 with jumbo frames / localhost)
 
 %% Display

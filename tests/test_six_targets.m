@@ -46,7 +46,7 @@ gate.el_deg  = 2;
 gate.vrBins  = 1.5;
 used = false(1, numel(plots));
 ok = true;
-fprintf('\n%-4s %6s | %8s %8s | %7s %7s | %6s %6s | %7s %7s | %6s %6s | %s\n', 'Tgt', 'pulse', ...
+fprintf('\n%-4s %6s %6s | %8s %8s | %7s %7s | %6s %6s | %7s %7s | %6s %6s | %s\n', 'Tgt', 'RCS', 'pulse', ...
     'R true', 'R meas', 'az tru', 'az mea', 'el tru', 'el mea', 'v fold', 'v meas', 'SNRexp', 'SNRmea', 'result');
 for i = 1:numel(cfg.targets)
     tgt = cfg.targets(i);
@@ -77,9 +77,12 @@ for i = 1:numel(cfg.targets)
     [R, az, el, vr] = target_geometry(tgt, p.time_s, cfg.ant.height_m);
     wv = sys.wave.(p.pulse);
     vFold = fold_velocity(vr, wv.lambda_m / (2*sys.dop.rowPri_s));
-    b = snr_budget(sys, tgt, p.time_s);
-    fprintf('%-4s %6s | %8.3f %8.3f | %7.2f %7.2f | %6.2f %6.2f | %7.2f %7.2f | %6.1f %6.1f | ok\n', ...
-        tgt.name, p.pulse, R/1e3, p.range_m/1e3, az, p.az_deg, el, p.el_deg, vFold, p.vr_mps, ...
+    % Expected SNR with the RCS this target had during the scan (Swerling 1)
+    tgtScan = results.targets(i);
+    tgtScan.rcs_m2 = target_rcs(tgtScan, 1 + floor(p.time_s * sys.ant.rate_dps / 360));
+    b = snr_budget(sys, tgtScan, p.time_s);
+    fprintf('%-4s %6.2f %6s | %8.3f %8.3f | %7.2f %7.2f | %6.2f %6.2f | %7.2f %7.2f | %6.1f %6.1f | ok\n', ...
+        tgt.name, tgtScan.rcs_m2, p.pulse, R/1e3, p.range_m/1e3, az, p.az_deg, el, p.el_deg, vFold, p.vr_mps, ...
         b.doppler, p.snr_dB);
 end
 

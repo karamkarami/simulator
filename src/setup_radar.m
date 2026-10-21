@@ -14,8 +14,9 @@ sys.fIF    = cfg.adc.fIF_Hz;                                  % IF carrier at th
 sys.fLO    = cfg.fc - sys.fIF;                                % receiver local oscillator [Hz]
 
 %% Input files (defaults are built when missing or when made for other cfg values)
-ant  = load_input(cfg, 'antenna', struct('fc', cfg.fc));
-ddcF = load_input(cfg, 'ddc', struct('fs_Hz', fs, 'decimation', cfg.ddc.decimation));
+ant  = load_input(cfg, 'antenna', struct('fc', cfg.fc, 'spacing', cfg.ant.elementSpacing_lambda));
+ddcF = load_input(cfg, 'ddc', struct('fs_Hz', fs, 'decimation', cfg.ddc.decimation, ...
+                                     'coefFracBits', cfg.ddc.coefFracBits));
 
 %% Antenna
 sys.ant = ant;
@@ -30,15 +31,20 @@ sys.nCh = cfg.ant.nElements;
 sys.radarConst = cfg.tx.peakPower_W * 10^(ant.txGain_dBi/10) * 10^(ant.rxChannelGain_dBi/10) ...
                * sys.lambda^2 / ((4*pi)^3 * 10^(cfg.rx.losses_dB/10));
 
-%% Noise level and ADC scaling (signals are simulated in ADC units = LSB)
+%% Receive chain: receiver input -> gain -> ADC
+% Signals at the receiver input are in sqrt(W): a sine of amplitude A has power A^2/2.
+sys.N0 = cfg.const.kB * cfg.const.T0 * 10^(cfg.rx.noiseFigure_dB/10);   % noise density [W/Hz]
+sys.rx.sigmaTh   = sqrt(sys.N0 * fs/2);                       % thermal noise per real sample [sqrt(W)]
+sys.rx.voltGain  = 10^(cfg.rx.gain_dB/20);                    % receiver path gain (amplitude)
+sys.rx.leakAmp   = sqrt(2 * cfg.tx.peakPower_W * 10^(-cfg.rx.txIsolation_dB/10));  % leakage [sqrt(W)]
 sys.adc.fullScale = 2^(cfg.adc.nBits - 1);
+fullScale_W      = 1e-3 * 10^(cfg.adc.fullScale_dBm/10);      % full-scale sine power at the ADC [W]
+sys.adc.lsbPerUnit = sys.adc.fullScale / sqrt(2*fullScale_W); % ADC input [sqrt(W)] -> LSB
 sinad      = 10^((6.02*cfg.adc.enob + 1.76)/10);              % full-scale sine / ADC noise
 adcNoise2  = sys.adc.fullScale^2/2 / sinad;                   % total ADC noise power [LSB^2]
 sys.adc.sigmaAdc = sqrt(max(adcNoise2 - 1/12, 0));            % ADC noise added before rounding [LSB]
-sys.adc.sigmaTh  = sqrt(adcNoise2 * 10^(cfg.adc.noiseAboveAdc_dB/10));   % thermal noise [LSB]
-sys.N0    = cfg.const.kB * cfg.const.T0 * 10^(cfg.rx.noiseFigure_dB/10); % noise density [W/Hz]
-sys.N0eff = sys.N0 * (sys.adc.sigmaTh^2 + adcNoise2) / sys.adc.sigmaTh^2; % incl. ADC noise
-sys.adc.scale = sys.adc.sigmaTh / sqrt(sys.N0 * fs/2);        % amplitude scale [LSB / sqrt(W)]
+sys.adc.sigmaTh  = sys.rx.sigmaTh * sys.rx.voltGain * sys.adc.lsbPerUnit;   % thermal noise at the ADC [LSB]
+sys.N0eff = sys.N0 * (sys.adc.sigmaTh^2 + adcNoise2) / sys.adc.sigmaTh^2;    % incl. ADC noise
 
 %% PRI sequence and MTI weights
 switch lower(cfg.prf.mode)
@@ -58,26 +64,33 @@ if size(sys.mtiCoeffs, 1) == 1
     sys.mtiCoeffs = repmat(sys.mtiCoeffs, sys.nStagger, 1);
 end
 
-%% DDC filters and the numerically controlled oscillator (NCO)
+%% DDC filters (signed 16-bit integers with coefFracBits fractional bits) and NCO
 D1 = cfg.ddc.decimation(1);
 D2 = cfg.ddc.decimation(2);
-sys.ddc.h1 = ddcF.h1(:);
-sys.ddc.h2 = ddcF.h2(:);
+sys.ddc.h1 = double(ddcF.h1(:));                              % integer coefficients
+sys.ddc.h2 = double(ddcF.h2(:));
+sys.ddc.shift = cfg.ddc.shift;
 sys.ddc.decim = [D1 D2];
 L1 = numel(sys.ddc.h1);
 L2 = numel(sys.ddc.h2);
 fs1 = fs / D1;
 sys.fsOut = fs1 / D2;
+% Real-valued filters (unit DC gain shape) and the extra gain of each stage
+% (2^(fracBits - shift) = 1 with the default shifts)
+q = 2^cfg.ddc.coefFracBits;
+sys.ddc.gain = 2.^(cfg.ddc.coefFracBits - cfg.ddc.shift);
+sys.ddc.h1real = sys.ddc.h1 / q;
+sys.ddc.h2real = sys.ddc.h2 / q;
 % Single filter at the ADC rate equivalent to the two stages (for the noise bandwidth)
 h2Up = zeros(D1*(L2-1)+1, 1);
-h2Up(1:D1:end) = sys.ddc.h2;
-sys.ddc.hEq = conv(sys.ddc.h1, h2Up);
+h2Up(1:D1:end) = sys.ddc.h2real;
+sys.ddc.hEq = conv(sys.ddc.h1real, h2Up);
 sys.ddc.noiseBw_Hz = fs * sum(sys.ddc.hEq.^2);                % complex noise bandwidth [Hz]
 
 %% PRI timeline: short pulse, receive, long pulse, receive
-% The receiver is blanked while a pulse is transmitted. One ADC record per
-% PRI runs from the end of the short pulse to the end of the long-pulse
-% receive window (it contains the blanked interval of the long pulse).
+% One ADC record per PRI runs from the PRI start to the end of the long-pulse
+% receive window. While a pulse is transmitted the receiver sees the
+% transmitter leakage (these samples are not used by the processing).
 names = {'short', 'long'};
 for i = 1:2
     wv = cfg.wave.(names{i});
@@ -91,18 +104,20 @@ if wl.tTx_s < ws.tTx_s + ws.width_s
     error('The long pulse must start after the end of the short pulse.');
 end
 filterSpan    = (L1-1)/fs + (L2-1)/fs1;                       % input span of one DDC output sample
-sys.rxStart_s = ceil((ws.tTx_s + ws.width_s)*fs) / fs;        % end of the short pulse
-rxEnd = wl.tTx_s + wl.width_s + 2*cfg.rx.maxRange_m/c + filterSpan + 2/sys.fsOut;
+cfarSpan      = (cfg.cfar.guardRange + cfg.cfar.trainRange) / sys.fsOut;  % range cells the CFAR cannot test
+sys.rxStart_s = 0;                                            % the record starts with the PRI
+rxEnd = wl.tTx_s + wl.width_s + 2*cfg.rx.maxRange_m/c + filterSpan + cfarSpan + 2/sys.fsOut;
 if rxEnd > min(sys.pri)
-    error('Receive window (%.1f us) does not fit in the shortest PRI; reduce cfg.rx.maxRange_m.', rxEnd*1e6);
+    error(['Receive window (%.1f us) does not fit in the shortest PRI (%.1f us): reduce ', ...
+           'cfg.rx.maxRange_m or start the long pulse earlier.'], rxEnd*1e6, min(sys.pri)*1e6);
 end
 sys.nAdc = round((rxEnd - sys.rxStart_s) * fs);
 sys.tAdc = sys.rxStart_s + (0:sys.nAdc-1)' / fs;             % ADC sample times in the PRI [s]
-sys.rxGate = single(sys.tAdc < wl.tTx_s | sys.tAdc >= wl.tTx_s + wl.width_s);  % 0 = blanked
 
-% NCO of the DDC: the real line is multiplied by cos(2*pi*fIF*t), the imaginary line by -sin(2*pi*fIF*t)
-sys.ddc.cos      = single(cos(2*pi*sys.fIF*sys.tAdc));
-sys.ddc.minusSin = single(-sin(2*pi*sys.fIF*sys.tAdc));
+% NCO of the DDC: the real line is multiplied by cos(2*pi*fIF*t), the imaginary
+% line by -sin(2*pi*fIF*t). At fIF = fs/4 these are exactly 1, 0, -1, 0, ...
+sys.ddc.cos      = round(cos(2*pi*sys.fIF*sys.tAdc) * 2^15) / 2^15;   % 16-bit NCO values
+sys.ddc.minusSin = round(-sin(2*pi*sys.fIF*sys.tAdc) * 2^15) / 2^15;
 
 % DDC output samples: their time (a valid output is centred on its input window, linear-phase
 % FIR) and the first/last ADC sample each of them depends on
@@ -114,7 +129,7 @@ firstAdc = k*D2*D1 + 1;
 lastAdc  = (k*D2 + L2 - 1)*D1 + L1;
 
 %% Receive interval, DDC segment, matched filter and delay / range axes of every sub-pulse
-rxInterval.short = [sys.rxStart_s, wl.tTx_s];                 % [start end) of the receive interval
+rxInterval.short = [ws.tTx_s + ws.width_s, wl.tTx_s];         % [start end) of the receive interval
 rxInterval.long  = [wl.tTx_s + wl.width_s, inf];
 for i = 1:2
     wv = sys.wave.(names{i});
@@ -123,6 +138,10 @@ for i = 1:2
     wv.ddcIdx = find(sys.tAdc(firstAdc) >= iv(1) & sys.tAdc(lastAdc) < iv(2)).';
     % Matched filter (Taylor window for LFM), unit noise gain
     Lp  = round(wv.width_s * sys.fsOut);                      % matched filter length [samples]
+    if numel(wv.ddcIdx) < Lp + 2*(cfg.cfar.guardRange + cfg.cfar.trainRange) + 1
+        error(['The %s-pulse receive interval is too short for its matched filter and the CFAR ', ...
+               'window: move the long pulse later or increase cfg.rx.maxRange_m.'], wv.name);
+    end
     ref = waveform_envelope(wv, ((0:Lp-1)' + 0.5) / sys.fsOut);  % mid-sample times (not on chip edges)
     if strcmpi(wv.type, 'lfm')
         win = taylor_window(Lp, cfg.proc.taylorNbar, cfg.proc.taylorSll_dB);
@@ -140,15 +159,30 @@ for i = 1:2
     wv.range_m = c * wv.delay_s / 2;                              % range axis [m]
     sys.wave.(names{i}) = wv;
 end
-if sys.wave.short.range_m(end) < sys.wave.long.range_m(1)
+% Handover: the short pulse stops where the long pulse starts to be tested
+% (its first CFAR-tested range cell), so a target is not reported twice.
+oR = cfg.cfar.guardRange + cfg.cfar.trainRange;
+handover_m = sys.wave.long.range_m(oR + 1);
+ws = sys.wave.short;
+nKeep = find(ws.range_m < handover_m, 1, 'last') + oR;        % + cells only used as CFAR training
+if nKeep < ws.nRange
+    Lp = numel(ws.mfTaps);
+    ws.nRange  = nKeep;
+    ws.ddcIdx  = ws.ddcIdx(1:nKeep + Lp - 1);                 % the matched filter then gives nKeep cells
+    ws.delay_s = ws.delay_s(1:nKeep);
+    ws.range_m = ws.range_m(1:nKeep);
+    sys.wave.short = ws;
+else
     warning('Gap in the range coverage: short pulse up to %.1f km, long pulse from %.1f km.', ...
-        sys.wave.short.range_m(end)/1e3, sys.wave.long.range_m(1)/1e3);
+        ws.range_m(end)/1e3, handover_m/1e3);
 end
+sys.handover_m = handover_m;
 
 %% Digital beamforming (disabled with a single receive element)
 sys.dbf.enabled = sys.nCh > 1;
 if sys.dbf.enabled
-    dbfF = load_input(cfg, 'dbf', struct('fc', cfg.fc, 'nElements', sys.nCh, 'tilt_deg', cfg.ant.tilt_deg));
+    dbfF = load_input(cfg, 'dbf', struct('fc', cfg.fc, 'nElements', sys.nCh, 'tilt_deg', cfg.ant.tilt_deg, ...
+                                         'spacing', cfg.ant.elementSpacing_lambda));
     if size(dbfF.W, 2) ~= sys.nCh
         error('The DBF matrix has %d columns but cfg.ant.nElements = %d.', size(dbfF.W, 2), sys.nCh);
     end
@@ -173,6 +207,10 @@ if isempty(cfg.proc.cpiLength)
     sys.cpi.length = round(sys.cpi.time_s / mean(sys.pri));
 else
     sys.cpi.length = cfg.proc.cpiLength;
+end
+if sys.staggered
+    % Staggered PRF: a whole number of stagger periods in the buffer
+    sys.cpi.length = sys.nStagger * floor(sys.cpi.length / sys.nStagger);
 end
 nTaps = size(sys.mtiCoeffs, 2);
 nOut  = sys.cpi.length - (nTaps - 1);                         % MTI output samples

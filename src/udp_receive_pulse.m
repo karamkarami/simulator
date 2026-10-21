@@ -1,8 +1,8 @@
-function [hdr, ddcData] = udp_receive_pulse(rx)
+function [hdr, I, Q] = udp_receive_pulse(rx)
 %UDP_RECEIVE_PULSE  Receive and reassemble the DDC output of one PRI sent by udp_send_pulse.m.
-%   [hdr, ddcData] = UDP_RECEIVE_PULSE(rx) reads datagrams from the receiver
+%   [hdr, I, Q] = UDP_RECEIVE_PULSE(rx) reads datagrams from the receiver
 %   rx (see udp_receiver_open.m) until all packets of one PRI have arrived.
-%   Packets of another PRI restart the reassembly. ddcData is complex single
+%   Packets of another PRI restart the reassembly. I and Q are int16
 %   [nSamples x nChannels]. This function is a reference implementation of
 %   the stream format for a receiver.
 bytes = [];
@@ -36,14 +36,15 @@ while numel(received) < nPackets
     nChannels = w16(3);
     nSamples  = w32b(1);
     if isempty(bytes)
-        bytes = zeros(1, 8*nSamples*nChannels, 'uint8');
+        bytes = zeros(1, 4*nSamples*nChannels, 'uint8');
     end
     payload = pkt(65:end);
-    bytes(8*w32b(2) + (1:numel(payload))) = payload;
+    bytes(4*w32b(2) + (1:numel(payload))) = payload;
     received = unique([received, w16(1)]);
 end
-iq = reshape(typecast(bytes, 'single'), 2, []);
-ddcData = reshape(complex(iq(1, :), iq(2, :)), nSamples, nChannels);
+iq = reshape(typecast(bytes, 'int16'), 2, []);
+I = reshape(iq(1, :), nSamples, nChannels);
+Q = reshape(iq(2, :), nSamples, nChannels);
 end
 
 function pkt = read_datagram(rx)

@@ -1,6 +1,6 @@
-function udp_send_pulse(u, hdr, ddcData)
+function udp_send_pulse(u, hdr, I, Q)
 %UDP_SEND_PULSE  Send the DDC output of one PRI as a sequence of UDP datagrams.
-%   UDP_SEND_PULSE(u, hdr, ddcData) sends the complex DDC output ddcData
+%   UDP_SEND_PULSE(u, hdr, I, Q) sends the signed 16-bit DDC output I, Q
 %   [nSamples x nChannels] of the PRI described by hdr (see pulse_header in
 %   run_radar_sim.m). Every datagram = 64-byte header + up to u.payloadBytes
 %   bytes of samples. Header (little-endian):
@@ -14,10 +14,10 @@ function udp_send_pulse(u, hdr, ddcData)
 %     bytes 32-39  double  PRI start time [s]
 %     bytes 40-47  single  DDC sample rate [Hz], time of the first DDC sample in the PRI [s]
 %     bytes 48-63  uint32  short pulse first/last DDC sample, long pulse first/last DDC sample (1-based)
-%   Payload: float32 pairs (I, Q), channel after channel (column-major order of ddcData).
-iq = single([real(ddcData(:)).'; imag(ddcData(:)).']);
+%   Payload: int16 pairs (I, Q), channel after channel (column-major order).
+iq = [reshape(int16(I), 1, []); reshape(int16(Q), 1, [])];
 bytes = typecast(iq(:).', 'uint8');
-perPacket = 8*floor(u.payloadBytes/8);               % whole complex samples
+perPacket = 4*floor(u.payloadBytes/4);               % whole complex samples
 nPackets = ceil(numel(bytes)/perPacket);
 for i = 1:nPackets
     first = (i-1)*perPacket + 1;
@@ -25,8 +25,8 @@ for i = 1:nPackets
     head = [typecast(uint32(hex2dec('52444443')), 'uint8'), ...
             typecast(uint32([hdr.pulseNumber, hdr.scanNumber]), 'uint8'), ...
             typecast(single(hdr.antennaAz_deg), 'uint8'), ...
-            typecast(uint16([i-1, nPackets, size(ddcData, 2), hdr.staggerIndex]), 'uint8'), ...
-            typecast(uint32([size(ddcData, 1), (first-1)/8]), 'uint8'), ...
+            typecast(uint16([i-1, nPackets, size(I, 2), hdr.staggerIndex]), 'uint8'), ...
+            typecast(uint32([size(I, 1), (first-1)/4]), 'uint8'), ...
             typecast(double(hdr.time_s), 'uint8'), ...
             typecast(single([hdr.ddcFs_Hz, hdr.ddcT0_s]), 'uint8'), ...
             typecast(uint32([hdr.shortDdcIdx, hdr.longDdcIdx]), 'uint8')];

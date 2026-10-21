@@ -4,7 +4,8 @@ function make_input_files(cfg, which)
 %   MAKE_INPUT_FILES(cfg) writes the four input files named in radar_config.m:
 %     antenna_pattern.mat : element spacing, azimuth pattern, elevation element
 %                           pattern, transmit elevation pattern, peak gains
-%     ddc_filters.mat     : low-pass FIR filters of the two DDC stages (h1, h2)
+%     ddc_filters.mat     : low-pass FIR filters of the two DDC stages (h1, h2),
+%                           signed 16-bit integers with 13 fractional bits
 %     dbf_matrix.mat      : elevation DBF matrix W [nBeams x cfg.ant.nElements]
 %                           and beam elevations
 %     stagger_prf.mat     : staggered PRI vector and the matching MTI weights
@@ -23,7 +24,7 @@ addpath(fullfile(fileparts(mfilename('fullpath')), 'src'));
 folder = fileparts(cfg.files.antenna);
 if ~exist(folder, 'dir'), mkdir(folder); end
 lambda = cfg.const.c / cfg.fc;
-elementSpacing_m = lambda / 2;   % element spacing in elevation [m]
+elementSpacing_m = cfg.ant.elementSpacing_lambda * lambda;   % element spacing in elevation [m]
 doAll = strcmpi(which, 'all');
 
 %% 1) Antenna
@@ -51,7 +52,7 @@ if doAll || strcmpi(which, 'antenna')
     rxChannelGain_dBi = 10*log10(26000 / (azBeamwidth_deg * elBeamwidth_deg));
     txGain_dBi        = rxChannelGain_dBi;
 
-    madeFor = struct('fc', cfg.fc);                                    %#ok<NASGU>
+    madeFor = struct('fc', cfg.fc, 'spacing', cfg.ant.elementSpacing_lambda);   %#ok<NASGU>
     save(cfg.files.antenna, 'elementSpacing_m', 'az_deg', 'azGain_dB', 'elRel_deg', ...
         'elElemGain_dB', 'txElGain_dB', 'rxChannelGain_dBi', 'txGain_dBi', 'madeFor', '-v7');
 end
@@ -61,9 +62,10 @@ end
 if doAll || strcmpi(which, 'ddc')
     fs  = cfg.adc.fs_Hz;
     fs1 = fs / cfg.ddc.decimation(1);
-    h1  = lowpass_fir(70, 5.8e6 / fs);    % stage 1: pass +-1 MHz, stop above 10.5 MHz (fs = 120 MHz)
-    h2  = lowpass_fir(66, 1.0e6 / fs1);   % stage 2: pass +-0.5 MHz, stop above 1.5 MHz (fs = 12 MHz)
-    madeFor = struct('fs_Hz', fs, 'decimation', cfg.ddc.decimation);  %#ok<NASGU>
+    q   = 2^cfg.ddc.coefFracBits;         % fixed point: signed 16 bit, 13 fractional bits
+    h1  = int16(round(q * lowpass_fir(70, 5.8e6 / fs)));    % stage 1: pass +-1 MHz, stop above 10.5 MHz
+    h2  = int16(round(q * lowpass_fir(66, 1.0e6 / fs1)));   % stage 2: pass +-0.5 MHz, stop above 1.5 MHz
+    madeFor = struct('fs_Hz', fs, 'decimation', cfg.ddc.decimation, 'coefFracBits', cfg.ddc.coefFracBits); %#ok<NASGU>
     save(cfg.files.ddc, 'h1', 'h2', 'madeFor', '-v7');
 end
 
@@ -72,14 +74,16 @@ if doAll || strcmpi(which, 'dbf')
     nElements  = cfg.ant.nElements;
     nBeams     = 21;
     uFirst     = sind(0.5 - cfg.ant.tilt_deg);     % lowest beam 0.5 deg above the horizon
-    uLast      = sind(50 - cfg.ant.tilt_deg);      % highest beam 50 deg above the horizon
+    uStep      = 1.2 * 0.886 / (nElements * cfg.ant.elementSpacing_lambda);   % 3 dB beamwidth in u
+    uLast      = min(uFirst + (nBeams-1)*uStep, sind(60 - cfg.ant.tilt_deg)); % at most 60 deg elevation
     beamU      = linspace(uFirst, uLast, nBeams)';
     beamEl_deg = cfg.ant.tilt_deg + asind(beamU);  % beam elevations (at the azimuth boresight)
     taper      = taylor_window(nElements, 4, -30);
     n          = 0:nElements-1;
     W          = (taper(:).' .* exp(-1j*2*pi*elementSpacing_m/lambda * beamU * n));
     W          = W ./ sqrt(sum(abs(W).^2, 2));     % unit noise gain for every beam
-    madeFor = struct('fc', cfg.fc, 'nElements', nElements, 'tilt_deg', cfg.ant.tilt_deg); %#ok<NASGU>
+    madeFor = struct('fc', cfg.fc, 'nElements', nElements, 'tilt_deg', cfg.ant.tilt_deg, ...
+                     'spacing', cfg.ant.elementSpacing_lambda);     %#ok<NASGU>
     save(cfg.files.dbf, 'W', 'beamEl_deg', 'madeFor', '-v7');
 end
 

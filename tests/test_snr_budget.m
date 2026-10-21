@@ -4,8 +4,9 @@ function ok = test_snr_budget(prfMode, pulseName, waveType, nElements)
 %   ok = TEST_SNR_BUDGET(prfMode, pulseName, waveType, nElements) places one target in the middle
 %   of the coverage of sub-pulse pulseName ('short' or 'long'), sweeps the
 %   antenna over it for one CPI and runs the processing chain twice:
-%     - signal only (no thermal noise, no ADC noise, no quantization)
-%     - noise only  (no target)
+%     - signal only (no thermal noise, no leakage, no ADC noise, no
+%                    quantization, DDC without rounding)
+%     - noise only  (no target, full fixed-point chain)
 %   The SNR measured after the ADC, DDC, DBF, matched filter, MTI and Doppler
 %   blocks is compared with snr_budget.m. prfMode is 'fixed' or 'staggered',
 %   waveType is 'lfm' (default) or 'phasecode', nElements is the number of
@@ -48,17 +49,21 @@ tgt.pos0_m  = tgt.pos0_m - tgt.vel_mps*tMid;                 % at R0 at the CPI 
 budget = snr_budget(sys, tgt, tMid);
 
 %% Run one CPI twice: signal only and noise only
-cfgS = cfg;  cfgS.rx.addThermalNoise = false;  cfgS.adc.addAdcNoise = false;
+cfgS = cfg;
+cfgS.rx.addThermalNoise = false;  cfgS.rx.addLeakage = false;  cfgS.adc.addAdcNoise = false;
+cfgS.adc.quantize = false;        cfgS.ddc.fixedPoint = false;
 sysS = sys;  sysS.cfg = cfgS;
-[rpS, xS] = run_cpi(sysS, tgt, tp, azAnt, wv, false);
-[rpN, xN] = run_cpi(sys, [], tp, azAnt, wv, true);
+[rpS, xS] = run_cpi(sysS, tgt, tp, azAnt, wv);
+[rpN, xN] = run_cpi(sys, [], tp, azAnt, wv);
 
 %% Measure the SNR after every block (centre pulse of the CPI)
 tau = 2*R0/c;
 inEcho = @(t) t >= wv.tTx_s + tau + 0.25*wv.width_s & t <= wv.tTx_s + tau + 0.75*wv.width_s;
 
 tSeg = sys.tDdc(wv.ddcIdx);                          % times of the DDC samples of this sub-pulse
-m.adc = mean(double(xS.adc(inEcho(sys.tAdc), 1)).^2) / var(double(xN.adc(sys.rxGate == 1, 1)));
+rxNow = sys.tAdc >= sys.wave.short.tTx_s + sys.wave.short.width_s & ...     % receiving, not transmitting
+        (sys.tAdc < sys.wave.long.tTx_s | sys.tAdc >= sys.wave.long.tTx_s + sys.wave.long.width_s + 1e-6);
+m.adc = mean(double(xS.adc(inEcho(sys.tAdc), 1)).^2) / var(double(xN.adc(rxNow, 1)));
 m.ddc = mean(abs(xS.ddc(inEcho(sys.tDdc), 1)).^2) / mean(abs(xN.ddc(wv.ddcIdx, 1)).^2);
 beam  = budget.beam;
 m.dbf = mean(abs(xS.dbf(beam, inEcho(tSeg))).^2) / mean(abs(xN.dbf(beam, :)).^2);
@@ -92,17 +97,15 @@ end
 fprintf('Result: %s\n', ternary(ok, 'PASS', 'FAIL'));
 end
 
-function [rpCpi, last] = run_cpi(sys, targets, tp, azAnt, wv, quantize)
+function [rpCpi, last] = run_cpi(sys, targets, tp, azAnt, wv)
 % Processing chain up to the matched filter for every pulse of one CPI.
 n = numel(tp);
 rpCpi = complex(zeros(sys.nBeams, wv.nRange, n, 'single'));
 k0 = ceil(n/2);
 for k = 1:n
-    x = generate_rx_signal(sys, targets, tp(k), azAnt(k), []);
-    if quantize
-        x = adc_sample(x, sys);
-    end
-    bb = ddc(x, sys);
+    x = adc_sample(generate_rx_signal(sys, targets, tp(k), azAnt(k), []), sys);
+    [I, Q] = ddc(x, sys);
+    bb = complex(single(I), single(Q));
     if sys.dbf.enabled
         bm = digital_beamforming(bb(wv.ddcIdx, :), sys.dbf.W);
     else

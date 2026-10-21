@@ -13,20 +13,21 @@ catch err
     return
 end
 
-% Small DDC output (fits the receive socket buffer) and its header
-ddcData = complex(single(randn(100, 48)), single(randn(100, 48)));
+% Small signed 16-bit DDC output (fits the receive socket buffer) and its header
+I = int16(randi([-3000 3000], 100, 48));
+Q = int16(randi([-3000 3000], 100, 48));
 hdr = struct('pulseNumber', 1234, 'scanNumber', 2, 'antennaAz_deg', 123.5, 'staggerIndex', 3, ...
              'time_s', 12.345, 'ddcFs_Hz', 2e6, 'ddcT0_s', 28e-6, 'shortDdcIdx', [1 40], 'longDdcIdx', [70 100]);
-udp_send_pulse(tx, hdr, ddcData);
-[hdrRx, dataRx] = udp_receive_pulse(rx);
+udp_send_pulse(tx, hdr, I, Q);
+[hdrRx, Irx, Qrx] = udp_receive_pulse(rx);
 udp_sender_close(tx);
 clear rx                                              % closes the udpport receiver
 
-ok = isequal(dataRx, ddcData) && hdrRx.pulseNumber == 1234 && hdrRx.scanNumber == 2 ...
+ok = isequal(Irx, I) && isequal(Qrx, Q) && hdrRx.pulseNumber == 1234 && hdrRx.scanNumber == 2 ...
      && abs(hdrRx.antennaAz_deg - 123.5) < 1e-4 && hdrRx.staggerIndex == 3 && hdrRx.time_s == 12.345 ...
      && hdrRx.ddcFs_Hz == 2e6 && isequal(hdrRx.shortDdcIdx, [1 40]) && isequal(hdrRx.longDdcIdx, [70 100]);
-fprintf('UDP stream test (DDC output, %d bytes in %d datagrams): %s\n', 8*numel(ddcData), ...
-        ceil(8*numel(ddcData)/cfgUdp.payloadBytes), ternary(ok, 'PASS', 'FAIL'));
+fprintf('UDP stream test (int16 DDC output, %d bytes in %d datagrams): %s\n', 4*numel(I), ...
+        ceil(4*numel(I)/cfgUdp.payloadBytes), ternary(ok, 'PASS', 'FAIL'));
 end
 
 function s = ternary(cond, a, b)

@@ -29,7 +29,7 @@ gEl    = pattern_gain(sys.ant.elRel_deg, sys.ant.txElGain_dB, elRel) ...
        * pattern_gain(sys.ant.elRel_deg, sys.ant.elElemGain_dB, elRel);
 area   = clut.range_m * deg2rad(cc.azStep_deg) * dR;      % cell area [m^2]
 power  = sys.radarConst * 10^(cc.sigma0_dB/10) * area ./ clut.range_m.^4 * gEl;  % [W]
-ampRms = sqrt(2*power) * sys.adc.scale;                   % [LSB]
+ampRms = sqrt(2*power);                                   % rms IF amplitude at the receiver input [sqrt(W)]
 clut.rho = ampRms .* (randn(nAz, nR) + 1j*randn(nAz, nR)) / sqrt(2);
 clut.fd_Hz = 2*cc.icmStd_mps/sys.lambda * randn(nAz, nR); % internal clutter motion
 

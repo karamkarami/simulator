@@ -5,12 +5,13 @@ function results = run_radar_sim(cfg)
 %   results = RUN_RADAR_SIM(cfg) runs it with a modified configuration.
 %
 %   Processing chain of every PRI (a short and then a long sub-pulse):
-%     1. Signal generation : target echoes + ground clutter + noise on the 30 MHz
-%                            IF, 48 elements, fs = 120 MHz, 16-bit ADC (12.7 ENOB)
+%     1. Signal generation : radar equation per target (Swerling 1), clutter, Tx
+%                            leakage and thermal noise on the 30 MHz IF, receiver
+%                            gain, 48 elements, fs = 120 MHz, 16-bit ADC (12.7 ENOB)
 %     2. Recording         : raw ADC data of every PRI -> <rawFolder>/pulse_<n>.mat
-%     3. DDC               : I/Q mixer (cos / -sin 30 MHz), two filter stages with
-%                            decimation 10 and 6 (valid convolutions)
-%                            (optional UDP streaming of the DDC output)
+%     3. DDC               : I/Q mixer (cos / -sin 30 MHz), two fixed-point filter
+%                            stages with decimation 10 and 6 (valid convolutions),
+%                            signed 16-bit I/Q output (optional UDP streaming)
 %     4. DBF               : 48 elements -> 21 elevation beams (off for 1 element)
 %     5. Matched filter    : per beam (valid convolution, Taylor window for LFM)
 %     6. CPI buffers       : circular buffers holding the pulses of one CPI (the
@@ -33,6 +34,7 @@ tStart = tic;
 %% Setup
 sys   = setup_radar(cfg);
 sched = pulse_schedule(sys);
+targets = draw_target_rcs(cfg.targets, max(sched.scan), cfg.sim.swerling);
 names = {'short', 'long'};
 if cfg.sim.verbose
     print_summary(sys, sched);
@@ -99,7 +101,7 @@ for k = 1:sched.nPulses
     if ~isempty(clut)
         clutterIf = clutter_signal(clut, sys, az, t);
     end
-    adcData = adc_sample(generate_rx_signal(sys, cfg.targets, t, az, clutterIf), sys);
+    adcData = adc_sample(generate_rx_signal(sys, targets, t, az, clutterIf, sched.scan(k)), sys);
 
     % 2) Raw data recording
     hdr = pulse_header(sys, sched, k);
@@ -108,10 +110,11 @@ for k = 1:sched.nPulses
     end
 
     % 3) DDC of the whole record (both sub-pulses) and streaming of its output
-    bb = ddc(adcData, sys);                             % [nDdc x nElements]
+    [I, Q] = ddc(adcData, sys);                         % signed 16 bit [nDdc x nElements]
     if ~isempty(udp)
-        udp_send_pulse(udp, hdr, bb);
+        udp_send_pulse(udp, hdr, I, Q);
     end
+    bb = complex(single(I), single(Q));
 
     % 4-9) Processing chain, separately for the short and the long sub-pulse
     for i = 1:2
@@ -167,6 +170,7 @@ end
 
 results.plots      = plots;
 results.sys        = sys;
+results.targets    = targets;                       % incl. the RCS of every scan (rcsScan)
 results.nProcessed = nProcessed;
 results.runTime_s  = toc(tStart);
 if cfg.sim.verbose
@@ -190,7 +194,7 @@ hdr.fc_Hz          = sys.cfg.fc;
 hdr.rxStart_s      = sys.rxStart_s;                  % time of the first ADC sample in the PRI
 hdr.shortTx_s      = [sys.wave.short.tTx_s, sys.wave.short.width_s];   % [start width]
 hdr.longTx_s       = [sys.wave.long.tTx_s,  sys.wave.long.width_s];
-hdr.ddcFs_Hz       = sys.fsOut;
+hdr.ddcFs_Hz       = sys.fsOut;                  % DDC output: signed 16-bit I/Q
 hdr.ddcT0_s        = sys.tDdc(1);                    % time of the first DDC sample in the PRI
 hdr.shortDdcIdx    = sys.wave.short.ddcIdx([1 end]); % DDC samples of the short pulse [first last]
 hdr.longDdcIdx     = sys.wave.long.ddcIdx([1 end]);
@@ -207,6 +211,11 @@ fprintf('PRF mode: %s, mean PRI = %.0f us, %d rpm, azimuth beamwidth %.2f deg\n'
     mean(sys.pri)*1e6, cfg.ant.rpm, sys.ant.azBeamwidth_deg);
 fprintf('ADC record: %.1f ... %.1f us of the PRI, IF %.0f MHz (%d samples, %.1f MB per PRI)\n', ...
     sys.rxStart_s*1e6, sys.tAdc(end)*1e6, sys.fIF/1e6, sys.nAdc, sys.nAdc*sys.nCh*2/2^20);
+noiseDdc = sys.adc.sigmaTh^2 * sum(sys.ddc.hEq.^2) * prod(sys.ddc.gain)^2;   % per complex sample
+fprintf(['Receiver gain %.0f dB: thermal noise at the ADC %.0f LSB rms (%.1f dBFS), ADC noise %.1f LSB, ', ...
+         'Tx leakage %.0f dBm at the ADC, DDC output noise %.1f LSB rms (I or Q)\n'], cfg.rx.gain_dB, ...
+    sys.adc.sigmaTh, 20*log10(sys.adc.sigmaTh*sqrt(2)/sys.adc.fullScale), sys.adc.sigmaAdc, ...
+    10*log10(sys.rx.leakAmp^2/2 * sys.rx.voltGain^2 * 1e3), sqrt(noiseDdc/2));
 names = {'short', 'long'};
 for i = 1:2
     wv = sys.wave.(names{i});

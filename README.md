@@ -153,9 +153,10 @@ there, at the same beam and Doppler, behind very strong far targets.
      isolation, in every channel.
   4. Thermal noise, k T0 F over fs/2 (NF 4 dB).
   5. The receiver gain of 60 dB.
-  6. The ADC: full scale +10 dBm (a 2 Vpp sine into 50 ohm), white ADC noise
-     for an ENOB of 12.7 added at the quantizer input, then rounding and
-     clipping to int16.
+  6. The ADC: full scale +10 dBm (a 2 Vpp sine into 50 ohm), quantization
+     to 16 bits (rounding and clipping to int16), then the ADC noise for an
+     ENOB of 12.7, after which the samples are rounded and clipped to int16
+     again (the raw data stays signed 16-bit).
 
   Signals are in sqrt(W) at the receiver input. Thermal noise reaches the
   ADC at 180 LSB rms (-42 dBFS), 36 dB above the ADC noise (2.8 LSB rms).
@@ -163,8 +164,11 @@ there, at the same beam and Doppler, behind very strong far targets.
   transmitted. It never reaches the processing (see the PRI timeline). Very
   strong near clutter can clip the ADC as well, because there is no STC.
 * **Targets:** Swerling 1. Every target gets a new exponentially
-  distributed RCS (mean `rcs_m2`) every scan (`cfg.sim.swerling = 0` for
-  constant RCS).
+  distributed RCS (mean `rcs_m2`) on every pass of the antenna, constant
+  during the dwell (`cfg.sim.swerling = 0` for constant RCS). The pass
+  number changes when the antenna points away from the target
+  (`target_look.m`), so a target near North does not change its RCS in the
+  middle of a dwell.
 * **Clutter:** constant sigma0 (-30 dB) Rayleigh cells (0.25 deg x 15 m) from
   1 km to the radar horizon, with internal motion (0.1 m/s). Scan modulation
   comes from the two-way azimuth pattern. The echo is convolved with both
@@ -261,8 +265,10 @@ datagrams.
 
 `print_snr_budget` (called at the start of every run) prints the expected
 SNR of every target after the ADC, DDC, DBF, matched filter, MTI and Doppler
-blocks. Each target is evaluated at the moment the beam crosses it. The
-table also gives the SNR needed for Pd = 0.9 (Albersheim) and the margin.
+blocks. Each target is evaluated at the moment the beam crosses it, with its
+mean RCS. The table also gives the SNR needed for Pd = 0.9 and the margin:
+for a Swerling 1 target (exact for one look, Shnidman's approximation for
+more) or, with `cfg.sim.swerling = 0`, for a steady target (Albersheim).
 Where a closed form would be approximate, the budget runs the real
 processing functions on a noise-free target:
 * the matched-filter loss: the pulse, with its Doppler shift, goes through

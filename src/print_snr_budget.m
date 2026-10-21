@@ -19,7 +19,7 @@ fprintf(['ADC: one element, one real sample | DDC: one element, one complex samp
          'Doppler: per row, %d row(s) (%.1f independent looks) integrated non-coherently\n'], ...
          sys.cpi.nRows, sys.dop.nLooks);
 if isfield(sys.cfg.sim, 'swerling') && sys.cfg.sim.swerling == 1
-    model = 'Swerling 1 target, Shnidman';
+    model = 'Swerling 1 target';
 else
     model = 'Albersheim, steady target';
 end

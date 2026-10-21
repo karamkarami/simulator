@@ -246,7 +246,7 @@ int radar_config_load(const char *path, RadarConfig *cfg, char *err, size_t errL
             const int gD = cfg->guardDoppler, oD = gD + cfg->trainDoppler;
             const int nTrain = (2 * oR + 1) * (2 * oD + 1) - (2 * gR + 1) * (2 * gD + 1);
             if (gR < 0 || gD < 0 || cfg->trainRange < 0 || cfg->trainDoppler < 0 || nTrain < 1 ||
-                nTrain != cfg->nTrain || 2 * oD + 1 > cfg->nfft)
+                nTrain != cfg->nTrain || 2 * oD + 1 > cfg->nfft || 2 * oR + 1 >= 64)
                 set_error(&rs, "invalid CFAR window in the configuration");
         }
         if (!rs.failed && (cfg->nfft & (cfg->nfft - 1)) != 0)

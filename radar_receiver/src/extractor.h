@@ -18,6 +18,8 @@ typedef struct {
     int n, capacity;
     int nDop;               /* Doppler bins (circular distance)           */
     int minHits, maxMiss;
+    int weight;             /* CPI updates represented by the next update: 1, or
+                               more after updates were skipped (overload)  */
 } Extractor;
 
 void extractor_init(Extractor *e, int nDop, int minHits, int maxMiss);

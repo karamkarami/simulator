@@ -16,6 +16,7 @@ void extractor_init(Extractor *e, int nDop, int minHits, int maxMiss)
     e->nDop = nDop;
     e->minHits = minHits;
     e->maxMiss = maxMiss;
+    e->weight = 1;
 }
 
 void extractor_free(Extractor *e)
@@ -52,12 +53,12 @@ void extractor_update(Extractor *e, const Detection *dets, int n, int flush,
             }
             PlotGroup *g = &e->groups[e->n];
             g->beam = d->beam;  g->rIdx = d->rIdx;  g->dIdx = d->dIdx;
-            g->hits = 1;  g->miss = 0;  g->best = *d;
+            g->hits = e->weight;  g->miss = 0;  g->best = *d;
             updated[e->n++] = 1;
         } else {
             PlotGroup *g = &e->groups[j];
             g->beam = d->beam;  g->rIdx = d->rIdx;  g->dIdx = d->dIdx;
-            g->hits++;
+            g->hits += e->weight;
             g->miss = 0;
             if (d->power > g->best.power) g->best = *d;
             updated[j] = 1;

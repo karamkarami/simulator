@@ -156,7 +156,7 @@ static int test_end_to_end(const char *configPath, int mfDirect, Detection *plot
         CHECK(0, "configuration %s: %s", configPath, err);
         return 0;
     }
-    cfg.mfDirect = mfDirect;
+    cfg.mfMethod = mfDirect ? MF_DIRECT : MF_AUTO;
     CHECK(cfg.nCh >= 1 && cfg.nDdc > 0 && cfg.cpiLength > 0, "configuration sizes");
     CHECK(cfg.pulse[PULSE_SHORT].ddcFirst < cfg.pulse[PULSE_LONG].ddcFirst, "short pulse before the long one");
     printf("config: %d channels, %d beams, %d DDC samples, CPI %d, nfft %d, %s PRF, %s matched filter\n",

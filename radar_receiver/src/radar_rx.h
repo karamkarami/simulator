@@ -27,6 +27,7 @@ extern "C" {
 /* ------------------------------------------------------------------------ */
 
 enum { PULSE_SHORT = 0, PULSE_LONG = 1, N_PULSES = 2 };
+enum { MF_AUTO = 0, MF_DIRECT = 1, MF_FFT = 2 };
 
 typedef struct {
     int     ddcFirst;      /* first DDC sample of this sub-pulse (0-based)            */
@@ -81,8 +82,9 @@ typedef struct {
     double  minExtent_deg;  /* azimuth extent of a plot (minHits = this / azimuth step per update) */
     double  meanPri_s;      /* mean PRI                                               */
 
-    /* run-time option (not in the file): 1 = always direct matched filter */
-    int     mfDirect;
+    /* run-time option (not in the file): matched filter method,
+     * MF_AUTO (the faster one for the thread count), MF_DIRECT or MF_FFT */
+    int     mfMethod;
 } RadarConfig;
 
 /* Loads the file written by export_receiver_config.m. Returns 0 on success. */
@@ -132,6 +134,19 @@ void udp_input_stats(const UdpInput *in, UdpStats *stats);
 void udp_input_close(UdpInput *in);
 void pri_data_free(PriData *pri);
 
+/* Reception in a thread of its own (input_thread.c): the PRIs from
+ * udp_input_next() go into a queue of 'capacity' PRIs, so the socket is
+ * emptied while the processing runs. dropWhenFull = 1 (live stream): a PRI
+ * that finds the queue full is dropped and counted; 0 (replay): the reader
+ * waits. input_thread_next() returns 1 with *pri valid until the next call,
+ * 0 on timeout, -1 when the input has ended and the queue is empty. */
+typedef struct InputThread InputThread;
+InputThread *input_thread_start(UdpInput *in, int capacity, int dropWhenFull);
+int      input_thread_next(InputThread *t, PriData **pri, int timeout_ms);
+int      input_thread_backlog(InputThread *t);     /* PRIs waiting in the queue */
+uint64_t input_thread_dropped(InputThread *t);
+void     input_thread_stop(InputThread *t);        /* stops and joins the thread */
+
 /* ------------------------------------------------------------------------ */
 /* Detections and plots (processor.c, extractor.c)                           */
 /* ------------------------------------------------------------------------ */
@@ -165,12 +180,17 @@ typedef struct {
     uint64_t pris, updates;
     uint64_t rejected;   /* PRIs whose layout (channels, DDC samples, sub-pulse samples,
                             DDC rate) differs from the configuration: not processed */
+    uint64_t skipped;    /* CPI updates skipped (processor_set_slow_time(p, 0))      */
 } ProcessorTiming;     /* accumulated times */
 
 typedef struct Processor Processor;
 Processor *processor_create(const RadarConfig *cfg, int nThreads);
 void processor_process(Processor *p, const PriData *pri, const ProcessorCallbacks *cb);
 void processor_flush(Processor *p, const ProcessorCallbacks *cb);   /* close all open plots */
+/* enabled = 0: the next PRIs get only the fast-time processing and the MTI
+ * (so the CPI buffers stay complete), their Doppler/CFAR/extraction updates
+ * are skipped. Used by the input loop when it falls behind the stream. */
+void processor_set_slow_time(Processor *p, int enabled);
 void processor_timing(const Processor *p, ProcessorTiming *t);
 void processor_destroy(Processor *p);
 

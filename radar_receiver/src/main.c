@@ -13,10 +13,13 @@
  *     --baud N               serial baud rate (default 921600)
  *     --serial-content X     'detections' (default) or 'plots'
  *     --threads N            processing threads (default: all cores but one)
+ *     --mf auto|direct|fft   matched filter: direct or FFT fast convolution (default auto: the faster)
  *     --update-every N       run Doppler/CFAR every N pulses (default from the configuration)
  *     --plots-csv FILE       plot list (default plots.csv, '' = none)
  *     --detections-csv FILE  list of all pruned CFAR detections (default: none)
  *     --idle-timeout S       stop when no data came for S seconds after the first PRI (default 0 = never)
+ *     --queue N              PRIs buffered between the input thread and the processing (default 64)
+ *     --no-skip              never skip Doppler/CFAR updates when the processing falls behind
  *     --quiet                do not print every plot
  */
 #include "radar_rx.h"
@@ -29,8 +32,8 @@
 
 typedef struct {
     const char *configPath, *recordPath, *replayPath, *snapshotPath;
-    const char *serialDevice, *serialContent, *plotsCsv, *detectionsCsv;
-    int port, baud, threads, updateEvery, ppi, quiet;
+    const char *serialDevice, *serialContent, *plotsCsv, *detectionsCsv, *mf;
+    int port, baud, threads, updateEvery, ppi, quiet, queue, noSkip;
     double idleTimeout_s;
 } Options;
 
@@ -55,8 +58,10 @@ static void usage(void)
 {
     puts("usage: radar_receiver [--config FILE] [--port N] [--record FILE] [--replay FILE]\n"
          "                      [--ppi] [--ppi-snapshot FILE] [--serial DEVICE] [--baud N]\n"
-         "                      [--serial-content detections|plots] [--threads N] [--update-every N]\n"
-         "                      [--plots-csv FILE] [--detections-csv FILE] [--idle-timeout S] [--quiet]");
+         "                      [--serial-content detections|plots] [--threads N] [--mf auto|direct|fft]\n"
+         "                      [--update-every N]\n"
+         "                      [--plots-csv FILE] [--detections-csv FILE] [--idle-timeout S] [--quiet]\n"
+         "                      [--queue N] [--no-skip]");
 }
 
 static int parse_options(int argc, char **argv, Options *o)
@@ -67,6 +72,8 @@ static int parse_options(int argc, char **argv, Options *o)
     o->baud = 921600;
     o->serialContent = "detections";
     o->plotsCsv = "plots.csv";
+    o->mf = "auto";
+    o->queue = 64;
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
         const char *v = (i + 1 < argc) ? argv[i + 1] : NULL;
@@ -81,14 +88,21 @@ static int parse_options(int argc, char **argv, Options *o)
         else if (!strcmp(a, "--baud"))           TAKE(o->baud = atoi(v));
         else if (!strcmp(a, "--serial-content")) TAKE(o->serialContent = v);
         else if (!strcmp(a, "--threads"))        TAKE(o->threads = atoi(v));
+        else if (!strcmp(a, "--mf"))             TAKE(o->mf = v);
         else if (!strcmp(a, "--update-every"))   TAKE(o->updateEvery = atoi(v));
         else if (!strcmp(a, "--plots-csv"))      TAKE(o->plotsCsv = v);
         else if (!strcmp(a, "--detections-csv")) TAKE(o->detectionsCsv = v);
         else if (!strcmp(a, "--idle-timeout"))   TAKE(o->idleTimeout_s = atof(v));
         else if (!strcmp(a, "--quiet"))          o->quiet = 1;
+        else if (!strcmp(a, "--queue"))          TAKE(o->queue = atoi(v));
+        else if (!strcmp(a, "--no-skip"))        o->noSkip = 1;
         else if (!strcmp(a, "--help") || !strcmp(a, "-h")) { usage(); return 1; }
         else { fprintf(stderr, "unknown option %s\n", a); usage(); return -1; }
 #undef TAKE
+    }
+    if (strcmp(o->mf, "auto") && strcmp(o->mf, "direct") && strcmp(o->mf, "fft")) {
+        fprintf(stderr, "--mf must be 'auto', 'direct' or 'fft'\n");
+        return -1;
     }
     if (strcmp(o->serialContent, "detections") && strcmp(o->serialContent, "plots")) {
         fprintf(stderr, "--serial-content must be 'detections' or 'plots'\n");
@@ -156,7 +170,7 @@ static void on_antenna(void *user, double az_deg, double time_s, uint32_t scan)
 /* Worker: input -> processing                                              */
 /* ------------------------------------------------------------------------ */
 
-static void print_timing(const Processor *proc, const UdpInput *in, double wall_s)
+static void print_timing(const Processor *proc, const UdpInput *in, uint64_t queueDrops, double wall_s)
 {
     ProcessorTiming t;
     UdpStats u;
@@ -169,6 +183,9 @@ static void print_timing(const Processor *proc, const UdpInput *in, double wall_
     fprintf(stderr, "Processing time per PRI: %.3f ms (DBF %.3f, MF %.3f, MTI %.3f, Doppler %.3f, "
             "CFAR+pruning %.3f, extraction %.3f)\n", t.total_ms / n, t.dbf_ms / n, t.mf_ms / n,
             t.mti_ms / n, t.doppler_ms / n, t.cfar_ms / n, t.extract_ms / n);
+    if (t.skipped || queueDrops)
+        fprintf(stderr, "Overload: %llu CPI updates skipped, %llu PRIs dropped because the queue was full\n",
+                (unsigned long long)t.skipped, (unsigned long long)queueDrops);
     if (t.rejected)
         fprintf(stderr, "PRIs ignored: %llu (their DDC layout differs from the configuration: export it again "
                 "with export_receiver_config.m)\n", (unsigned long long)t.rejected);
@@ -192,28 +209,44 @@ static int worker(void *arg)
         return 1;
     }
     ProcessorCallbacks cb = { on_detections, on_plot, on_antenna, app };
-    PriData pri;
-    memset(&pri, 0, sizeof pri);
-    if (!app->opt.replayPath)
+    /* live stream: a full queue drops PRIs; replay: the reader waits */
+    const int live = app->opt.replayPath == NULL;
+    InputThread *input = input_thread_start(in, app->opt.queue, live);
+    if (!input) {
+        fprintf(stderr, "cannot start the input thread\n");
+        processor_destroy(proc);
+        udp_input_close(in);
+        app->exitCode = 1;
+        return 1;
+    }
+    if (live)
         fprintf(stderr, "Waiting for the DDC stream on UDP port %d ...\n", app->opt.port);
+    /* While the processing is behind a live stream (more than a quarter of the
+     * queue waiting), the Doppler/CFAR updates are skipped; the fast-time
+     * processing keeps the CPI buffers complete. */
+    const int skipAbove = app->opt.queue / 4 > 2 ? app->opt.queue / 4 : 2;
     const double t0 = now_seconds();
     double lastData = 0;                                        /* 0: no PRI yet */
     while (!g_stop) {
-        int r = udp_input_next(in, &pri, 200);
+        PriData *pri = NULL;
+        int r = input_thread_next(input, &pri, 200);
         if (r < 0) break;                                      /* end of the replay file */
         if (r == 0) {
             if (app->opt.idleTimeout_s > 0 && lastData > 0 && now_seconds() - lastData > app->opt.idleTimeout_s) break;
             continue;
         }
         lastData = now_seconds();
-        processor_process(proc, &pri, &cb);
+        if (live && !app->opt.noSkip)
+            processor_set_slow_time(proc, input_thread_backlog(input) <= skipAbove);
+        processor_process(proc, pri, &cb);
     }
+    const uint64_t queueDrops = input_thread_dropped(input);
+    input_thread_stop(input);
     processor_flush(proc, &cb);
-    print_timing(proc, in, now_seconds() - t0);
+    print_timing(proc, in, queueDrops, now_seconds() - t0);
     fprintf(stderr, "Plots: %llu, CFAR detections after pruning: %llu\n",
             (unsigned long long)app->nPlots, (unsigned long long)app->nDetections);
     processor_destroy(proc);
-    pri_data_free(&pri);
     udp_input_close(in);
     return 0;
 }
@@ -230,6 +263,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "configuration: %s\n", err);
         return 1;
     }
+    app.cfg.mfMethod = !strcmp(app.opt.mf, "direct") ? MF_DIRECT : !strcmp(app.opt.mf, "fft") ? MF_FFT : MF_AUTO;
     if (app.opt.updateEvery > 0 && app.opt.updateEvery != app.cfg.updateEvery) {
         /* the plot extractor needs the same azimuth extent with the new update interval */
         app.cfg.updateEvery = app.opt.updateEvery;

@@ -54,6 +54,7 @@ add_library(radar_core STATIC
     src/udp_input.c
     src/serial_out.c
     src/platform.c
+    src/input_thread.c
 )
 target_include_directories(radar_core PUBLIC src)
 
@@ -65,6 +66,8 @@ if(RADAR_OPENMP)
         message(WARNING "OpenMP not found: the receiver runs single-threaded")
     endif()
 endif()
+find_package(Threads REQUIRED)
+target_link_libraries(radar_core PUBLIC Threads::Threads)
 if(WIN32)
     target_link_libraries(radar_core PUBLIC ws2_32)
 else()
@@ -116,6 +119,10 @@ if(RADAR_QT_FOUND)
     # The C main program links with the C++ PPI library.
     set_target_properties(radar_receiver PROPERTIES LINKER_LANGUAGE CXX)
 endif()
+
+# Sends a recorded stream (--record) over UDP at the real PRI rate
+add_executable(radar_stream_send tools/stream_send.c)
+target_link_libraries(radar_stream_send PRIVATE radar_core)
 
 # Windows: copy the Qt DLLs and plugins next to a program that uses the PPI,
 # so it starts without Qt's bin folder on PATH.

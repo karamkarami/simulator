@@ -9,7 +9,7 @@ at 921600 baud.
 
 ```
  UDP datagrams (int16 I/Q + header)  -- or a recorded file (--replay)
-        |  reassembly of each PRI (udp_input.c)
+        |  input thread: reassembly of each PRI (udp_input.c) -> queue of PRIs (input_thread.c)
         v  split in time: short-pulse samples | long-pulse samples
  DBF (21 x 48 matrix, off for 1 element)
  Matched filter (valid convolution; FFT fast convolution when it is faster)
@@ -31,7 +31,7 @@ therefore always use the same values.
 
 ## Build
 
-Requirements: a C11 compiler (GCC, Clang or MSVC), CMake 3.16 or newer,
+Requirements: a C11 compiler (GCC, Clang, or MSVC 2019 16.8 or newer), CMake 3.21 or newer,
 OpenMP (optional, for multi-threading), and Qt 5.12+ or Qt 6 Widgets
 (optional, for the PPI).
 
@@ -63,7 +63,10 @@ CMake options:
 
 On Windows, the MinGW toolchain bundled with CLion and MSVC both work.
 OpenMP and `-march=native` need no extra setup with MinGW. With MSVC,
-`/openmp` is used. The serial port is opened as `COM3` and so on.
+`/openmp` is used, and `RADAR_NATIVE` means `/arch:AVX2` (every Intel Core
+CPU since 2013). When Qt is found, `windeployqt` copies the Qt DLLs next to
+the programs after the build, so they also start outside Qt's environment.
+The serial port is opened as `COM3` and so on.
 
 ## Use with the MATLAB simulator
 
@@ -96,12 +99,15 @@ plots of both programs.
 | `--serial DEVICE` | send the CFAR output to a serial port (`/dev/ttyUSB0`, `COM3`, ...) |
 | `--baud N` | serial baud rate (default 921600) |
 | `--serial-content X` | `detections` (default: the pruned CFAR detections of every CPI update) or `plots` |
-| `--threads N` | processing threads (default: number of cores - 1) |
+| `--threads N` | processing threads (default: `OMP_NUM_THREADS`, else number of cores - 1) |
+| `--mf auto\|direct\|fft` | matched filter: direct valid convolution or FFT fast convolution (same result); `auto` (default) takes the faster one for the thread count |
 | `--update-every N` | run Doppler, CFAR and extraction every N pulses (default from the configuration: 1) |
 | `--plots-csv FILE` | plot list (default `plots.csv`; `''` = none) |
 | `--detections-csv FILE` | all pruned CFAR detections (default none) |
 | `--idle-timeout S` | stop when no PRI arrived for S seconds after the first one (default 0 = never) |
 | `--quiet` | do not print every plot |
+| `--queue N` | PRIs buffered between the input thread and the processing (default 64) |
+| `--no-skip` | never skip Doppler/CFAR updates when the processing falls behind (see Speed) |
 
 Ctrl+C (or closing the PPI window) stops the receiver. The open plots are
 closed and the processing times are printed.
@@ -115,7 +121,14 @@ order. It ignores duplicates and foreign datagrams, drops PRIs with missing
 packets (counted as incomplete), and follows the sender when it restarts.
 A jump in the pulse numbers (a PRI lost, or a skipped azimuth sector)
 restarts the CPI buffers and closes the open plots, as the MATLAB simulator
-does between simulated sectors.
+does between simulated sectors. A PRI whose layout (channels, DDC samples,
+samples of each sub-pulse, DDC rate) differs from the configuration is
+ignored and counted: export the configuration again.
+
+The datagrams are read in a thread of their own, which puts the complete
+PRIs into a queue (`--queue`). The socket is therefore emptied also while a
+Doppler/CFAR update runs. With a live stream a PRI that finds the queue full
+is dropped and counted; a replay waits instead.
 
 At the full rate of the default radar (48 channels, about 1400 DDC samples
 per PRI and 1000 PRIs/s), the stream is 340 MB/s (2.7 Gbit/s). It needs
@@ -153,26 +166,51 @@ scan.
 ## Speed
 
 The processing is written for x86 CPUs with AVX2:
-* The data is float and stored as separate real and imaginary arrays.
-* The DBF, the matched filter, the Doppler FFTs (radix 2, many signals at
-  once, in cache-sized blocks), the MTI and the CFAR (running sums) all
-  have inner loops that the compiler vectorises.
-* The MTI output of every pulse is computed once and kept in a ring.
-* The long matched filter runs as FFT fast convolution when that is
-  estimated to be faster than the direct convolution with the available
-  threads.
-* The stages are split over threads with OpenMP, and all work buffers are
+* The data is float and stored as separate real and imaginary arrays, so
+  the inner loops of every stage vectorise.
+* DBF: three beams are formed per pass over the channel data.
+* Matched filter: FFT fast convolution (same result as the valid
+  convolution) or direct convolution, whichever is faster for the filter
+  length and the number of threads.
+* Only the matched filter outputs that the MTI needs are kept, and the MTI
+  output of every pulse is computed once and kept in a ring.
+* Doppler: radix-2^2 FFTs of many cells at once, in cache-sized blocks.
+* CFAR: beam by beam, so the data stays in the cache. Range sums are built
+  from partial sums, and Doppler sums are running sums. The noise floor
+  median uses a histogram.
+* All stages are split over threads with OpenMP, and all buffers are
   allocated once.
 
 PERFORMANCE_TABLE
 
-Doppler processing and CFAR on every new pulse, as in MATLAB, need more
-time than one PRI. To keep up with the real-time stream, use
-`--update-every N` (for example 8 or 16). The fast-time processing (DBF,
-matched filter, MTI) still runs for every pulse. Doppler, CFAR and plot
-extraction then run every N pulses: 0.29 deg of antenna rotation with N = 8.
-The number of CPI detections a plot needs is scaled with N, so the plots
-stay the same.
+**Real time.** Doppler processing and CFAR on every new pulse, as in MATLAB,
+take longer than a 1 ms PRI on a small PC. The receiver handles this in two
+ways:
+* `--update-every N` (for example 4 or 8) runs Doppler, CFAR and plot
+  extraction every N pulses: 0.14 or 0.29 deg of antenna rotation. The fast
+  time processing (DBF, matched filter, MTI) still runs for every pulse.
+* Independently of that, when the processing falls behind a live stream
+  (more than a quarter of `--queue` waiting), Doppler/CFAR updates are
+  skipped until it has caught up. DBF, matched filter and MTI continue, so
+  the CPI buffers stay complete. An update after skipped ones counts for all
+  the pulses it covers. A plot then still needs detections over the same
+  azimuth extent (2 deg), so targets are still plotted as long as some
+  updates run while they are in the beam.
+  `--no-skip` switches this off.
+
+Without skipped updates the plots are exactly those of MATLAB. The stream of
+the default radar is 340 MB/s (2.7 Gbit/s). It needs 10 Gbit Ethernet and a
+receive buffer of at least 32 MB (see "Input: UDP packets").
+
+`radar_stream_send` sends a recorded stream (`--record`) at the real PRI
+rate (or `--speed X` times faster), so the receiver can be tested in real
+time without MATLAB:
+
+```sh
+radar_receiver --config cfg.bin --port 50000 --record stream.rec   # while MATLAB streams
+radar_receiver --config cfg.bin --port 50001 --update-every 4 &
+radar_stream_send stream.rec --port 50001
+```
 
 ## Tests
 

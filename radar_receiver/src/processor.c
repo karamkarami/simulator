@@ -11,9 +11,11 @@
  * to the valid convolution); the MTI output of every pulse is computed once
  * and kept in a ring buffer; the Doppler FFTs of all beam/range cells run
  * together (cells are the fast index, so the loops vectorise) in cache-sized
- * blocks; the CFAR works beam by beam with running Doppler sums so its data
- * stays in the cache; DBF, matched filter, Doppler and CFAR are split over
- * threads with OpenMP. Work buffers are allocated once.
+ * blocks (radix-2^2); the CFAR works beam by beam (range sums from partial
+ * sums, running Doppler sums) so its data stays in the cache; the noise
+ * floor median uses a histogram; DBF, matched filter, Doppler, CFAR and the
+ * noise floors are split over threads with OpenMP. Work buffers are
+ * allocated once.
  *
  * Array layouts (float, real and imaginary parts in separate arrays):
  *   cell             = beam * nRange + rangeCell
@@ -35,14 +37,29 @@
 #define PI 3.14159265358979323846
 #define CELL_BLOCK 64           /* cells per Doppler FFT block (fits the L1/L2 cache) */
 #define MF_LANES   24           /* beams per fast-convolution chunk (3 AVX registers) */
+#define HIST_SHIFT 19           /* noise floor median: histogram of float bits >> 19 */
+#define HIST_BINS  (1 << (32 - HIST_SHIFT))
+
+#if defined(__clang__)
+#  define IVDEP _Pragma("clang loop vectorize(assume_safety)")
+#elif defined(__GNUC__)
+#  define IVDEP _Pragma("GCC ivdep")
+#elif defined(_MSC_VER)
+#  define IVDEP __pragma(loop(ivdep))
+#else
+#  define IVDEP
+#endif
 
 typedef struct {
     int nR, nCells, nSlots, nMtiOut;
     float *segRe, *segIm;       /* DDC samples of this sub-pulse [ch][n]          */
     float *beamRe, *beamIm;     /* beamformer output [beam][n]                    */
-    float *cpiRe, *cpiIm;       /* matched filter outputs [slot][cell]            */
+    float *cpiRe, *cpiIm;       /* matched filter outputs of the newest nMtiTaps
+                                   pulses (all the MTI needs) [mfSlot][cell]      */
     float *mtiRe, *mtiIm;       /* MTI outputs [slot][cell]                       */
     int    last, count, nPushed;            /* CPI buffer state                   */
+    int    mfLast;                          /* newest slot of cpiRe/cpiIm         */
+    int    sinceUpdate;                     /* pulses since the last performed update */
     int    mtiLast, mtiCount;               /* MTI ring state                     */
     uint16_t *staggerIdx;       /* stagger position of every buffered pulse        */
     double   *az, *time;
@@ -62,8 +79,10 @@ typedef struct {
 typedef struct {                /* work buffers of one thread                      */
     float  *xr, *xi;            /* Doppler: one cell block [nfft][CELL_BLOCK]     */
     float  *sumO, *sumG;        /* CFAR: range box sums of one beam [nfft][nR]    */
-    double *prefix;             /* CFAR: prefix sums of four range rows           */
+    float  *partial;            /* CFAR: partial range sums, 6 x (maxNR + 2*oR + 32) */
     double *accO, *accG;        /* CFAR: Doppler running sums [nR]                */
+    uint32_t *hist;             /* noise floor: histogram of the float keys       */
+    float  *work;               /* noise floor: median candidates [nfft*maxNR]    */
 } Scratch;
 
 struct Processor {
@@ -72,6 +91,7 @@ struct Processor {
     PulseState ps[N_PULSES];
     int nThreads;
     Scratch *scratch;           /* [nThreads] */
+    int slowTime;               /* 0: skip the Doppler/CFAR updates (overload)    */
     uint32_t lastPulse;
     int havePulse;
     ProcessorTiming timing;
@@ -96,6 +116,8 @@ static void *xrealloc(void *p, size_t size)
 static void reset_buffers(PulseState *s)
 {
     s->last = -1;
+    s->mfLast = -1;
+    s->sinceUpdate = 0;
     s->count = 0;
     s->nPushed = 0;
     s->mtiLast = -1;
@@ -115,8 +137,8 @@ static int thread_num(void)
  * It is used when its estimated time is shorter than that of the direct
  * convolution (which is split over the threads beam by beam; the FFTs of
  * MF_LANES beams run in one thread). Costs per operation measured on an
- * AVX2 Xeon: 0.3 ns per complex MAC (direct), 1.5 ns per FFT unit. */
-static int mf_fft_init(const RadarConfig *cfg, const PulseConfig *pc, PulseState *s, int forceDirect, int nThreads)
+ * AVX2 Xeon: 0.3 ns per complex MAC (direct), 0.6 ns per FFT unit. */
+static int mf_fft_init(const RadarConfig *cfg, const PulseConfig *pc, PulseState *s, int method, int nThreads)
 {
     int N = 1;
     while (N < pc->ddcCount) N *= 2;
@@ -124,8 +146,8 @@ static int mf_fft_init(const RadarConfig *cfg, const PulseConfig *pc, PulseState
     while ((1 << log2N) < N) log2N++;
     const int nChunks = (cfg->nBeams + MF_LANES - 1) / MF_LANES;
     const double direct = 0.3 * pc->nTaps * pc->nRange * cfg->nBeams / nThreads;
-    const double fast = 1.5 * ((double)N * log2N + N) * nChunks * MF_LANES / (nThreads < nChunks ? nThreads : nChunks);
-    s->mfFft = !forceDirect && fast < direct;
+    const double fast = 0.6 * ((double)N * log2N + N) * nChunks * MF_LANES / (nThreads < nChunks ? nThreads : nChunks);
+    s->mfFft = method == MF_FFT || (method == MF_AUTO && fast < direct);
     if (!s->mfFft) return 0;
     s->mfN = N;
     s->mfChunks = nChunks;
@@ -144,9 +166,11 @@ static int mf_fft_init(const RadarConfig *cfg, const PulseConfig *pc, PulseState
 Processor *processor_create(const RadarConfig *cfg, int nThreads)
 {
 #ifdef _OPENMP
-    /* default: all cores but one (left for the UDP input and the display) */
-    if (nThreads <= 0) nThreads = omp_get_num_procs() > 1 ? omp_get_num_procs() - 1 : 1;
-    omp_set_num_threads(nThreads);
+    /* default: OMP_NUM_THREADS if set, else all cores but one (left for the
+     * UDP input and the display) */
+    if (nThreads <= 0 && !getenv("OMP_NUM_THREADS"))
+        nThreads = omp_get_num_procs() > 1 ? omp_get_num_procs() - 1 : 1;
+    if (nThreads > 0) omp_set_num_threads(nThreads);
     const int nThr = omp_get_max_threads();
 #else
     (void)nThreads;
@@ -165,7 +189,7 @@ Processor *processor_create(const RadarConfig *cfg, int nThreads)
         s->nSlots = cfg->cpiLength;
         s->nMtiOut = cfg->cpiLength - cfg->nMtiTaps + 1;
         size_t seg = (size_t)cfg->nCh * pc->ddcCount, beams = (size_t)cfg->nBeams * pc->ddcCount;
-        size_t cpi = (size_t)s->nSlots * s->nCells, mti = (size_t)s->nMtiOut * s->nCells;
+        size_t cpi = (size_t)cfg->nMtiTaps * s->nCells, mti = (size_t)s->nMtiOut * s->nCells;
         size_t map = (size_t)cfg->nfft * s->nCells;
         s->segRe = xcalloc(seg, sizeof(float));   s->segIm = xcalloc(seg, sizeof(float));
         s->beamRe = xcalloc(beams, sizeof(float)); s->beamIm = xcalloc(beams, sizeof(float));
@@ -176,11 +200,13 @@ Processor *processor_create(const RadarConfig *cfg, int nThreads)
         s->time = xcalloc(s->nSlots, sizeof(double));
         s->P = xcalloc(map, sizeof(float));
         s->det = xcalloc(map, 1);
-        if (mf_fft_init(cfg, pc, s, cfg->mfDirect, nThr) != 0) { processor_destroy(p); return NULL; }
+        if (mf_fft_init(cfg, pc, s, cfg->mfMethod, nThr) != 0) { processor_destroy(p); return NULL; }
         extractor_init(&s->ext, cfg->nfft, cfg->minHits, cfg->maxMiss);
         reset_buffers(s);
     }
+    const size_t partialLen = (size_t)maxNR + 2 * (cfg->guardRange + cfg->trainRange) + 32;
     p->nThreads = nThr;
+    p->slowTime = 1;
     p->scratch = xcalloc(nThr, sizeof(Scratch));
     for (int t = 0; t < nThr; t++) {
         Scratch *w = &p->scratch[t];
@@ -188,7 +214,9 @@ Processor *processor_create(const RadarConfig *cfg, int nThreads)
         w->xi = xcalloc((size_t)cfg->nfft * CELL_BLOCK, sizeof(float));
         w->sumO = xcalloc((size_t)cfg->nfft * maxNR, sizeof(float));
         w->sumG = xcalloc((size_t)cfg->nfft * maxNR, sizeof(float));
-        w->prefix = xcalloc(4 * ((size_t)maxNR + 1), sizeof(double));
+        w->partial = xcalloc(6 * partialLen, sizeof(float));
+        w->hist = xcalloc(HIST_BINS, sizeof(uint32_t));
+        w->work = xcalloc((size_t)cfg->nfft * maxNR, sizeof(float));
         w->accO = xcalloc(maxNR, sizeof(double));
         w->accG = xcalloc(maxNR, sizeof(double));
     }
@@ -211,11 +239,16 @@ void processor_destroy(Processor *p)
     }
     for (int t = 0; p->scratch && t < p->nThreads; t++) {
         Scratch *w = &p->scratch[t];
-        free(w->xr); free(w->xi); free(w->sumO); free(w->sumG); free(w->prefix); free(w->accO); free(w->accG);
+        free(w->xr); free(w->xi); free(w->sumO); free(w->sumG); free(w->partial); free(w->hist); free(w->work); free(w->accO); free(w->accG);
     }
     free(p->scratch);
     fft_plan_free(&p->fft);
     free(p);
+}
+
+void processor_set_slow_time(Processor *p, int enabled)
+{
+    p->slowTime = enabled;
 }
 
 void processor_timing(const Processor *p, ProcessorTiming *t)
@@ -241,26 +274,50 @@ static void load_segment(const RadarConfig *cfg, const PulseConfig *pc, const Pr
     }
 }
 
-/* beam b = sum over channels of W[b][ch] * x[ch]  (or the single channel). */
+/* beam b = sum over channels of W[b][ch] * x[ch]  (or the single channel).
+ * Three beams are updated per pass over a channel (fewer loads). */
 static void beamform(const RadarConfig *cfg, const PulseConfig *pc, PulseState *s)
 {
-    const int n = pc->ddcCount;
+    const int n = pc->ddcCount, nB = cfg->nBeams, nCh = cfg->nCh;
     if (!cfg->dbfEnabled) {
         memcpy(s->beamRe, s->segRe, sizeof(float) * n);
         memcpy(s->beamIm, s->segIm, sizeof(float) * n);
         return;
     }
+    const int nGroups = (nB + 2) / 3;
     #pragma omp parallel for schedule(static)
-    for (int b = 0; b < cfg->nBeams; b++) {
-        float *restrict yr = s->beamRe + (size_t)b * n, *restrict yi = s->beamIm + (size_t)b * n;
-        memset(yr, 0, sizeof(float) * n);
-        memset(yi, 0, sizeof(float) * n);
-        for (int ch = 0; ch < cfg->nCh; ch++) {
-            const float wr = cfg->wRe[b * cfg->nCh + ch], wi = cfg->wIm[b * cfg->nCh + ch];
+    for (int g = 0; g < nGroups; g++) {
+        const int b0 = 3 * g, nb = nB - b0 < 3 ? nB - b0 : 3;
+        float *y0r = s->beamRe + (size_t)b0 * n, *y0i = s->beamIm + (size_t)b0 * n;
+        memset(y0r, 0, sizeof(float) * nb * n);
+        memset(y0i, 0, sizeof(float) * nb * n);
+        if (nb < 3) {                                       /* last 1 or 2 beams */
+            for (int b = b0; b < nB; b++) {
+                float *restrict yr = s->beamRe + (size_t)b * n, *restrict yi = s->beamIm + (size_t)b * n;
+                for (int ch = 0; ch < nCh; ch++) {
+                    const float wr = cfg->wRe[b * nCh + ch], wi = cfg->wIm[b * nCh + ch];
+                    const float *restrict xr = s->segRe + (size_t)ch * n, *restrict xi = s->segIm + (size_t)ch * n;
+                    for (int k = 0; k < n; k++) {
+                        yr[k] += wr * xr[k] - wi * xi[k];
+                        yi[k] += wr * xi[k] + wi * xr[k];
+                    }
+                }
+            }
+            continue;
+        }
+        float *restrict a0r = y0r, *restrict a0i = y0i, *restrict a1r = y0r + n, *restrict a1i = y0i + n;
+        float *restrict a2r = y0r + 2 * (size_t)n, *restrict a2i = y0i + 2 * (size_t)n;
+        for (int ch = 0; ch < nCh; ch++) {
+            const float w0r = cfg->wRe[b0 * nCh + ch], w0i = cfg->wIm[b0 * nCh + ch];
+            const float w1r = cfg->wRe[(b0 + 1) * nCh + ch], w1i = cfg->wIm[(b0 + 1) * nCh + ch];
+            const float w2r = cfg->wRe[(b0 + 2) * nCh + ch], w2i = cfg->wIm[(b0 + 2) * nCh + ch];
             const float *restrict xr = s->segRe + (size_t)ch * n, *restrict xi = s->segIm + (size_t)ch * n;
+            IVDEP
             for (int k = 0; k < n; k++) {
-                yr[k] += wr * xr[k] - wi * xi[k];
-                yi[k] += wr * xi[k] + wi * xr[k];
+                const float r = xr[k], i = xi[k];
+                a0r[k] += w0r * r - w0i * i;  a0i[k] += w0r * i + w0i * r;
+                a1r[k] += w1r * r - w1i * i;  a1i[k] += w1r * i + w1i * r;
+                a2r[k] += w2r * r - w2i * i;  a2i[k] += w2r * i + w2i * r;
             }
         }
     }
@@ -347,6 +404,7 @@ static void mti_newest(const RadarConfig *cfg, PulseState *s)
     const int L = cfg->nMtiTaps, N = s->nSlots;
     const int first = (s->last - (L - 1) + N) % N;               /* oldest pulse of the output */
     const double *c = cfg->mtiCoeffs + (size_t)(s->staggerIdx[first] - 1) * L;
+    const int firstMf = (s->mfLast + 1) % L;                     /* its matched filter output  */
     s->mtiLast = (s->mtiLast + 1) % s->nMtiOut;
     float *restrict yr = s->mtiRe + (size_t)s->mtiLast * s->nCells;
     float *restrict yi = s->mtiIm + (size_t)s->mtiLast * s->nCells;
@@ -354,7 +412,7 @@ static void mti_newest(const RadarConfig *cfg, PulseState *s)
     memset(yi, 0, sizeof(float) * s->nCells);
     for (int l = 0; l < L; l++) {
         const float w = (float)c[l];
-        const int slot = (first + l) % N;
+        const int slot = (firstMf + l) % L;
         const float *restrict xr = s->cpiRe + (size_t)slot * s->nCells;
         const float *restrict xi = s->cpiIm + (size_t)slot * s->nCells;
         for (int k = 0; k < s->nCells; k++) {
@@ -386,8 +444,9 @@ static void doppler(const Processor *p, PulseState *s)
         for (int blk = 0; blk < nBlocks; blk++) {
             const int c0 = blk * CELL_BLOCK;
             const int nc = (s->nCells - c0 < CELL_BLOCK) ? s->nCells - c0 : CELL_BLOCK;
-            for (int d = 0; d < nfft; d++)
-                memset(s->P + (size_t)d * s->nCells + c0, 0, sizeof(float) * nc);
+            if (nRows > 1)
+                for (int d = 0; d < nfft; d++)
+                    memset(s->P + (size_t)d * s->nCells + c0, 0, sizeof(float) * nc);
             for (int row = 0; row < nRows; row++) {
                 /* load the row in bit-reversed order, windowed, zero padded */
                 for (int j = 0; j < nfft; j++) {
@@ -413,10 +472,15 @@ static void doppler(const Processor *p, PulseState *s)
                     const int sh = (d + nfft / 2) % nfft;
                     float *restrict pd = s->P + (size_t)sh * s->nCells + c0;
                     const float *restrict ar = xr + (size_t)d * CELL_BLOCK, *restrict ai = xi + (size_t)d * CELL_BLOCK;
-                    for (int c = 0; c < nc; c++) pd[c] += ar[c] * ar[c] + ai[c] * ai[c];
+                    if (nRows == 1) {                                  /* one row: final value */
+                        const float g = 1.0f / cfg->noiseGain[sh];
+                        for (int c = 0; c < nc; c++) pd[c] = (ar[c] * ar[c] + ai[c] * ai[c]) * g;
+                    } else {
+                        for (int c = 0; c < nc; c++) pd[c] += ar[c] * ar[c] + ai[c] * ai[c];
+                    }
                 }
             }
-            for (int d = 0; d < nfft; d++) {
+            for (int d = 0; d < nfft && nRows > 1; d++) {          /* mean over rows, noise gain */
                 const float g = scale / cfg->noiseGain[d];
                 float *restrict pd = s->P + (size_t)d * s->nCells + c0;
                 for (int c = 0; c < nc; c++) pd[c] *= g;
@@ -429,32 +493,41 @@ static void doppler(const Processor *p, PulseState *s)
 /* 2-D CA-CFAR                                                              */
 /* ------------------------------------------------------------------------ */
 
-/* y[r] = S[r+h+1] - S[r-h] with the indices clamped to 0 ... nR (zero padding);
- * S is the prefix sum of a range row (S[0] = 0). */
-static void box_from_prefix(const double *S, float *y, int nR, int h)
+/* Range box sums of one range row x (zero padded): yO[r] = sum of x over
+ * r-hO ... r+hO, yG[r] over r-hG ... r+hG. Partial sums of 1, 2, 4, 8, ...
+ * neighbouring values are built with vectorised passes, and every window
+ * is the sum of the partial sums given by the binary digits of its length
+ * (no running sum, so no rounding drift). buf: 6 x (nR + 2*hO + 32) floats. */
+static void range_box_sums(const float *x, float *yO, float *yG, int nR, int hO, int hG, float *buf)
 {
-    int r = 0;
-    for (; r < nR && r < h; r++) y[r] = (float)(S[r + h + 1 < nR ? r + h + 1 : nR] - S[0]);
-    for (; r + h + 1 <= nR; r++) y[r] = (float)(S[r + h + 1] - S[r - h]);
-    for (; r < nR; r++) y[r] = (float)(S[nR] - S[r - h > 0 ? r - h : 0]);
-}
-
-/* Range box sums (outer and guard half widths) of four Doppler rows: prefix
- * sums in double, four independent chains so the additions overlap. */
-static void range_box_sums4(const float *const x[4], double *S, float *const yO[4], float *const yG[4],
-                            int nR, int hO, int hG)
-{
-    const int ld = nR + 1;
-    double *S0 = S, *S1 = S + ld, *S2 = S + 2 * ld, *S3 = S + 3 * ld;
-    double s0 = 0, s1 = 0, s2 = 0, s3 = 0;
-    S0[0] = S1[0] = S2[0] = S3[0] = 0;
-    for (int r = 0; r < nR; r++) {
-        s0 += x[0][r];  s1 += x[1][r];  s2 += x[2][r];  s3 += x[3][r];
-        S0[r + 1] = s0; S1[r + 1] = s1; S2[r + 1] = s2; S3[r + 1] = s3;
+    const int L = nR + 2 * hO, ld = L + 32;
+    const int wO = 2 * hO + 1, wG = 2 * hG + 1;
+    float *part[6];
+    int top = 0;                                        /* part[k]: sums of 2^k values */
+    while ((2 << top) <= wO && top < 5) top++;
+    for (int k = 0; k <= top; k++) part[k] = buf + (size_t)k * ld;
+    memset(part[0], 0, sizeof(float) * hO);
+    memcpy(part[0] + hO, x, sizeof(float) * nR);
+    memset(part[0] + hO + nR, 0, sizeof(float) * (hO + 32));
+    for (int k = 1; k <= top; k++) {
+        const int sh = 1 << (k - 1), n = L - (1 << k) + 1;
+        const float *restrict a = part[k - 1];
+        float *restrict b = part[k];
+        for (int i = 0; i < n; i++) b[i] = a[i] + a[i + sh];
     }
-    for (int i = 0; i < 4; i++) {
-        box_from_prefix(S + (size_t)i * ld, yO[i], nR, hO);
-        box_from_prefix(S + (size_t)i * ld, yG[i], nR, hG);
+    const int width[2] = { wO, wG }, start[2] = { 0, hO - hG };
+    float *out[2] = { yO, yG };
+    for (int w = 0; w < 2; w++) {
+        int off = start[w], first = 1;
+        for (int k = top; k >= 0; k--) {
+            if (!(width[w] & (1 << k))) continue;
+            const float *restrict a = part[k] + off;
+            float *restrict y = out[w];
+            if (first) for (int r = 0; r < nR; r++) y[r] = a[r];
+            else       for (int r = 0; r < nR; r++) y[r] += a[r];
+            first = 0;
+            off += 1 << k;
+        }
     }
 }
 
@@ -477,17 +550,9 @@ static void cfar(const Processor *p, PulseState *s)
         Scratch *w = &p->scratch[thread_num()];
         #pragma omp for schedule(dynamic)
         for (int b = 0; b < nB; b++) {
-            for (int d0 = 0; d0 < nfft; d0 += 4) {
-                const float *x[4];
-                float *yO[4], *yG[4];
-                for (int i = 0; i < 4; i++) {          /* rows past the end repeat the last one */
-                    const int d = d0 + i < nfft ? d0 + i : nfft - 1;
-                    x[i] = s->P + (size_t)d * nCells + (size_t)b * nR;
-                    yO[i] = w->sumO + (size_t)d * nR;
-                    yG[i] = w->sumG + (size_t)d * nR;
-                }
-                range_box_sums4(x, w->prefix, yO, yG, nR, oR, gR);
-            }
+            for (int d = 0; d < nfft; d++)
+                range_box_sums(s->P + (size_t)d * nCells + (size_t)b * nR, w->sumO + (size_t)d * nR,
+                               w->sumG + (size_t)d * nR, nR, oR, gR, w->partial);
             double *restrict aO = w->accO, *restrict aG = w->accG;
             for (int r = 0; r < nR; r++) aO[r] = aG[r] = 0.0;
             for (int k = -oD; k <= oD; k++) {                  /* window of bin 0 */
@@ -559,21 +624,43 @@ static float select_kth(float *v, int n, int k)
     return v[k];
 }
 
-/* Noise floor of a beam: median of its range-Doppler map / (median/mean of the noise). */
-static double beam_noise_floor(const RadarConfig *cfg, const PulseState *s, int b, float *work)
+/* Order-preserving integer key of a float (any sign). */
+static uint32_t float_key(float x)
 {
-    const int n = cfg->nfft * s->nR;
-    for (int d = 0; d < cfg->nfft; d++)
-        memcpy(work + (size_t)d * s->nR, s->P + (size_t)d * s->nCells + (size_t)b * s->nR, sizeof(float) * s->nR);
-    double med;
-    if (n % 2) {
-        med = select_kth(work, n, n / 2);
-    } else {                                                    /* mean of the two middle values */
-        float hi = select_kth(work, n, n / 2);
-        float lo = work[0];
-        for (int i = 1; i < n / 2; i++) if (work[i] > lo) lo = work[i];   /* max of the lower half */
-        med = 0.5 * ((double)lo + hi);
+    uint32_t u;
+    memcpy(&u, &x, sizeof u);
+    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+}
+
+/* Noise floor of a beam: median of its range-Doppler map / (median/mean of
+ * the noise). Exact median: a histogram of the float keys finds the bins of
+ * the middle values, then only the values in those bins are searched. */
+static double beam_noise_floor(const RadarConfig *cfg, const PulseState *s, int b, Scratch *w)
+{
+    const int nfft = cfg->nfft, nR = s->nR, n = nfft * nR;
+    uint32_t *hist = w->hist;
+    memset(hist, 0, sizeof(uint32_t) * HIST_BINS);
+    for (int d = 0; d < nfft; d++) {
+        const float *row = s->P + (size_t)d * s->nCells + (size_t)b * nR;
+        for (int r = 0; r < nR; r++) hist[float_key(row[r]) >> HIST_SHIFT]++;
     }
+    const int kHi = n / 2, kLo = (n % 2) ? n / 2 : n / 2 - 1;      /* ranks of the middle values */
+    int binLo = -1, binHi = -1, before = 0, cum = 0;
+    for (int q = 0; q < HIST_BINS && binHi < 0; q++) {
+        if (binLo < 0 && cum + (int)hist[q] > kLo) { binLo = q; before = cum; }
+        if (cum + (int)hist[q] > kHi) binHi = q;
+        cum += (int)hist[q];
+    }
+    int m = 0;
+    for (int d = 0; d < nfft; d++) {
+        const float *row = s->P + (size_t)d * s->nCells + (size_t)b * nR;
+        for (int r = 0; r < nR; r++) {
+            const int q = (int)(float_key(row[r]) >> HIST_SHIFT);
+            if (q >= binLo && q <= binHi) w->work[m++] = row[r];
+        }
+    }
+    const float hi = select_kth(w->work, m, kHi - before);
+    const double med = (n % 2) ? hi : 0.5 * ((double)select_kth(w->work, m, kLo - before) + hi);
     return med / cfg->medianToMean;
 }
 
@@ -588,8 +675,9 @@ static void add_report(PulseState *s, const Detection *d)
 
 /* Keeps the detections that are local peaks (3x3x3 beam x range x Doppler) and
  * not sidelobes of a much stronger peak, and converts them to reports. */
-static void prune_and_report(const RadarConfig *cfg, int pulse, PulseState *s)
+static void prune_and_report(const Processor *p, int pulse, PulseState *s)
 {
+    const RadarConfig *cfg = p->cfg;
     const int nfft = cfg->nfft, nB = cfg->nBeams, nR = s->nR;
     const PulseConfig *pc = &cfg->pulse[pulse];
     Cell *cells = NULL;
@@ -652,17 +740,18 @@ static void prune_and_report(const RadarConfig *cfg, int pulse, PulseState *s)
     }
     double azCenter = atan2(sinSum / s->nSlots, cosSum / s->nSlots) * 180 / PI;
     azCenter = fmod(azCenter + 360.0, 360.0);
-    double *floors = NULL;
-    float *work = NULL;
+    /* noise floors of the beams with detections, in parallel */
+    double *floors = xcalloc(nB, sizeof(double));
+    int *beams = xcalloc(nB, sizeof(int)), nNeed = 0;
+    for (int i = 0; i < n; i++)
+        if (keep[i] && floors[cells[i].b] == 0) { floors[cells[i].b] = -1; beams[nNeed++] = cells[i].b; }
+    #pragma omp parallel for schedule(dynamic) num_threads(p->nThreads)
+    for (int j = 0; j < nNeed; j++)
+        floors[beams[j]] = beam_noise_floor(cfg, s, beams[j], &p->scratch[thread_num()]);
+    free(beams);
     for (int i = 0; i < n; i++) {
         if (!keep[i]) continue;
         const Cell *c = &cells[i];
-        if (!floors) {
-            floors = xcalloc(nB, sizeof(double));
-            for (int b = 0; b < nB; b++) floors[b] = -1;
-            work = xcalloc((size_t)nfft * nR, sizeof(float));
-        }
-        if (floors[c->b] < 0) floors[c->b] = beam_noise_floor(cfg, s, c->b, work);
         Detection d;
         memset(&d, 0, sizeof d);
         d.time_s = tSum / s->nSlots;
@@ -696,7 +785,6 @@ static void prune_and_report(const RadarConfig *cfg, int pulse, PulseState *s)
         add_report(s, &d);
     }
     free(floors);
-    free(work);
     free(keep);
     free(cells);
 }
@@ -766,7 +854,8 @@ void processor_process(Processor *p, const PriData *pri, const ProcessorCallback
         beamform(cfg, pc, s);
         p->timing.dbf_ms += elapsed_ms(&t0);
         const int slot = (s->last + 1) % s->nSlots;
-        matched_filter(cfg, pc, s, slot);
+        s->mfLast = (s->mfLast + 1) % cfg->nMtiTaps;
+        matched_filter(cfg, pc, s, s->mfLast);
         s->last = slot;
         s->staggerIdx[slot] = pri->staggerIndex >= 1 && pri->staggerIndex <= cfg->nStagger ? pri->staggerIndex : 1;
         s->az[slot] = pri->az_deg;
@@ -778,12 +867,21 @@ void processor_process(Processor *p, const PriData *pri, const ProcessorCallback
 
         /* slow time */
         if (s->count >= cfg->nMtiTaps) mti_newest(cfg, s);
+        if (s->count == s->nSlots) s->sinceUpdate++;
         p->timing.mti_ms += elapsed_ms(&t0);
         if (s->count < s->nSlots || s->nPushed != 0) continue;
+        if (!p->slowTime) {                                 /* overload: this update is skipped */
+            if (i == 0) p->timing.skipped++;
+            continue;
+        }
+        /* a plot needs detections over the same azimuth extent also when
+         * updates were skipped: an update counts for the pulses it covers */
+        s->ext.weight = s->sinceUpdate / cfg->updateEvery > 1 ? s->sinceUpdate / cfg->updateEvery : 1;
+        s->sinceUpdate = 0;
         doppler(p, s);
         p->timing.doppler_ms += elapsed_ms(&t0);
         cfar(p, s);
-        prune_and_report(cfg, i, s);
+        prune_and_report(p, i, s);
         p->timing.cfar_ms += elapsed_ms(&t0);
         if (cb && cb->detections) cb->detections(cb->user, i, s->reports, s->nReports);
         extractor_update(&s->ext, s->reports, s->nReports, 0, plot_callback, (void *)cb);

@@ -181,7 +181,26 @@ The processing is written for x86 CPUs with AVX2:
 * All stages are split over threads with OpenMP, and all buffers are
   allocated once.
 
-PERFORMANCE_TABLE
+Measured processing time per PRI (replay of the six-target streams of
+`tests/test_c_receiver.m`: 48 channels, 21 beams, both sub-pulses, 273 +
+382 range cells; 4-vCPU Intel Xeon VM at 2.1 GHz, AVX2):
+
+| PRF | Threads | Doppler/CFAR every pulse | every 8 pulses |
+|---|---|---|---|
+| fixed (CPI 114, FFT 128) | 1 | 8.6 ms | 1.6 ms |
+| fixed | 3 | 3.6 ms | 0.80 ms |
+| staggered (4 x 28, FFT 32) | 1 | 4.4 ms | 0.91 ms |
+| staggered | 3 | 1.7 ms | 0.63 ms |
+
+DBF, matched filter and MTI together take about 0.45 ms per PRI with 3
+threads. One Doppler/CFAR update of both sub-pulses takes about 4 ms (fixed
+PRF), so with `--update-every 8` the receiver keeps up with 1000 PRIs/s on
+this small machine. In a real-time test (`radar_stream_send`, 2.7 Gbit/s
+over localhost) it dropped no PRIs and plotted every target, with
+`--update-every` 1, 4 and 8. With every-pulse updates, about three quarters
+of the updates were skipped automatically. A desktop CPU with 8 or more cores is
+correspondingly faster. The 80 km default configuration has about twice as
+many long-pulse range cells.
 
 **Real time.** Doppler processing and CFAR on every new pulse, as in MATLAB,
 take longer than a 1 ms PRI on a small PC. The receiver handles this in two

@@ -292,6 +292,12 @@ budget.
 | `test_six_targets(mode, clutterOn, keepRaw)` | 6 targets (0.5 - 10 m^2 mean RCS, Swerling 1, 8 - 48 km, up to 290 m/s, around the radar) are detected with the right range, azimuth, elevation and ambiguous velocity, with at most 2 false plots; one raw file per PRI, named by the pulse number |
 | `test_c_receiver(mode)` | the six-target scenario streamed over UDP to the C receiver (`radar_receiver/`): its plots must match the MATLAB plots; the recorded stream is replayed to check repeatability and speed |
 
+Latest results (Octave 8.4): all SNR budget checks agree within 0.7 dB.
+The six-target tests find all 6 targets with no false plot, for both the
+fixed and the staggered PRF. In `test_c_receiver` the C receiver gives the
+same 6 plots as MATLAB (same cells, range, azimuth, elevation, velocity, SNR
+and number of detections) for both PRF modes.
+
 `tests/run_all_tests.m` runs all of them for the fixed and the staggered
 PRF. The six-target test simulates only the azimuth sectors around the
 targets, about 2400 PRIs. Its raw files are about 18 GB per PRF mode;

@@ -44,7 +44,10 @@ function stats = replay_ddc_udp(folder, varargin)
 %     the C receiver accepts any payload size).
 %   * Reading a file can take longer than one PRI; preload the files
 %     ('preloadMB') when the idle time is too short to read them.
-%   stats.late_s shows whether the timing was kept.
+%   stats.late_s shows whether the timing was kept. For exact real-time
+%   timing use the C sender, which reads the same files and sends the same
+%   datagrams: radar_receiver/build/radar_stream_send <folder> (see
+%   radar_receiver/README.md).
 %
 %   Example:
 %     cfg = radar_config;  cfg.io.saveDdc = true;  cfg.io.saveRaw = false;

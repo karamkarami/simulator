@@ -32,8 +32,9 @@ therefore always use the same values.
 ## Build
 
 Requirements: a C11 compiler (GCC, Clang, or MSVC 2019 16.8 or newer), CMake 3.21 or newer,
-OpenMP (optional, for multi-threading), and Qt 5.12+ or Qt 6 Widgets
-(optional, for the PPI).
+OpenMP (optional, for multi-threading), Qt 5.12+ or Qt 6 Widgets
+(optional, for the PPI) and zlib (optional: `radar_stream_send` then also
+reads compressed `-v7` DDC files; `-v6` files need nothing).
 
 **CLion:** *File > Open* the `radar_receiver` folder; CLion loads
 `CMakeLists.txt`. Choose the **Release** profile (*Settings > Build,
@@ -237,15 +238,61 @@ Without skipped updates the plots are exactly those of MATLAB. The stream of
 the default radar is 340 MB/s (2.7 Gbit/s). It needs 10 Gbit Ethernet and a
 receive buffer of at least 32 MB (see "Input: UDP packets").
 
-`radar_stream_send` sends a recorded stream (`--record`) at the real PRI
-rate (or `--speed X` times faster), so the receiver can be tested in real
-time without MATLAB:
+## Sending DDC files or a recording with the PRI timing (`radar_stream_send`)
+
+`radar_stream_send` sends recorded DDC data over UDP at the real PRI rate
+(or `--speed X` times faster), so the receiver can be tested in real time
+without MATLAB. The source is either
+
+* a folder of DDC files `ddc_<n>.mat`, written by the simulator with
+  `cfg.io.saveDdc = true` (one file per PRI: `I`, `Q`, `hdr`), or
+* a stream recorded with `radar_receiver --record FILE`.
+
+The data are not processed: every PRI of a DDC file is split into exactly
+the datagrams that the simulator sends live (`udp_make_packets.m`), with
+`--payload` bytes of samples per datagram; a recording is sent datagram by
+datagram as it was received.
 
 ```sh
+radar_stream_send ../output/ddc_pulses --host 192.168.1.20 --port 50000
+radar_stream_send ../output/ddc_pulses --payload 8192 --spread 0.8 --timing-csv timing.csv
 radar_receiver --config cfg.bin --port 50000 --record stream.rec   # while MATLAB streams
-radar_receiver --config cfg.bin --port 50001 --update-every 4 &
-radar_stream_send stream.rec --port 50001
+radar_stream_send stream.rec --port 50001 --loops 10
 ```
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--host H`, `--port N` | 127.0.0.1, 50000 | destination (IPv4) |
+| `--speed X` | 1 | replay speed (0 = as fast as possible) |
+| `--payload BYTES` | 1400 | DDC bytes per datagram (DDC files only; 1400 fits a 1500-byte MTU) |
+| `--spread F` | 0 | send the datagrams of a PRI evenly over the fraction F of the PRI instead of as one burst |
+| `--no-gaps` | | a skipped sector (gap in the pulse numbers) lasts one PRI instead of its real duration |
+| `--catch-up` | | after a late PRI, send the next ones at once until the original schedule is reached (default: keep the PRI spacing, no burst) |
+| `--loops N` | 1 | send the data N times; pulse numbers and times continue |
+| `--queue N` | 256 | PRIs read ahead (filled before the first PRI is sent) |
+| `--timing-csv FILE` | | scheduled and real send time and delay of every PRI |
+| `--quiet` | | only the summary |
+
+Timing:
+* The send time of every PRI is its PRI start time from the header
+  (`hdr.time_s`) divided by `--speed`, on one monotonic clock: errors do not
+  accumulate. The sender sleeps until 2 ms before the send time (20 ms on
+  Windows, where `Sleep` can wake a timer tick late) and busy-waits for the
+  rest. On this 4-vCPU VM, with nothing else running, the PRIs left with a
+  median delay of 0.1 us and the PRI intervals were within 13 ... 34 us
+  (99 %) of the 1 ms PRI, 1000 PRIs/s at 2.2 Gbit/s with 1400-byte payloads.
+  Late PRIs come from the operating system (the VM stalled the process for
+  up to a few ms now and then).
+* A reader thread reads and splits the files ahead into a queue of
+  `--queue` PRIs, so reading never delays a PRI (1 ms PRI: 256 PRIs =
+  0.26 s of data, 88 MB for 48 channels). Reading a 48-channel file takes
+  less than 0.5 ms.
+* At the end a summary gives the number of late PRIs, the largest and the
+  median delay and the error of the PRI intervals.
+* When the receiver runs on the same PC, leave a core for the sender
+  (`--threads`) and use `--update-every` so the receiver keeps up; on this
+  4-vCPU VM, with `--threads 2 --update-every 8`, all 397 PRIs of a
+  48-channel recording arrived complete and gave the MATLAB plot.
 
 ## Tests
 
@@ -253,6 +300,7 @@ radar_stream_send stream.rec --port 50001
 |---|---|
 | `core` (`tests/test_core.c`) | batched FFT against a direct DFT; plot extractor; a moving target through the whole chain with the exported configuration (one plot at the right range, velocity and beam); direct and fast-convolution matched filters give the same plot |
 | `udp_input` | reassembly with shuffled, duplicate, missing and foreign datagrams; timeouts; record and replay; fuzzing |
+| `ddc_files` (`tests/test_ddc_files.c`) | MAT-file reader with files written as MATLAB writes them (data in smaller storage types, small elements, skipped char field, compressed `-v7` with zlib); folder listing; the datagrams of a DDC file are accepted by `udp_input.c` and give back the same PRI; corrupted, truncated, `-v7.3` and big-endian files are refused |
 | `serial` | frame encoding and CRC; real output to a pseudo-terminal (Linux): exact bytes, 200-detection split, non-blocking drops, close |
 | `ppi` | the Qt PPI runs off-screen with antenna updates and plots and saves a snapshot |
 | `ppi_interactive` | mouse, wheel and key events: data tips, cursor readout, zoom around the cursor, pan, pin/unpin, reset, filters, persistence options, pause, clear |

@@ -317,6 +317,15 @@ stats = replay_ddc_udp('output/ddc_pulses', 'host', '192.168.1.20', 'port', 5000
   datagrams per PRI (the network stack fragments them; the C receiver accepts
   datagrams up to 64 kB) instead of 245 with 1400 bytes.
 
+For exact real-time timing use the C sender `radar_stream_send` of
+`radar_receiver/` (see its README). It reads the same folder (files saved
+with `-v6`, or `-v7` when built with zlib), sends the same datagrams, and
+keeps the PRI timing within microseconds at 2.7 Gbit/s:
+
+```sh
+radar_receiver/build/radar_stream_send output/ddc_pulses --host 192.168.1.20 --port 50000
+```
+
 ### UDP stream
 
 With `cfg.udp.enable = true`, the **DDC output** of every PRI (signed
@@ -368,7 +377,7 @@ budget.
 |---|---|
 | `test_snr_budget(mode, pulse, type, nElements)` | measured vs. expected SNR after each block (LFM or P4, 1 or 48 elements) |
 | `test_udp_stream` | the DDC output of a PRI sent over UDP to localhost is received bit-exact, with its header |
-| `test_ddc_replay` | a short run saves only the DDC files (no raw data); `replay_ddc_udp` sends them to localhost bit-exact, with the PRI timing (median delay below 10 % of the PRI) |
+| `test_ddc_replay` | a short run saves only the DDC files (no raw data); `replay_ddc_udp` sends them to localhost bit-exact, with the PRI timing (median delay below 10 % of the PRI); when built, the C sender `radar_stream_send` sends them (saved with `-v6` and `-v7`) bit-exact as well |
 | `test_short_pulse_ghost` | a strong target at 65 km is detected, and its short-pulse echo in the long window gives no ghost plot |
 | `test_six_targets(mode, clutterOn, keepRaw)` | 6 targets (0.5 - 10 m^2 mean RCS, Swerling 1, 8 - 48 km, up to 290 m/s, around the radar) are detected with the right range, azimuth, elevation and ambiguous velocity, with at most 2 false plots; one raw file per PRI, named by the pulse number |
 | `test_ppi_interactive` | PPI interaction: data tips, zoom around the cursor, pan, keys, filters, pinned tips, pause, clear, PNG |

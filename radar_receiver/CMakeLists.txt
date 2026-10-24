@@ -120,9 +120,26 @@ if(RADAR_QT_FOUND)
     set_target_properties(radar_receiver PROPERTIES LINKER_LANGUAGE CXX)
 endif()
 
-# Sends a recorded stream (--record) over UDP at the real PRI rate
+# Reading the DDC files of the simulator (ddc_<n>.mat). zlib (optional) is
+# needed only for compressed MAT-files (save -v7); -v6 files need nothing.
+add_library(radar_ddc_files STATIC tools/mat_file.c tools/ddc_files.c)
+target_include_directories(radar_ddc_files PUBLIC tools)
+find_package(ZLIB QUIET)
+if(ZLIB_FOUND)
+    target_compile_definitions(radar_ddc_files PRIVATE RADAR_HAVE_ZLIB)
+    target_link_libraries(radar_ddc_files PRIVATE ZLIB::ZLIB)
+    message(STATUS "DDC files: -v6 and compressed -v7 MAT-files (zlib)")
+else()
+    message(STATUS "zlib not found: the DDC files must be saved with -v6 (cfg.io.matFormat)")
+endif()
+if(NOT WIN32)
+    target_link_libraries(radar_ddc_files PUBLIC m)
+endif()
+
+# Sends the DDC files (ddc_<n>.mat) or a recorded stream (--record) over UDP
+# with the real PRI timing
 add_executable(radar_stream_send tools/stream_send.c)
-target_link_libraries(radar_stream_send PRIVATE radar_core)
+target_link_libraries(radar_stream_send PRIVATE radar_core radar_ddc_files)
 
 # Windows: copy the Qt DLLs and plugins next to a program that uses the PPI,
 # so it starts without Qt's bin folder on PATH.
@@ -151,6 +168,14 @@ if(RADAR_BUILD_TESTS)
     add_executable(test_core tests/test_core.c)
     target_link_libraries(test_core PRIVATE radar_core)
     add_test(NAME core COMMAND test_core ${CMAKE_CURRENT_SOURCE_DIR}/config/radar_config.bin)
+
+    add_executable(test_ddc_files tests/test_ddc_files.c)
+    target_link_libraries(test_ddc_files PRIVATE radar_core radar_ddc_files)
+    if(ZLIB_FOUND)
+        target_compile_definitions(test_ddc_files PRIVATE RADAR_HAVE_ZLIB)   # writes compressed files
+        target_link_libraries(test_ddc_files PRIVATE ZLIB::ZLIB)
+    endif()
+    add_test(NAME ddc_files COMMAND test_ddc_files)
 
     add_executable(test_udp_input tests/test_udp_input.c)
     target_link_libraries(test_udp_input PRIVATE radar_core)

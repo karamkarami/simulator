@@ -8,6 +8,9 @@ function ok = test_ddc_replay()
 %   their header, and the PRIs must leave on time: median delay below 10 % of
 %   the PRI (single late PRIs come from the operating system and are allowed)
 %   and, with 'catchUp', the replay must last as long as the recording.
+%   When the C sender radar_receiver/build/radar_stream_send is built, it
+%   sends the same files, saved with -v6 and with -v7 (compressed), and they
+%   must arrive bit-exact as well.
 
 root = fileparts(fileparts(mfilename('fullpath')));
 addpath(root, fullfile(root, 'src'));
@@ -61,12 +64,49 @@ for attempt = 1:3
     timingOk = median(stats.late_s) < 0.1*pri && abs(stats.sent_s(end) - expected) < 1e-4 + stats.late_s(end);
     if timingOk, break; end
 end
+
+% The C sender (radar_receiver/build/radar_stream_send), when it is built:
+% the same files as saved (-v6) and compressed (-v7) must arrive bit-exact
+cOk = true;
+cText = 'C sender not built';
+sender = fullfile(root, 'radar_receiver', 'build', 'radar_stream_send');
+if ispc, sender = [sender '.exe']; end
+if exist(sender, 'file')
+    v7Folder = fullfile(cfg.io.outFolder, 'ddc_pulses_v7');
+    if exist(v7Folder, 'dir')
+        delete(fullfile(v7Folder, 'ddc_*.mat'));
+    else
+        mkdir(v7Folder);
+    end
+    for k = 1:numel(files)
+        d = load(fullfile(cfg.io.ddcFolder, files(k).name));
+        save_ddc_file(v7Folder, '-v7', d.hdr, d.I, d.Q);
+    end
+    for folder = {cfg.io.ddcFolder, v7Folder}
+        [status, out] = system(sprintf('"%s" "%s" --port %d --quiet', sender, folder{1}, port));
+        cOk = cOk && status == 0;
+        for k = 1:numel(files)
+            try
+                [hdr, I, Q] = udp_receive_pulse(rx);
+            catch
+                cOk = false;
+                break
+            end
+            d = load(fullfile(cfg.io.ddcFolder, files(k).name));
+            cOk = cOk && isequal(I, d.I) && isequal(Q, d.Q) && hdr.pulseNumber == d.hdr.pulseNumber ...
+                  && hdr.time_s == d.hdr.time_s && abs(hdr.antennaAz_deg - d.hdr.antennaAz_deg) < 1e-4 ...
+                  && isequal(hdr.shortDdcIdx, d.hdr.shortDdcIdx) && isequal(hdr.longDdcIdx, d.hdr.longDdcIdx);
+        end
+        if status ~= 0, fprintf('%s', out); end
+    end
+    cText = sprintf('C sender (-v6 and -v7 files) %s', ternary(cOk, 'ok', 'FAIL'));
+end
 clear rx
-ok = filesOk && dataOk && timingOk;
+ok = filesOk && dataOk && timingOk && cOk;
 fprintf(['DDC recording and replay (%d PRIs in %.3f ms for %.3f ms of PRIs, delay median %.1f us, max %.1f us, ', ...
-         'replay %d): files %s, data %s, timing %s: %s\n'], numel(files), 1e3*stats.sent_s(end), 1e3*expected, ...
+         'replay %d): files %s, data %s, timing %s, %s: %s\n'], numel(files), 1e3*stats.sent_s(end), 1e3*expected, ...
         1e6*median(stats.late_s), 1e6*stats.maxLate_s, attempt, ternary(filesOk, 'ok', 'FAIL'), ternary(dataOk, 'ok', 'FAIL'), ...
-        ternary(timingOk, 'ok', 'FAIL'), ternary(ok, 'PASS', 'FAIL'));
+        ternary(timingOk, 'ok', 'FAIL'), cText, ternary(ok, 'PASS', 'FAIL'));
 end
 
 function s = ternary(cond, a, b)

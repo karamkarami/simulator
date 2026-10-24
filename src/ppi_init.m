@@ -22,7 +22,7 @@ function ppi = ppi_init(sys)
 %   magenta, tentative gray, with a velocity leader); shows the mean
 %   processing time per PRI of every block [us]; sets the CFAR threshold [dB]
 %   of the selected CFAR method of the running processing
-%   (Apply; Default = the value from cfg.cfar.pfa); clears the display; and
+%   (Apply; Default = the value from the method's Pfa); clears the display; and
 %   saves a screenshot (PNG). The MATLAB zoom/pan/data tip tools of the axes
 %   toolbar also work.
 cfg  = sys.cfg;
@@ -143,7 +143,7 @@ opt.history = 0;                                           % 0 all, 1 last scan,
 % CFAR threshold of the running processing
 cfar_dB = 10*log10(sys.cfar.alpha);
 y = y - 1.4*rowH;
-label('CFAR threshold [dB]', [x0 y 0.12 rowH]);
+label('CFAR thr. [dB]', [x0 y 0.12 rowH]);
 h.ui.cfar = uicontrol(fig, 'Style', 'edit', 'String', sprintf('%.2f', cfar_dB), 'Units', 'normalized', ...
     'Position', [x0+0.13 y 0.09 rowH], 'BackgroundColor', bg, 'ForegroundColor', fg);
 y = y - 1.1*rowH;
@@ -169,15 +169,18 @@ end
 y = y - 2.1*rowH;
 h.cursor = uicontrol(fig, 'Style', 'text', 'String', '', 'Units', 'normalized', 'Position', [x0 y w 2*rowH], ...
                      'BackgroundColor', 'k', 'ForegroundColor', [0.7 0.9 0.7], 'HorizontalAlignment', 'left');
-% Mean processing time of every block (set by ppi_callbacks('redraw') from ppi_update)
-helpH = 0.075;
+% Mean processing time of every block (set by ppi_callbacks('redraw') from ppi_update),
+% bottom right above the help
+helpH = 0.085;
+mono = 'FixedWidth';                                       % MATLAB's monospaced font
+if exist('OCTAVE_VERSION', 'builtin'), mono = 'Monospace'; end
 h.timing = uicontrol(fig, 'Style', 'text', 'String', '', 'Units', 'normalized', ...
-    'Position', [x0 0.01+helpH w y-0.015-helpH-0.01], 'BackgroundColor', [0.08 0.08 0.08], ...
-    'ForegroundColor', [0.85 0.85 0.85], 'HorizontalAlignment', 'left', 'FontName', 'FixedWidth', 'FontSize', 8);
+    'Position', [x0 0.015+helpH w 0.16], 'BackgroundColor', [0.08 0.08 0.08], ...
+    'ForegroundColor', [0.85 0.85 0.85], 'HorizontalAlignment', 'left', 'FontName', mono, 'FontSize', 8);
 uicontrol(fig, 'Style', 'text', 'Units', 'normalized', 'Position', [x0 0.01 w helpH], ...
     'BackgroundColor', 'k', 'ForegroundColor', [0.6 0.6 0.6], 'HorizontalAlignment', 'left', ...
-    'String', {'Wheel: zoom   Drag: pan', 'Double click: reset   Hover: tip', ...
-               'Click: pin   Keys: + - arrows r c d space'});
+    'String', {'Wheel: zoom   Drag: pan', 'Double click: reset', 'Hover: tip   Click: pin', ...
+               'Keys: + - arrows r c d space'});
 
 %% State (used by ppi_update and ppi_callbacks)
 opt.clearTime_s = -Inf;                                    % plots up to this time are cleared

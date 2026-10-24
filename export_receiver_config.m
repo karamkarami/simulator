@@ -64,6 +64,7 @@ r{end+1} = {'guardDoppler', cfg.cfar.guardDoppler};
 r{end+1} = {'trainDoppler', cfg.cfar.trainDoppler};
 r{end+1} = {'nTrain', sys.cfar.nTrain};
 r{end+1} = {'alpha', sys.cfar.alpha};
+r{end+1} = {'nLooks', sys.dop.nLooks};               % optional in the receiver (Pfa of the threshold)
 r{end+1} = {'sidelobeMargin_dB', cfg.prune.sidelobeMargin_dB};
 r{end+1} = {'minHits', max(1, ceil(cfg.extract.minExtent_deg / ...
                        (sys.ant.rate_dps * mean(sys.pri) * cfg.proc.updateEvery)))};

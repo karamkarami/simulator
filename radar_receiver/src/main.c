@@ -9,6 +9,8 @@
  *     --replay FILE          read the datagrams from FILE instead of the network
  *     --ppi                  show the PPI (Qt build only)
  *     --ppi-snapshot FILE    save the PPI as PNG at the end and close it
+ *     --ppi-show MODE        PPI shows 'plots' (default, after the plot extractor),
+ *                            'detections' (CFAR detections before it) or 'both'
  *     --serial DEVICE        send the CFAR detections to a serial port (e.g. /dev/ttyUSB0, COM3)
  *     --baud N               serial baud rate (default 921600)
  *     --serial-content X     'detections' (default) or 'plots'
@@ -20,6 +22,8 @@
  *     --idle-timeout S       stop when no data came for S seconds after the first PRI (default 0 = never)
  *     --queue N              PRIs buffered between the input thread and the processing (default 64)
  *     --no-skip              never skip Doppler/CFAR updates when the processing falls behind
+ *     --cfar-threshold DB    CA-CFAR threshold factor in dB (default from the configuration,
+ *                            i.e. from cfg.cfar.pfa); can also be changed in the PPI
  *     --quiet                do not print every plot
  */
 #include "radar_rx.h"
@@ -32,9 +36,10 @@
 
 typedef struct {
     const char *configPath, *recordPath, *replayPath, *snapshotPath;
-    const char *serialDevice, *serialContent, *plotsCsv, *detectionsCsv, *mf;
+    const char *serialDevice, *serialContent, *plotsCsv, *detectionsCsv, *mf, *ppiShow;
     int port, baud, threads, updateEvery, ppi, quiet, queue, noSkip;
     double idleTimeout_s;
+    double cfarThreshold_dB;      /* NAN: from the configuration */
 } Options;
 
 typedef struct {
@@ -43,6 +48,7 @@ typedef struct {
     SerialOut *serial;
     FILE *plotsFile, *detFile;
     uint64_t nPlots, nDetections;
+    double detArc_deg;            /* azimuth step between CPI updates (PPI detection arcs) */
     int exitCode;
 } App;
 
@@ -57,11 +63,12 @@ static void on_signal(int sig)
 static void usage(void)
 {
     puts("usage: radar_receiver [--config FILE] [--port N] [--record FILE] [--replay FILE]\n"
-         "                      [--ppi] [--ppi-snapshot FILE] [--serial DEVICE] [--baud N]\n"
+         "                      [--ppi] [--ppi-snapshot FILE] [--ppi-show plots|detections|both]\n"
+         "                      [--serial DEVICE] [--baud N]\n"
          "                      [--serial-content detections|plots] [--threads N] [--mf auto|direct|fft]\n"
          "                      [--update-every N]\n"
          "                      [--plots-csv FILE] [--detections-csv FILE] [--idle-timeout S] [--quiet]\n"
-         "                      [--queue N] [--no-skip]");
+         "                      [--queue N] [--no-skip] [--cfar-threshold DB]");
 }
 
 static int parse_options(int argc, char **argv, Options *o)
@@ -73,7 +80,9 @@ static int parse_options(int argc, char **argv, Options *o)
     o->serialContent = "detections";
     o->plotsCsv = "plots.csv";
     o->mf = "auto";
+    o->ppiShow = "plots";
     o->queue = 64;
+    o->cfarThreshold_dB = NAN;
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
         const char *v = (i + 1 < argc) ? argv[i + 1] : NULL;
@@ -84,6 +93,7 @@ static int parse_options(int argc, char **argv, Options *o)
         else if (!strcmp(a, "--replay"))         TAKE(o->replayPath = v);
         else if (!strcmp(a, "--ppi"))            o->ppi = 1;
         else if (!strcmp(a, "--ppi-snapshot"))   TAKE((o->snapshotPath = v, o->ppi = 1));
+        else if (!strcmp(a, "--ppi-show"))       TAKE(o->ppiShow = v);
         else if (!strcmp(a, "--serial"))         TAKE(o->serialDevice = v);
         else if (!strcmp(a, "--baud"))           TAKE(o->baud = atoi(v));
         else if (!strcmp(a, "--serial-content")) TAKE(o->serialContent = v);
@@ -96,12 +106,21 @@ static int parse_options(int argc, char **argv, Options *o)
         else if (!strcmp(a, "--quiet"))          o->quiet = 1;
         else if (!strcmp(a, "--queue"))          TAKE(o->queue = atoi(v));
         else if (!strcmp(a, "--no-skip"))        o->noSkip = 1;
+        else if (!strcmp(a, "--cfar-threshold")) TAKE(o->cfarThreshold_dB = atof(v));
         else if (!strcmp(a, "--help") || !strcmp(a, "-h")) { usage(); return 1; }
         else { fprintf(stderr, "unknown option %s\n", a); usage(); return -1; }
 #undef TAKE
     }
     if (strcmp(o->mf, "auto") && strcmp(o->mf, "direct") && strcmp(o->mf, "fft")) {
         fprintf(stderr, "--mf must be 'auto', 'direct' or 'fft'\n");
+        return -1;
+    }
+    if (!isnan(o->cfarThreshold_dB) && !(o->cfarThreshold_dB >= 0.0 && o->cfarThreshold_dB <= 50.0)) {
+        fprintf(stderr, "--cfar-threshold must be 0 ... 50 dB\n");
+        return -1;
+    }
+    if (strcmp(o->ppiShow, "plots") && strcmp(o->ppiShow, "detections") && strcmp(o->ppiShow, "both")) {
+        fprintf(stderr, "--ppi-show must be 'plots', 'detections' or 'both'\n");
         return -1;
     }
     if (strcmp(o->serialContent, "detections") && strcmp(o->serialContent, "plots")) {
@@ -136,6 +155,9 @@ static void on_detections(void *user, int pulse, const Detection *dets, int n)
                     d->time_s, d->az_deg, d->range_m, d->el_deg, d->vr_mps, d->snr_dB, d->beam, d->rIdx, d->dIdx);
         }
     }
+#ifdef RADAR_WITH_QT
+    if (app->opt.ppi && n > 0) ppi_post_detections(dets, n, app->detArc_deg);
+#endif
 }
 
 static void on_plot(void *user, const Detection *p)
@@ -191,6 +213,20 @@ static void print_timing(const Processor *proc, const UdpInput *in, uint64_t que
                 "with export_receiver_config.m)\n", (unsigned long long)t.rejected);
 }
 
+/* Prints the CFAR threshold in use and shows it in the PPI. */
+static void report_cfar(App *app, const Processor *proc, double default_dB, int changed)
+{
+    const double alpha = processor_cfar_alpha(proc), dB = 10.0 * log10(alpha);
+    const double pfa = cfar_pfa(alpha, app->cfg.nTrain, app->cfg.nLooks);
+    if (changed || fabs(dB - default_dB) > 1e-9) {
+        if (isnan(pfa)) fprintf(stderr, "CFAR threshold %.2f dB\n", dB);
+        else fprintf(stderr, "CFAR threshold %.2f dB (Pfa %.1e)\n", dB, pfa);
+    }
+#ifdef RADAR_WITH_QT
+    if (app->opt.ppi) ppi_post_cfar_threshold(dB, pfa, default_dB);
+#endif
+}
+
 static int worker(void *arg)
 {
     App *app = arg;
@@ -209,6 +245,10 @@ static int worker(void *arg)
         return 1;
     }
     ProcessorCallbacks cb = { on_detections, on_plot, on_antenna, app };
+    const double default_dB = 10.0 * log10(app->cfg.alpha);
+    if (!isnan(app->opt.cfarThreshold_dB))
+        processor_set_cfar_alpha(proc, pow(10.0, app->opt.cfarThreshold_dB / 10.0));
+    report_cfar(app, proc, default_dB, 0);
     /* live stream: a full queue drops PRIs; replay: the reader waits */
     const int live = app->opt.replayPath == NULL;
     InputThread *input = input_thread_start(in, app->opt.queue, live);
@@ -236,6 +276,13 @@ static int worker(void *arg)
             continue;
         }
         lastData = now_seconds();
+#ifdef RADAR_WITH_QT
+        double request_dB;
+        if (app->opt.ppi && ppi_take_cfar_request(&request_dB)) {   /* Apply in the PPI */
+            processor_set_cfar_alpha(proc, pow(10.0, request_dB / 10.0));
+            report_cfar(app, proc, default_dB, 1);
+        }
+#endif
         if (live && !app->opt.noSkip)
             processor_set_slow_time(proc, input_thread_backlog(input) <= skipAbove);
         processor_process(proc, pri, &cb);
@@ -271,6 +318,7 @@ int main(int argc, char **argv)
         const int minHits = (int)ceil(app.cfg.minExtent_deg / step_deg);     /* as run_radar_sim.m */
         app.cfg.minHits = minHits > 1 ? minHits : 1;
     }
+    app.detArc_deg = app.cfg.rate_dps * app.cfg.meanPri_s * app.cfg.updateEvery;
     fprintf(stderr, "Configuration: %d element(s), %d beam(s), DDC %d samples, short %d / long %d range cells, "
             "CPI %d pulses, FFT %d x %d row(s), update every %d pulse(s), plots need %d update(s)\n", app.cfg.nCh,
             app.cfg.nBeams, app.cfg.nDdc, app.cfg.pulse[0].nRange, app.cfg.pulse[1].nRange, app.cfg.cpiLength,
@@ -298,6 +346,8 @@ int main(int argc, char **argv)
 
     if (app.opt.ppi) {
 #ifdef RADAR_WITH_QT
+        ppi_set_display_mode(!strcmp(app.opt.ppiShow, "detections") ? PPI_SHOW_DETECTIONS
+                             : !strcmp(app.opt.ppiShow, "both") ? PPI_SHOW_BOTH : PPI_SHOW_PLOTS);
         app.exitCode = ppi_run(argc, argv, app.cfg.maxRange_m, worker, &app, &g_stop, app.opt.snapshotPath);
 #else
         fprintf(stderr, "this build has no Qt: --ppi is not available\n");

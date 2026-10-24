@@ -97,6 +97,8 @@ plots of both programs.
 | `--replay FILE` | read the datagrams from a recorded FILE instead of the network (as fast as possible) |
 | `--ppi` | show the interactive PPI (Qt build, see below) |
 | `--ppi-snapshot FILE` | save the PPI as a PNG at the end and close it |
+| `--ppi-show MODE` | what the PPI shows at the start: `plots` (default, after the plot extractor), `detections` (CFAR detections before it) or `both` |
+| `--cfar-threshold DB` | CA-CFAR threshold factor 10 log10(alpha) in dB (default: the configuration, i.e. `cfg.cfar.pfa`); can also be changed in the PPI |
 | `--serial DEVICE` | send the CFAR output to a serial port (`/dev/ttyUSB0`, `COM3`, ...) |
 | `--baud N` | serial baud rate (default 921600) |
 | `--serial-content X` | `detections` (default: the pruned CFAR detections of every CPI update) or `plots` |
@@ -162,20 +164,40 @@ file (`decode_serial.py /dev/ttyUSB0`, `decode_serial.py capture.bin --csv`).
 **PPI:** range rings, azimuth spokes (0 = North, clockwise) and the antenna
 line. Short-pulse plots are cyan and long-pulse plots yellow. They are drawn
 at ground range and, by default, removed when the antenna passes them again
-in the next scan. The PPI is interactive:
+in the next scan.
+
+The panel on the right of the window has:
+* **Display**: *Plots (after extractor)* as before; *Detections (before
+  extractor)*: the pruned CFAR detections of every CPI update, the input of
+  the plot extractor, each drawn as an arc over the azimuth step between CPI
+  updates (rotation rate x PRI x `--update-every`) at its ground range
+  (darker cyan / yellow), so a target appears as an arc about one beamwidth
+  long; or both. Key `D` switches too. The newest 60 000 detections are kept;
+  they disappear like the plots.
+* **Save screenshot (PNG) ...**: saves the PPI as it is now (without the
+  panel); the default file name has the date and time.
+* **CFAR threshold [dB]**: shows the threshold the processing uses and its
+  false alarm probability (`cfar_pfa()`, needs `nLooks` in the configuration
+  file: export it again with the current `export_receiver_config.m`).
+  *Apply* sends the value in the field to the processing thread, which uses
+  it from the next CPI update on and reports it back (also printed on the
+  console); *Default* returns to the value of the configuration.
+
+The PPI is interactive:
 
 | Action | Effect |
 |---|---|
 | mouse wheel | zoom in/out around the cursor (up to x500); rings adapt to the visible range |
 | left drag | pan |
 | double click, `R`, `Home` | reset the view |
-| hover over a plot | data tip: range, azimuth, elevation, radial velocity, SNR, time, sub-pulse, CPI hits, beam/cell/bin, pulse number |
-| click on a plot | pin its data tip on the display (click again to remove it) |
-| right click | options: short/long-pulse plots, plot labels, range rings, antenna trail, plots shown (until the antenna passes again / two scans / all until cleared), minimum SNR, reset view, clear plots, remove data tips, pause, save as PNG |
+| hover over a plot or detection | data tip: range, azimuth, elevation, radial velocity, SNR, time, sub-pulse, CPI hits (plots), beam/cell/bin, pulse number |
+| click on a plot or detection | pin its data tip on the display (click again to remove it) |
+| right click | options: show plots / detections / both, short/long pulse, plot labels, range rings, antenna trail, plots shown (until the antenna passes again / two scans / all until cleared), minimum SNR, reset view, clear display, remove data tips, pause, save a screenshot |
 | `+` `-`, arrows | zoom, pan |
 | `C` | remove the pinned data tips |
+| `D` | next display mode (plots / detections / both) |
 | space | pause/resume the display (the processing continues; the plots are shown on resume) |
-| `S` | save as PNG |
+| `S` | save a screenshot (PNG) |
 
 The status line shows the zoom and the range, azimuth and east/north
 position of the cursor.
@@ -298,10 +320,10 @@ Timing:
 
 | Test | What it checks |
 |---|---|
-| `core` (`tests/test_core.c`) | batched FFT against a direct DFT; plot extractor; a moving target through the whole chain with the exported configuration (one plot at the right range, velocity and beam); direct and fast-convolution matched filters give the same plot |
+| `core` (`tests/test_core.c`) | batched FFT against a direct DFT; plot extractor; a moving target through the whole chain with the exported configuration (one plot at the right range, velocity and beam); direct and fast-convolution matched filters give the same plot; the same target with the CFAR threshold raised to 45 dB at run time gives no detection; `cfar_pfa()` against the closed form (one look) and the Pfa 1e-8 of the configured threshold |
 | `udp_input` | reassembly with shuffled, duplicate, missing and foreign datagrams; timeouts; record and replay; fuzzing |
 | `ddc_files` (`tests/test_ddc_files.c`) | MAT-file reader with files written as MATLAB writes them (data in smaller storage types, small elements, skipped char field, compressed `-v7` with zlib); folder listing; the datagrams of a DDC file are accepted by `udp_input.c` and give back the same PRI; corrupted, truncated, `-v7.3` and big-endian files are refused |
 | `serial` | frame encoding and CRC; real output to a pseudo-terminal (Linux): exact bytes, 200-detection split, non-blocking drops, close |
-| `ppi` | the Qt PPI runs off-screen with antenna updates and plots and saves a snapshot |
-| `ppi_interactive` | mouse, wheel and key events: data tips, cursor readout, zoom around the cursor, pan, pin/unpin, reset, filters, persistence options, pause, clear |
+| `ppi` | the Qt PPI runs off-screen with antenna updates, plots, detections and a CFAR threshold report and saves a snapshot |
+| `ppi_interactive` | mouse, wheel and key events: data tips, cursor readout, zoom around the cursor, pan, pin/unpin, reset, filters, persistence options, pause, clear; detections (display modes, arcs drawn, data tips, key D); window panel: display mode box, CFAR threshold Apply/Default and its report, screenshot |
 | `../tests/test_c_receiver.m` (Octave/MATLAB) | the six-target scenario streamed over UDP to this receiver: the C plots must match the MATLAB plots; the recording is replayed to check that the result is repeatable and to measure the time |

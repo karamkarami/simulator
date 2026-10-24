@@ -92,6 +92,7 @@ struct Processor {
     int nThreads;
     Scratch *scratch;           /* [nThreads] */
     int slowTime;               /* 0: skip the Doppler/CFAR updates (overload)    */
+    double alpha;               /* CA-CFAR threshold factor in use                */
     uint32_t lastPulse;
     int havePulse;
     ProcessorTiming timing;
@@ -207,6 +208,7 @@ Processor *processor_create(const RadarConfig *cfg, int nThreads)
     const size_t partialLen = (size_t)maxNR + 2 * (cfg->guardRange + cfg->trainRange) + 32;
     p->nThreads = nThr;
     p->slowTime = 1;
+    p->alpha = cfg->alpha;
     p->scratch = xcalloc(nThr, sizeof(Scratch));
     for (int t = 0; t < nThr; t++) {
         Scratch *w = &p->scratch[t];
@@ -249,6 +251,59 @@ void processor_destroy(Processor *p)
 void processor_set_slow_time(Processor *p, int enabled)
 {
     p->slowTime = enabled;
+}
+
+void processor_set_cfar_alpha(Processor *p, double alpha)
+{
+    if (alpha > 0.0 && isfinite(alpha)) p->alpha = alpha;
+}
+
+double processor_cfar_alpha(const Processor *p)
+{
+    return p->alpha;
+}
+
+/* Continued fraction of the incomplete beta function (modified Lentz). */
+static double beta_cf(double a, double b, double x)
+{
+    const double tiny = 1e-300;
+    double c = 1.0, d = 1.0 - (a + b) * x / (a + 1.0);
+    if (fabs(d) < tiny) d = tiny;
+    d = 1.0 / d;
+    double h = d;
+    for (int m = 1; m <= 1000; m++) {
+        const int m2 = 2 * m;
+        double aa = m * (b - m) * x / ((a + m2 - 1.0) * (a + m2));
+        d = 1.0 + aa * d;  if (fabs(d) < tiny) d = tiny;
+        c = 1.0 + aa / c;  if (fabs(c) < tiny) c = tiny;
+        d = 1.0 / d;
+        h *= d * c;
+        aa = -(a + m) * (a + b + m) * x / ((a + m2) * (a + m2 + 1.0));
+        d = 1.0 + aa * d;  if (fabs(d) < tiny) d = tiny;
+        c = 1.0 + aa / c;  if (fabs(c) < tiny) c = tiny;
+        d = 1.0 / d;
+        const double del = d * c;
+        h *= del;
+        if (fabs(del - 1.0) < 1e-15) break;
+    }
+    return h;
+}
+
+/* Regularized incomplete beta function I_x(a, b) (MATLAB's betainc). */
+static double beta_inc(double x, double a, double b)
+{
+    if (x <= 0.0) return 0.0;
+    if (x >= 1.0) return 1.0;
+    const double lfront = lgamma(a + b) - lgamma(a) - lgamma(b) + a * log(x) + b * log1p(-x);
+    if (x < (a + 1.0) / (a + b + 2.0))
+        return exp(lfront) * beta_cf(a, b, x) / a;
+    return 1.0 - exp(lfront) * beta_cf(b, a, 1.0 - x) / b;
+}
+
+double cfar_pfa(double alpha, int nTrain, double nLooks)
+{
+    if (!(nLooks > 0.0) || nTrain < 1 || !(alpha >= 0.0)) return NAN;
+    return beta_inc(1.0 / (1.0 + alpha / nTrain), nTrain * nLooks, nLooks);
 }
 
 void processor_timing(const Processor *p, ProcessorTiming *t)
@@ -541,7 +596,7 @@ static void cfar(const Processor *p, PulseState *s)
     const int nfft = cfg->nfft, nB = cfg->nBeams, nR = s->nR;
     const int gR = cfg->guardRange, oR = gR + cfg->trainRange;
     const int gD = cfg->guardDoppler, oD = gD + cfg->trainDoppler;
-    const double alpha = cfg->alpha / cfg->nTrain;
+    const double alpha = p->alpha / cfg->nTrain;
     const int zeroBin = nfft / 2;
     const size_t nCells = (size_t)s->nCells;
 

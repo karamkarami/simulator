@@ -94,6 +94,8 @@ file was built for other values (for example after you change
 | `src/cfar_2d.m`, `cfar_alpha.m` | 2-D CA-CFAR |
 | `src/prune_peaks.m`, `detection_reports.m`, `plot_extractor*.m` | pruning and plot extraction |
 | `src/ppi_init.m`, `ppi_update.m`, `ppi_callbacks.m` | interactive PPI display |
+| `src/detection_log_init.m`, `detection_log_add.m` | CFAR detections kept for the PPI |
+| `src/cfar_pfa.m` | false alarm probability of a CFAR threshold (inverse of `cfar_alpha.m`) |
 | `src/snr_budget.m`, `print_snr_budget.m` | expected SNR after every block |
 | `src/six_targets_scenario.m`, `make_target.m`, `target_geometry.m`, `illumination_time.m`, `target_sectors.m` | targets |
 | `tests/` | tests (see below) |
@@ -244,18 +246,38 @@ The PPI (`ppi_init.m`) is interactive, also while the simulation runs:
 | mouse wheel | zoom in/out around the cursor (up to x500) |
 | left drag | pan |
 | double click, key `r` | reset the view (whole instrumented range) |
-| hover over a plot or a true target | data tip: range, azimuth, elevation, radial velocity, SNR, time, sub-pulse, CPI hits, beam/cell/bin (true target: range, azimuth, elevation, height, speed, RCS) |
-| click on a plot | pin its data tip (click again to remove it) |
+| hover over a plot, a detection or a true target | data tip: range, azimuth, elevation, radial velocity, SNR, time, sub-pulse, CPI hits, beam/cell/bin (true target: range, azimuth, elevation, height, speed, RCS) |
+| click on a plot or detection | pin its data tip (click again to remove it) |
 | keys `+` `-`, arrows | zoom, pan |
 | key `c` | remove the pinned data tips |
+| key `d` | next display mode (plots / detections / both) |
 | key space | pause/resume the display (the simulation continues) |
 
-The panel on the right shows or hides the short- and long-pulse plots, the
-true targets, range rings, plot labels (range and velocity next to each
-plot) and the antenna. It also has a minimum SNR, a choice of the plots shown
-(all, last scan, last 2 scans), Reset view, Clear plots, Remove data tips,
-Pause and Save PNG. The cursor position (range, azimuth, east/north) is shown
-under the buttons. In MATLAB the zoom, pan and data tip tools of the axes
+The panel on the right has:
+* **Show**: *Plots (after extractor)*, the plots of the plot extractor as
+  before; *Detections (before extractor)*, the pruned CFAR detections of
+  every CPI update, i.e. what goes into the plot extractor; or both. Every
+  detection is drawn as an arc over the azimuth step between CPI updates
+  (rotation rate x PRI x `cfg.proc.updateEvery`, 0.036 deg by default) at its
+  ground range, so a target appears as an arc about one beamwidth long (one
+  per detected range cell and Doppler bin), and a noise false alarm as a
+  short dash. Start value: `cfg.display.showMode`. The newest
+  `cfg.display.maxDetections` (100 000) detections are kept.
+* show/hide of the short- and long-pulse data, the true targets, range
+  rings, plot labels (range and velocity next to each plot) and the antenna;
+  a minimum SNR and a choice of what is shown (all, last scan, last 2 scans).
+  The filters apply to plots and detections.
+* **CFAR threshold [dB]**: the threshold factor of the 2-D CA-CFAR,
+  10 log10(alpha). *Apply* hands the value to the running simulation at its
+  next display update (`ppi_update` returns `sys` with the new
+  `sys.cfar.alpha`), from then on every CFAR uses it. *Default* goes back to
+  the value of `cfg.cfar.pfa`. The line below shows the threshold in use and
+  its false alarm probability (`cfar_pfa.m`, the inverse of `cfar_alpha.m`),
+  e.g. `applied 12.79 dB (Pfa 1.0e-08)`.
+* Reset view, Clear display, Remove data tips, Pause, and **Save screenshot
+  (PNG)**, which saves the window as it is now (file dialog, default name
+  `ppi_<date>_<time>.png`).
+The cursor position (range, azimuth, east/north) is shown under the buttons. In MATLAB the zoom, pan and data tip tools of the axes
 toolbar work as well; their data tips also list the plot values.
 `ppi_callbacks(action, fig, ...)` does the same from a script (see
 `tests/test_ppi_interactive.m`).
@@ -380,7 +402,7 @@ budget.
 | `test_ddc_replay` | a short run saves only the DDC files (no raw data); `replay_ddc_udp` sends them to localhost bit-exact, with the PRI timing (median delay below 10 % of the PRI); when built, the C sender `radar_stream_send` sends them (saved with `-v6` and `-v7`) bit-exact as well |
 | `test_short_pulse_ghost` | a strong target at 65 km is detected, and its short-pulse echo in the long window gives no ghost plot |
 | `test_six_targets(mode, clutterOn, keepRaw)` | 6 targets (0.5 - 10 m^2 mean RCS, Swerling 1, 8 - 48 km, up to 290 m/s, around the radar) are detected with the right range, azimuth, elevation and ambiguous velocity, with at most 2 false plots; one raw file per PRI, named by the pulse number |
-| `test_ppi_interactive` | PPI interaction: data tips, zoom around the cursor, pan, keys, filters, pinned tips, pause, clear, PNG |
+| `test_ppi_interactive` | PPI interaction: data tips, zoom around the cursor, pan, keys, filters, pinned tips, pause, clear, PNG; detection display (modes, arcs, data tips, filters); CFAR threshold field (Apply, hand-over through `ppi_update`, invalid input, Default, Pfa) |
 | `test_c_receiver(mode)` | the six-target scenario streamed over UDP to the C receiver (`radar_receiver/`): its plots must match the MATLAB plots; the recorded stream is replayed to check repeatability and speed |
 
 Latest results (Octave 8.4): all SNR budget checks agree within 0.7 dB.

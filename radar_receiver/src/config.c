@@ -45,6 +45,15 @@ static const Record *find(RecordSet *rs, const char *name)
     return NULL;
 }
 
+/* A scalar that older files may not have: 'fallback' if it is missing. */
+static double get_optional(RecordSet *rs, const char *name, double fallback)
+{
+    for (int i = 0; i < rs->n; i++)
+        if (strcmp(rs->rec[i].name, name) == 0)
+            return rs->rec[i].rows * rs->rec[i].cols >= 1 ? rs->rec[i].data[0] : fallback;
+    return fallback;
+}
+
 static double get_scalar(RecordSet *rs, const char *name)
 {
     const Record *r = find(rs, name);
@@ -226,6 +235,7 @@ int radar_config_load(const char *path, RadarConfig *cfg, char *err, size_t errL
         cfg->trainDoppler = get_int(&rs, "trainDoppler");
         cfg->nTrain       = get_int(&rs, "nTrain");
         cfg->alpha        = get_scalar(&rs, "alpha");
+        cfg->nLooks       = get_optional(&rs, "nLooks", 0.0);
         cfg->sidelobeMargin_dB = get_scalar(&rs, "sidelobeMargin_dB");
         cfg->minHits      = get_int(&rs, "minHits");
         cfg->maxMiss      = get_int(&rs, "maxMiss");

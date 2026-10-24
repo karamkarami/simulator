@@ -76,7 +76,9 @@ typedef struct {
 
     /* CFAR, pruning, plot extraction */
     int     guardRange, trainRange, guardDoppler, trainDoppler, nTrain;
-    double  alpha;         /* CA-CFAR threshold factor                                */
+    double  alpha;         /* CA-CFAR threshold factor (design value from cfg.cfar.pfa) */
+    double  nLooks;        /* looks of the noise power in a cell (for cfar_pfa; 0 if the
+                              file is older and does not have it)                     */
     double  sidelobeMargin_dB;
     int     minHits, maxMiss, updateEvery;
     double  minExtent_deg;  /* azimuth extent of a plot (minHits = this / azimuth step per update) */
@@ -191,6 +193,14 @@ void processor_flush(Processor *p, const ProcessorCallbacks *cb);   /* close all
  * (so the CPI buffers stay complete), their Doppler/CFAR/extraction updates
  * are skipped. Used by the input loop when it falls behind the stream. */
 void processor_set_slow_time(Processor *p, int enabled);
+/* CA-CFAR threshold factor used from the next CPI update on (starts at
+ * cfg->alpha). threshold [dB] = 10*log10(alpha). Call from the processing thread. */
+void   processor_set_cfar_alpha(Processor *p, double alpha);
+double processor_cfar_alpha(const Processor *p);
+/* False alarm probability of the CA-CFAR with factor alpha (inverse of
+ * cfar_alpha.m): I(1/(1 + alpha/nTrain); nTrain*nLooks, nLooks). NaN if
+ * nLooks <= 0. */
+double cfar_pfa(double alpha, int nTrain, double nLooks);
 void processor_timing(const Processor *p, ProcessorTiming *t);
 void processor_destroy(Processor *p);
 
@@ -232,6 +242,20 @@ int  ppi_run(int argc, char **argv, double maxRange_m, int (*worker)(void *), vo
 /* Thread-safe calls from the worker thread. */
 void ppi_post_antenna(double az_deg, double time_s, uint32_t scan);
 void ppi_post_plot(const Detection *plot);
+/* The pruned CFAR detections of a CPI update (before the plot extractor).
+ * The PPI draws each one as an arc of arcWidth_deg (the azimuth step between
+ * CPI updates) when its display mode shows detections. */
+void ppi_post_detections(const Detection *dets, int n, double arcWidth_deg);
+/* CFAR threshold field of the PPI: the worker reports the threshold it uses
+ * (and its Pfa, NaN if unknown; default_dB = the design value for the Default
+ * button); ppi_take_cfar_request() returns 1 and the new threshold when the
+ * user pressed Apply (or Default) since the last call. */
+void ppi_post_cfar_threshold(double threshold_dB, double pfa, double default_dB);
+int  ppi_take_cfar_request(double *threshold_dB);
+/* Display mode at the start of ppi_run (call before it): plots after the plot
+ * extractor (default), CFAR detections before it, or both. */
+enum { PPI_SHOW_PLOTS = 0, PPI_SHOW_DETECTIONS = 1, PPI_SHOW_BOTH = 2 };
+void ppi_set_display_mode(int mode);
 
 /* ------------------------------------------------------------------------ */
 /* Platform helpers (platform.c)                                             */

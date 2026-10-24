@@ -148,7 +148,7 @@ static int16_t sat16(double v)
 /* A target of the long pulse: echo = transmitted waveform (from the matched
  * filter taps), steered to one elevation beam, moving with vr. Noise 16 LSB rms
  * per component like the simulator's DDC output. */
-static int test_end_to_end(const char *configPath, int mfDirect, Detection *plotOut)
+static int test_end_to_end(const char *configPath, int mfDirect, double threshold_dB, Detection *plotOut)
 {
     RadarConfig cfg;
     char err[256];
@@ -191,6 +191,8 @@ static int test_end_to_end(const char *configPath, int mfDirect, Detection *plot
 
     Processor *proc = processor_create(&cfg, 0);
     CHECK(proc != NULL, "processor_create");
+    CHECK(processor_cfar_alpha(proc) == cfg.alpha, "the CFAR threshold starts at the configuration value");
+    if (!isnan(threshold_dB)) processor_set_cfar_alpha(proc, pow(10.0, threshold_dB / 10.0));
     Sink sink;
     memset(&sink, 0, sizeof sink);
     ProcessorCallbacks cb = { on_detections, on_plot, NULL, &sink };
@@ -235,6 +237,17 @@ static int test_end_to_end(const char *configPath, int mfDirect, Detection *plot
            sink.dets[0], sink.dets[1], sink.plots.n);
     CHECK(sink.updates[PULSE_LONG] == nPulses - cfg.cpiLength + 1 || cfg.updateEvery > 1,
           "CPI updates %d", sink.updates[PULSE_LONG]);
+    if (!isnan(threshold_dB)) {          /* a threshold above the target peak: nothing is detected */
+        CHECK(sink.dets[0] + sink.dets[1] == 0 && sink.plots.n == 0,
+              "CFAR threshold %.1f dB: %d detections, %d plots (expected none)", threshold_dB,
+              sink.dets[0] + sink.dets[1], sink.plots.n);
+        processor_destroy(proc);
+        free(steerRe);
+        free(steerIm);
+        free(pri.iq);
+        radar_config_free(&cfg);
+        return sink.plots.n == 0;
+    }
     int found = 0;
     for (int i = 0; i < sink.plots.n; i++) {
         const Detection *p = &sink.plots.plots[i];
@@ -258,6 +271,33 @@ static int test_end_to_end(const char *configPath, int mfDirect, Detection *plot
     return found == 1;
 }
 
+/* False alarm probability of the CFAR threshold (the inverse of cfar_alpha.m). */
+static void test_cfar_pfa(const char *configPath)
+{
+    /* one look: closed form (1 + alpha/N)^-N */
+    for (int n = 8; n <= 300; n *= 3) {
+        const double alpha = n * (pow(1e-6, -1.0 / n) - 1.0);
+        const double pfa = cfar_pfa(alpha, n, 1.0);
+        CHECK(fabs(pfa / 1e-6 - 1.0) < 1e-9, "cfar_pfa one look, N = %d: %.6e (expected 1e-6)", n, pfa);
+    }
+    CHECK(fabs(cfar_pfa(0.0, 100, 1.5) - 1.0) < 1e-12, "cfar_pfa(alpha = 0) = 1");
+    CHECK(isnan(cfar_pfa(10.0, 100, 0.0)), "cfar_pfa without nLooks is NaN");
+    /* the configuration: alpha was designed for cfg.cfar.pfa = 1e-8 with nLooks looks */
+    RadarConfig cfg;
+    char err[256];
+    if (radar_config_load(configPath, &cfg, err, sizeof err) != 0) return;
+    if (cfg.nLooks > 0) {
+        const double pfa = cfar_pfa(cfg.alpha, cfg.nTrain, cfg.nLooks);
+        printf("CFAR: alpha %.3f (%.2f dB), %d training cells, %.2f looks -> Pfa %.3e\n", cfg.alpha,
+               10 * log10(cfg.alpha), cfg.nTrain, cfg.nLooks, pfa);
+        CHECK(fabs(pfa / 1e-8 - 1.0) < 1e-3, "Pfa of the configured threshold %.4e (expected 1e-8)", pfa);
+        CHECK(cfar_pfa(cfg.alpha * 2.0, cfg.nTrain, cfg.nLooks) < pfa, "a higher threshold has a lower Pfa");
+    } else {
+        printf("configuration without nLooks: Pfa check skipped\n");
+    }
+    radar_config_free(&cfg);
+}
+
 int main(int argc, char **argv)
 {
     test_fft();
@@ -265,13 +305,16 @@ int main(int argc, char **argv)
     if (argc > 1) {
         /* fast convolution (where cheaper) and direct matched filter: same plot */
         Detection a, b;
-        if (test_end_to_end(argv[1], 0, &a) && test_end_to_end(argv[1], 1, &b)) {
+        if (test_end_to_end(argv[1], 0, NAN, &a) && test_end_to_end(argv[1], 1, NAN, &b)) {
             CHECK(a.rIdx == b.rIdx && a.dIdx == b.dIdx && a.beam == b.beam && a.hits == b.hits,
                   "fast and direct matched filter give different plots");
             CHECK(fabs(a.snr_dB - b.snr_dB) < 0.01 && fabs(a.power / b.power - 1) < 1e-4,
                   "fast and direct matched filter: SNR %.4f / %.4f dB, power ratio %.6f",
                   a.snr_dB, b.snr_dB, a.power / b.power);
         }
+        /* the same target with the CFAR threshold raised far above its peak (run-time change) */
+        test_end_to_end(argv[1], 0, 45.0, &a);
+        test_cfar_pfa(argv[1]);
     } else {
         printf("no configuration file given: end-to-end test skipped\n");
     }

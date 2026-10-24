@@ -9,11 +9,17 @@ function ppi = ppi_init(sys)
 %                          velocity, SNR, time, sub-pulse, hits, beam
 %     click on a plot      pin its data tip (click again to remove it)
 %     keys                 + / - zoom, arrows pan, r reset, c clear the
-%                          pinned data tips, space pause/resume the display
-%   The panel on the right shows or hides the short/long-pulse plots, the
-%   true targets, range rings, plot labels and the antenna; filters the plots
-%   by SNR and age; clears the plots; and saves the PPI as a PNG file.
-%   The MATLAB zoom/pan/data tip tools of the axes toolbar also work.
+%                          pinned data tips, space pause/resume the display,
+%                          d next display mode
+%   The panel on the right selects what is shown: the plots (after the plot
+%   extractor), the CFAR detections before the extractor (each detection is
+%   an arc over the azimuth step of its CPI update, so a target appears as an
+%   arc about one beamwidth long) or both; shows or hides the short/long-pulse
+%   data, the true targets, range rings, plot labels and the antenna; filters
+%   by SNR and age; sets the CFAR threshold [dB] of the running processing
+%   (Apply; Default = the value from cfg.cfar.pfa); clears the display; and
+%   saves a screenshot (PNG). The MATLAB zoom/pan/data tip tools of the axes
+%   toolbar also work.
 cfg  = sys.cfg;
 rMax = cfg.display.maxRange_m;
 if isempty(rMax), rMax = cfg.rx.maxRange_m; end
@@ -59,10 +65,14 @@ for i = 1:numel(cfg.targets)
     h.names(i)  = text(NaN, NaN, ['  ' cfg.targets(i).name], 'Color', [1 0.3 0.3], 'Parent', ax, 'HitTest', 'off', 'Clipping', 'on');
     h.tracks(i) = plot(ax, NaN, NaN, ':', 'Color', [1 0.3 0.3], 'HitTest', 'off', 'Clipping', 'on');   % true track since t = 0
 end
+% CFAR detections before the plot extractor: one arc segment per detection
+h.detShort = plot(ax, NaN, NaN, '-', 'Color', [0 0.55 0.65], 'LineWidth', 2.5, 'HitTest', 'off', 'Clipping', 'on');
+h.detLong  = plot(ax, NaN, NaN, '-', 'Color', [0.75 0.55 0], 'LineWidth', 2.5, 'HitTest', 'off', 'Clipping', 'on');
 h.short = plot(ax, NaN, NaN, 'o', 'Color', [0 0.9 1], 'MarkerFaceColor', [0 0.9 1], 'MarkerSize', 5);
 h.long  = plot(ax, NaN, NaN, 'o', 'Color', [1 0.9 0], 'MarkerFaceColor', [1 0.9 0], 'MarkerSize', 5);
 h.labels = [];                                             % plot labels (option)
-hLeg = legend([h.truth h.short h.long], {'true target', 'plot (short pulse)', 'plot (long pulse)'}, ...
+hLeg = legend([h.truth h.short h.long h.detShort h.detLong], {'true target', 'plot (short)', 'plot (long)', ...
+       'detection (short)', 'detection (long)'}, ...
        'TextColor', 'w', 'Color', 'k', 'Location', 'southoutside', 'Orientation', 'horizontal');
 try
     set(hLeg, 'AutoUpdate', 'off');                        % data tips and labels stay out of the legend
@@ -79,11 +89,22 @@ h.pins = {};                                               % pinned data tips: {
 
 %% Control panel (right)
 bg = [0.15 0.15 0.15];  fg = [0.9 0.9 0.9];
-x0 = 0.76;  w = 0.22;  rowH = 0.04;
-y = 0.92;
+x0 = 0.76;  w = 0.22;  rowH = 0.034;
+y = 0.95;
+label = @(str, pos) uicontrol(fig, 'Style', 'text', 'String', str, 'Units', 'normalized', 'Position', pos, ...
+                              'BackgroundColor', 'k', 'ForegroundColor', fg, 'HorizontalAlignment', 'left');
 uicontrol(fig, 'Style', 'text', 'String', 'Display', 'Units', 'normalized', 'Position', [x0 y w rowH], ...
           'BackgroundColor', 'k', 'ForegroundColor', 'w', 'FontWeight', 'bold', 'HorizontalAlignment', 'left');
-checks = {'showShort', 'Short-pulse plots', true;  'showLong', 'Long-pulse plots', true;
+y = y - rowH;
+label('Show', [x0 y 0.05 rowH]);
+modes = {'plots', 'detections', 'both'};
+h.ui.showMode = uicontrol(fig, 'Style', 'popupmenu', 'Units', 'normalized', 'Position', [x0+0.05 y w-0.05 rowH], ...
+    'String', {'Plots (after extractor)', 'Detections (before extractor)', 'Plots and detections'}, ...
+    'Value', find(strcmp(cfg.display.showMode, modes)), ...
+    'BackgroundColor', bg, 'ForegroundColor', fg, ...
+    'Callback', @(src, evt) ppi_callbacks('option', fig, 'showMode', modes{get(src, 'Value')}));
+opt.showMode = cfg.display.showMode;
+checks = {'showShort', 'Short pulse', true;  'showLong', 'Long pulse', true;
           'showTruth', 'True targets', logical(cfg.display.showTruth);  'showRings', 'Range rings', true;
           'showLabels', 'Plot labels', false;  'showAntenna', 'Antenna', true};
 for i = 1:size(checks, 1)
@@ -93,48 +114,68 @@ for i = 1:size(checks, 1)
         'Callback', @(src, evt) ppi_callbacks('option', fig, checks{i, 1}, logical(get(src, 'Value'))));
     opt.(checks{i, 1}) = checks{i, 3};
 end
-y = y - 1.5*rowH;
-uicontrol(fig, 'Style', 'text', 'String', 'Min. SNR [dB]', 'Units', 'normalized', 'Position', [x0 y 0.12 rowH], ...
-          'BackgroundColor', 'k', 'ForegroundColor', fg, 'HorizontalAlignment', 'left');
+y = y - 1.3*rowH;
+label('Min. SNR [dB]', [x0 y 0.12 rowH]);
 h.ui.minSnr = uicontrol(fig, 'Style', 'edit', 'String', '0', 'Units', 'normalized', ...
     'Position', [x0+0.13 y 0.09 rowH], 'BackgroundColor', bg, 'ForegroundColor', fg, ...
     'Callback', @(src, evt) ppi_callbacks('option', fig, 'minSnr_dB', str2double(get(src, 'String'))));
 opt.minSnr_dB = 0;
 y = y - rowH;
-uicontrol(fig, 'Style', 'text', 'String', 'Plots shown', 'Units', 'normalized', 'Position', [x0 y 0.12 rowH], ...
-          'BackgroundColor', 'k', 'ForegroundColor', fg, 'HorizontalAlignment', 'left');
+label('Shown', [x0 y 0.12 rowH]);
 h.ui.history = uicontrol(fig, 'Style', 'popupmenu', 'String', {'all', 'last scan', 'last 2 scans'}, ...
     'Value', 1, 'Units', 'normalized', 'Position', [x0+0.13 y 0.09 rowH], 'BackgroundColor', bg, ...
     'ForegroundColor', fg, 'Callback', @(src, evt) ppi_callbacks('option', fig, 'history', get(src, 'Value') - 1));
 opt.history = 0;                                           % 0 all, 1 last scan, 2 last two scans
-buttons = {'Reset view', 'reset';  'Clear plots', 'clear';  'Remove data tips', 'cleartips';
-           'Pause display', 'pause';  'Save PNG ...', 'save'};
-y = y - 0.5*rowH;
+
+% CFAR threshold of the running processing
+cfar_dB = 10*log10(sys.cfar.alpha);
+y = y - 1.4*rowH;
+label('CFAR threshold [dB]', [x0 y 0.12 rowH]);
+h.ui.cfar = uicontrol(fig, 'Style', 'edit', 'String', sprintf('%.2f', cfar_dB), 'Units', 'normalized', ...
+    'Position', [x0+0.13 y 0.09 rowH], 'BackgroundColor', bg, 'ForegroundColor', fg);
+y = y - 1.1*rowH;
+h.ui.cfarApply = uicontrol(fig, 'Style', 'pushbutton', 'String', 'Apply', 'Units', 'normalized', ...
+    'Position', [x0 y 0.105 rowH], 'BackgroundColor', bg, 'ForegroundColor', fg, ...
+    'Callback', @(src, evt) ppi_callbacks('cfar', fig, str2double(get(h.ui.cfar, 'String'))));
+h.ui.cfarDefault = uicontrol(fig, 'Style', 'pushbutton', 'String', 'Default', 'Units', 'normalized', ...
+    'Position', [x0+0.115 y 0.105 rowH], 'BackgroundColor', bg, 'ForegroundColor', fg, ...
+    'Callback', @(src, evt) ppi_callbacks('cfar', fig, cfar_dB));
+y = y - rowH;
+h.ui.cfarInfo = label('', [x0 y w rowH]);                 % set by ppi_callbacks('cfarApplied')
+set(h.ui.cfarInfo, 'ForegroundColor', [0.7 0.9 0.7]);
+
+buttons = {'Reset view', 'reset';  'Clear display', 'clear';  'Remove data tips', 'cleartips';
+           'Pause display', 'pause';  'Save screenshot (PNG) ...', 'save'};
+y = y - 0.3*rowH;
 for i = 1:size(buttons, 1)
-    y = y - 1.2*rowH;
+    y = y - 1.15*rowH;
     h.ui.(buttons{i, 2}) = uicontrol(fig, 'Style', 'pushbutton', 'String', buttons{i, 1}, 'Units', 'normalized', ...
         'Position', [x0 y w rowH], 'BackgroundColor', bg, 'ForegroundColor', fg, ...
         'Callback', @(src, evt) ppi_callbacks(buttons{i, 2}, fig));
 end
-y = y - 2.2*rowH;
+y = y - 2.1*rowH;
 h.cursor = uicontrol(fig, 'Style', 'text', 'String', '', 'Units', 'normalized', 'Position', [x0 y w 2*rowH], ...
                      'BackgroundColor', 'k', 'ForegroundColor', [0.7 0.9 0.7], 'HorizontalAlignment', 'left');
-uicontrol(fig, 'Style', 'text', 'Units', 'normalized', 'Position', [x0 0.01 w 0.2], ...
+uicontrol(fig, 'Style', 'text', 'Units', 'normalized', 'Position', [x0 0.01 w y-0.02], ...
     'BackgroundColor', 'k', 'ForegroundColor', [0.6 0.6 0.6], 'HorizontalAlignment', 'left', ...
-    'String', {'Wheel: zoom', 'Drag: pan', 'Double click: reset', 'Hover a plot: data tip', ...
-               'Click a plot: pin the tip', 'Keys: + - arrows r c space'});
+    'String', {'Wheel: zoom   Drag: pan', 'Double click: reset', 'Hover: data tip', ...
+               'Click: pin the tip', 'Keys: + - arrows r c d space'});
 
 %% State (used by ppi_update and ppi_callbacks)
 opt.clearTime_s = -Inf;                                    % plots up to this time are cleared
 opt.paused = false;
+opt.cfarDefault_dB = cfar_dB;
+opt.cfarRequest_dB = [];                                   % threshold to apply (ppi_update hands it over)
 S.h = h;
 S.ax = ax;
 S.rMax = rMax;
 S.home = rMax*[-1.05 1.05 -1.05 1.05];
 S.opt = opt;
 S.sys = sys;
-S.data = struct('az_deg', 0, 't_s', 0, 'scan', 1, 'plots', []);
+S.data = struct('az_deg', 0, 't_s', 0, 'scan', 1, 'plots', [], 'dets', zeros(0, 10));
 S.vis = struct('x', [], 'y', [], 'idx', []);               % visible plots (for picking)
+S.visDet = struct('x', [], 'y', [], 'idx', []);            % visible detections
+S.detArc_deg = sys.ant.rate_dps * mean(sys.pri) * cfg.proc.updateEvery;   % azimuth step of a CPI update
 S.drag = [];
 setappdata(fig, 'ppi', S);
 
@@ -143,6 +184,7 @@ set(fig, 'WindowScrollWheelFcn',  @(src, evt) ppi_callbacks('scroll', fig, evt),
          'WindowButtonMotionFcn', @(src, evt) ppi_callbacks('move', fig), ...
          'WindowButtonUpFcn',     @(src, evt) ppi_callbacks('up', fig), ...
          'KeyPressFcn',           @(src, evt) ppi_callbacks('key', fig, evt));
+ppi_callbacks('cfarApplied', fig, cfar_dB);
 
 ppi.fig = fig;
 ppi.ax = ax;

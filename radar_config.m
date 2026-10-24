@@ -156,6 +156,9 @@ cfg.display.visible           = true;     % false = draw off-screen (figures are
 cfg.display.updateEvery       = 50;       % PPI refresh period [pulses]
 cfg.display.maxRange_m        = [];       % [] = cfg.rx.maxRange_m
 cfg.display.showTruth         = true;     % draw the true target positions
+cfg.display.showMode          = 'plots';  % PPI shows 'plots' (after the plot extractor), 'detections'
+                                          % (CFAR detections before it: arcs) or 'both' (also in the panel)
+cfg.display.maxDetections     = 100000;   % CFAR detections kept for the PPI (the newest)
 cfg.display.rangeProfilePulse = [];       % pulse number whose matched filter output is plotted
 cfg.display.rangeProfileAxis  = 'range';  % 'range', 'delay' or 'index'
 end

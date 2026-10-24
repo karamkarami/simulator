@@ -22,7 +22,9 @@ function results = run_radar_sim(cfg)
 %                            stagger MTI + de-interleaving + FFT + NCI (staggered PRF)
 %     8. 2-D CFAR          : on every range-Doppler map
 %     9. Pruning           : local peaks only, then azimuth peak picking (plots)
-%    10. PPI display       : updated while the radar is running
+%    10. PPI display       : updated while the radar is running: plots and/or the
+%                            CFAR detections before the extractor; the CFAR
+%                            threshold can be changed in the PPI panel
 %
 %   results.plots holds the extracted plots (time, azimuth, range, elevation,
 %   ambiguous radial velocity, SNR, pulse type).
@@ -61,8 +63,10 @@ if cfg.udp.enable
     udp = udp_sender_open(cfg.udp);
 end
 ppi = [];
+detLog = [];
 if cfg.display.enable
     ppi = ppi_init(sys);
+    detLog = detection_log_init(cfg.display.maxDetections);   % CFAR detections for the PPI
 end
 
 for i = 1:2
@@ -147,6 +151,9 @@ for k = 1:sched.nPulses
             [isDet, noise] = cfar_2d(rd, sys);
             dets = prune_peaks(isDet, rd, noise, sys, wv);
             reports = detection_reports(dets, rd, sys, wv, info);
+            if ~isempty(detLog)
+                detLog = detection_log_add(detLog, reports);
+            end
             [ext.(p), newPlots] = plot_extractor(ext.(p), reports, extractOpt);
             plots = [plots, newPlots]; %#ok<AGROW>
         end
@@ -155,7 +162,7 @@ for k = 1:sched.nPulses
 
     % 10) Display
     if ~isempty(ppi) && mod(nProcessed, cfg.display.updateEvery) == 0
-        ppi_update(ppi, sys, az, t, sched.scan(k), plots);
+        sys = ppi_update(ppi, sys, az, t, sched.scan(k), plots, detLog.M(1:detLog.n, :));   % may set a new CFAR threshold
     end
     if cfg.sim.verbose && mod(nProcessed, 500) == 0
         fprintf('  pulse %6d (az %6.1f deg): %d plots so far, %.0f s elapsed\n', k, az, numel(plots), toc(tStart));
@@ -169,7 +176,7 @@ for i = 1:2
     plots = [plots, newPlots]; %#ok<AGROW>
 end
 if ~isempty(ppi)
-    ppi_update(ppi, sys, sched.az_deg(end), sched.time_s(end), sched.scan(end), plots);
+    ppi_update(ppi, sys, sched.az_deg(end), sched.time_s(end), sched.scan(end), plots, detLog.M(1:detLog.n, :));
     print(ppi.fig, fullfile(cfg.io.outFolder, 'ppi.png'), '-dpng');
 end
 if ~isempty(udp)

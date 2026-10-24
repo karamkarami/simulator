@@ -18,11 +18,13 @@ optional Qt PPI and serial output (see `radar_receiver/README.md`).
  per target: position from its motion -> power from the radar equation (Swerling 1)
  echoes + clutter + Tx leakage (40 dB isolation) + thermal noise, 30 MHz IF, 48 elements
  x receiver gain (60 dB) -> ADC 120 MHz, 16 bit, ENOB 12.7 -> int16
-        |                       \--> raw data: output/raw_pulses/pulse_<n>.mat
+        |                       \--> optional raw data: output/raw_pulses/pulse_<n>.mat
         v
  DDC: x*cos(30 MHz) | x*(-sin(30 MHz)) -> FIR h1, /10 -> FIR h2, /6
       (int16 coefficients with 13 fractional bits, time-domain sliding valid convolutions,
        every stage rounded and saturated to int16)                     -> int16 [nDdc x 48]
+        |                       \--> optional DDC files: output/ddc_pulses/ddc_<n>.mat
+        |                             (replay_ddc_udp.m sends them later with the PRI timing)
         |                       \--> optional UDP: int16 DDC output + pulse/scan/azimuth header
         |                             (-> radar_receiver/, the same processing in C)
         v  split in time: short-pulse samples | long-pulse samples
@@ -46,7 +48,10 @@ cfg.prf.mode = 'staggered';
 cfg.clutter.enable = false;
 cfg.ant.nElements = 1;              % a single antenna: no beamforming
 cfg.sim.sectors_deg = [20 45];      % only simulate this azimuth sector
+cfg.io.saveRaw = false;             % recordings per PRI: raw ADC data and/or DDC output
+cfg.io.saveDdc = true;
 results = run_radar_sim(cfg);
+replay_ddc_udp;                     % send the DDC files over UDP with the PRI timing
 
 cd tests
 run_all_tests                       % SNR budget, UDP, ghost and six-target tests
@@ -74,13 +79,14 @@ file was built for other values (for example after you change
 | `radar_config.m` | all user parameters |
 | `export_receiver_config.m` | writes the configuration of the C receiver (`radar_receiver/config/radar_config.bin`) |
 | `run_radar_sim.m` | main loop: generation, recording, DDC/streaming, processing, display |
+| `replay_ddc_udp.m` | sends recorded DDC files (`ddc_<n>.mat`) over UDP, unchanged, with the original PRI timing |
 | `make_input_files.m` | default input .mat files |
 | `src/setup_radar.m` | derives the PRI timeline, NCO, DDC segments, matched filters, axes, CPI length, FFT length, CFAR factor ... |
 | `src/generate_rx_signal.m`, `clutter_init.m`, `clutter_signal.m`, `adc_sample.m` | signal generation |
 | `src/target_rcs.m`, `draw_target_rcs.m` | Swerling 1 target RCS (a new value every scan) |
-| `src/save_pulse_file.m` | raw ADC data of a PRI to a .mat file |
+| `src/save_pulse_file.m`, `save_ddc_file.m` | raw ADC data / DDC output of a PRI to a .mat file |
 | `src/ddc.m`, `fir_decimate_valid.m` | two-stage DDC with I/Q mixer |
-| `src/udp_sender_open.m`, `udp_send_pulse.m`, `udp_sender_close.m`, `udp_receiver_open.m`, `udp_receive_pulse.m` | UDP streaming of the DDC output (sender and reference receiver) |
+| `src/udp_sender_open.m`, `udp_make_packets.m`, `udp_send_pulse.m`, `udp_send_packets.m`, `udp_send_datagram.m`, `udp_sender_close.m`, `udp_receiver_open.m`, `udp_receive_pulse.m` | UDP streaming of the DDC output (sender and reference receiver) |
 | `src/digital_beamforming.m` | DBF |
 | `src/matched_filter.m`, `plot_range_profile.m` | pulse compression, range/delay/index plots |
 | `src/cpi_buffer_*.m` | circular CPI buffers |
@@ -254,15 +260,64 @@ toolbar work as well; their data tips also list the plot values.
 `ppi_callbacks(action, fig, ...)` does the same from a script (see
 `tests/test_ppi_interactive.m`).
 
-## Raw data and UDP format
+## Raw data, DDC files and UDP format
 
-Every simulated PRI is saved as `output/raw_pulses/pulse_<number>.mat`
-(`cfg.io.rawFolder`). `adcData` is int16 [nSamples x nElements]. `hdr`
-holds the pulse number, scan number, time, antenna azimuth, PRI, stagger
-index, fs, IF, carrier, record start, pulse timing, DDC rate and the DDC
-samples of each sub-pulse. At 80 km instrumented range one PRI is about
-9.5 MB, so a full scan (10 000 PRIs) is about 95 GB. Use
+Two recordings can be switched on and off separately in `radar_config.m`:
+
+| Option | Files (one per PRI) | Content |
+|---|---|---|
+| `cfg.io.saveRaw` (default `true`) | `cfg.io.rawFolder/pulse_<n>.mat` | `adcData`: raw ADC samples, int16 [nSamples x nElements] |
+| `cfg.io.saveDdc` (default `false`) | `cfg.io.ddcFolder/ddc_<n>.mat` | `I`, `Q`: DDC output, int16 [nDdc x nElements], both sub-pulses |
+
+Both files also hold `hdr`: pulse number, scan number, time, antenna
+azimuth, PRI, stagger index, fs, IF, carrier, record start, pulse timing,
+DDC rate and the DDC samples of each sub-pulse. At 80 km instrumented range
+one PRI is about 9.5 MB of raw data (a full scan of 10 000 PRIs is about
+95 GB) and 342 kB of DDC output (3.4 GB per scan). Use
 `cfg.sim.sectors_deg` or a smaller `cfg.rx.maxRange_m` for long runs.
+
+### Replaying the DDC files over UDP
+
+`replay_ddc_udp.m` reads the DDC files and sends them to a receiver
+without any processing: the stored samples and header go out in the same
+datagrams as the live stream below, so the receiver (for example
+`radar_receiver/`) cannot tell a replay from the simulator. The PRIs are
+sent with the original timing:
+
+```matlab
+cfg = radar_config;
+cfg.io.saveDdc = true;  cfg.io.saveRaw = false;
+cfg.sim.sectors_deg = [20 45];
+run_radar_sim(cfg);                                   % -> output/ddc_pulses/ddc_<n>.mat
+
+stats = replay_ddc_udp;                               % to cfg.udp.host:cfg.udp.port
+stats = replay_ddc_udp('output/ddc_pulses', 'host', '192.168.1.20', 'port', 50000, ...
+                       'payloadBytes', 65400, 'spread', 0.8);
+```
+
+* The send time of every PRI comes from the PRI start times in the headers
+  (`hdr.time_s`), on one clock, so no error accumulates. The loop sleeps
+  until 20 ms before a send time and then busy-waits; on an idle PC a PRI
+  leaves within a few microseconds of its time.
+* Files are read and split into datagrams ahead of time: up to
+  `'preloadMB'` (2048 MB) before the start, the rest only while the next
+  datagram is not yet due, so reading never delays a PRI.
+* `'spread'` sends the datagrams of a PRI evenly over this fraction of the
+  PRI instead of as one burst (smoother data rate for small receive buffers).
+* A PRI that still goes out late (the operating system stalled the
+  sender) does not cause a burst: the following PRIs keep the PRI spacing.
+  `'catchUp', true` instead sends them at once until the original schedule
+  is reached again. `'keepGaps', false` shortens a skipped sector to one PRI;
+  `'speed'` replays faster or slower.
+* `stats.sent_s` (send time of every PRI) and `stats.late_s` (its delay)
+  show whether the timing was kept; a summary is printed at the end.
+* Data rate: one PRI of the default radar is 342 kB, 2.7 Gbit/s at a 1 ms
+  PRI (localhost or 10 Gbit Ethernet). MATLAB needs tens of microseconds
+  per datagram, so use few datagrams per PRI: `'payloadBytes', 65400` gives 6
+  datagrams per PRI (the network stack fragments them; the C receiver accepts
+  datagrams up to 64 kB) instead of 245 with 1400 bytes.
+
+### UDP stream
 
 With `cfg.udp.enable = true`, the **DDC output** of every PRI (signed
 16-bit I/Q, [nDdc x nElements], both sub-pulses) is sent to
@@ -313,6 +368,7 @@ budget.
 |---|---|
 | `test_snr_budget(mode, pulse, type, nElements)` | measured vs. expected SNR after each block (LFM or P4, 1 or 48 elements) |
 | `test_udp_stream` | the DDC output of a PRI sent over UDP to localhost is received bit-exact, with its header |
+| `test_ddc_replay` | a short run saves only the DDC files (no raw data); `replay_ddc_udp` sends them to localhost bit-exact, with the PRI timing (median delay below 10 % of the PRI) |
 | `test_short_pulse_ghost` | a strong target at 65 km is detected, and its short-pulse echo in the long window gives no ghost plot |
 | `test_six_targets(mode, clutterOn, keepRaw)` | 6 targets (0.5 - 10 m^2 mean RCS, Swerling 1, 8 - 48 km, up to 290 m/s, around the radar) are detected with the right range, azimuth, elevation and ambiguous velocity, with at most 2 false plots; one raw file per PRI, named by the pulse number |
 | `test_ppi_interactive` | PPI interaction: data tips, zoom around the cursor, pan, keys, filters, pinned tips, pause, clear, PNG |

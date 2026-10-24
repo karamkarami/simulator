@@ -9,9 +9,11 @@ function results = run_radar_sim(cfg)
 %                            leakage and thermal noise on the 30 MHz IF, receiver
 %                            gain, 48 elements, fs = 120 MHz, 16-bit ADC (12.7 ENOB)
 %     2. Recording         : raw ADC data of every PRI -> <rawFolder>/pulse_<n>.mat
+%                            (optional, cfg.io.saveRaw)
 %     3. DDC               : I/Q mixer (cos / -sin 30 MHz), two fixed-point filter
 %                            stages with decimation 10 and 6 (valid convolutions),
-%                            signed 16-bit I/Q output (optional UDP streaming)
+%                            signed 16-bit I/Q output (optional recording to
+%                            <ddcFolder>/ddc_<n>.mat, cfg.io.saveDdc, and UDP streaming)
 %     4. DBF               : 48 elements -> 21 elevation beams (off for 1 element)
 %     5. Matched filter    : per beam (valid convolution, Taylor window for LFM)
 %     6. CPI buffers       : circular buffers holding the pulses of one CPI (the
@@ -47,6 +49,9 @@ if cfg.clutter.enable
 end
 if cfg.io.saveRaw && ~exist(cfg.io.rawFolder, 'dir')
     mkdir(cfg.io.rawFolder);
+end
+if cfg.io.saveDdc && ~exist(cfg.io.ddcFolder, 'dir')
+    mkdir(cfg.io.ddcFolder);
 end
 if ~exist(cfg.io.outFolder, 'dir')
     mkdir(cfg.io.outFolder);
@@ -109,8 +114,11 @@ for k = 1:sched.nPulses
         save_pulse_file(cfg.io.rawFolder, cfg.io.matFormat, hdr, adcData);
     end
 
-    % 3) DDC of the whole record (both sub-pulses) and streaming of its output
+    % 3) DDC of the whole record (both sub-pulses), recording and streaming of its output
     [I, Q] = ddc(adcData, sys);                         % signed 16 bit [nDdc x nElements]
+    if cfg.io.saveDdc
+        save_ddc_file(cfg.io.ddcFolder, cfg.io.matFormat, hdr, I, Q);
+    end
     if ~isempty(udp)
         udp_send_pulse(udp, hdr, I, Q);
     end

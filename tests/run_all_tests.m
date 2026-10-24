@@ -25,6 +25,9 @@ passed(end+1) = test_snr_budget('fixed', 'short', 'lfm', 1);
 names{end+1}  = 'UDP streaming of the DDC output';
 passed(end+1) = test_udp_stream();
 
+names{end+1}  = 'DDC recording and replay over UDP with the PRI timing';
+passed(end+1) = test_ddc_replay();
+
 names{end+1}  = 'Interactive PPI (data tips, zoom, pan, filters)';
 passed(end+1) = test_ppi_interactive();
 

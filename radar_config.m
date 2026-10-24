@@ -135,10 +135,13 @@ cfg.sim.verbose     = true;
 %% Targets (see make_target.m)
 cfg.targets = six_targets_scenario();
 
-%% Recording of the raw ADC data and streaming of the DDC output
+%% Recording of the raw ADC data and of the DDC output, streaming of the DDC output
 cfg.io.outFolder = fullfile(root, 'output');
 cfg.io.saveRaw   = true;                                    % raw ADC data: one .mat file per PRI
-cfg.io.rawFolder = fullfile(root, 'output', 'raw_pulses');
+cfg.io.rawFolder = fullfile(root, 'output', 'raw_pulses');  % -> pulse_<n>.mat (adcData, hdr)
+cfg.io.saveDdc   = false;                                   % DDC output: one .mat file per PRI
+cfg.io.ddcFolder = fullfile(root, 'output', 'ddc_pulses');  % -> ddc_<n>.mat (I, Q, hdr); replay_ddc_udp.m
+                                                            %    sends these files with the PRI timing
 cfg.io.matFormat = '-v6';                                   % '-v6' fast/uncompressed, '-v7' compressed
 
 cfg.udp.enable       = false;        % stream the DDC output of every PRI over Ethernet/UDP

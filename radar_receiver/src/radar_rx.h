@@ -28,6 +28,8 @@ extern "C" {
 
 enum { PULSE_SHORT = 0, PULSE_LONG = 1, N_PULSES = 2 };
 enum { MF_AUTO = 0, MF_DIRECT = 1, MF_FFT = 2 };
+enum { CFAR_2D = 0, CFAR_RANGE = 1, CFAR_DOPPLER = 2 };
+const char *cfar_method_name(int method);   /* "2-D", "1-D range", "1-D Doppler" */
 
 typedef struct {
     int     ddcFirst;      /* first DDC sample of this sub-pulse (0-based)            */
@@ -39,6 +41,8 @@ typedef struct {
     double *range_m;       /* range axis [nRange]                                     */
     double *delay_s;       /* delay axis [nRange]                                     */
     double  lambda_m;      /* wavelength used for the radial velocity                 */
+    int     testFirst;     /* range cells tested by the CFAR: testFirst ... testFirst+testCount-1 */
+    int     testCount;     /* (the others are only training cells; default: all)      */
 } PulseConfig;
 
 typedef struct {
@@ -75,6 +79,7 @@ typedef struct {
     double  medianToMean;  /* median / mean of the noise power (noise floor estimate) */
 
     /* CFAR, pruning, plot extraction */
+    int     cfarMethod;    /* CFAR_2D, CFAR_RANGE or CFAR_DOPPLER: the window below   */
     int     guardRange, trainRange, guardDoppler, trainDoppler, nTrain;
     double  alpha;         /* CA-CFAR threshold factor (design value from cfg.cfar.pfa) */
     double  nLooks;        /* looks of the noise power in a cell (for cfar_pfa; 0 if the
@@ -83,6 +88,15 @@ typedef struct {
     int     minHits, maxMiss, updateEvery;
     double  minExtent_deg;  /* azimuth extent of a plot (minHits = this / azimuth step per update) */
     double  meanPri_s;      /* mean PRI                                               */
+
+    /* EKF tracker (optional in the file: off if missing) */
+    int     trackEnable, trackDim;   /* dimension 2 (range, azimuth) or 3 (+ elevation)  */
+    double  trackSigma[3];  /* measurement errors: range [m], azimuth, elevation [rad]   */
+    double  trackQ[3];      /* white-acceleration spectral density per axis [m^2/s^3]    */
+    double  trackSigmaV0;   /* velocity std of a new track [m/s]                          */
+    double  trackGate;      /* chi-square gate of d^2                                     */
+    int     trackConfirmHits, trackMaxMissTentative, trackMaxMiss;
+    double  scanTime_s;     /* antenna revolution                                         */
 
     /* run-time option (not in the file): matched filter method,
      * MF_AUTO (the faster one for the thread count), MF_DIRECT or MF_FFT */
@@ -167,6 +181,21 @@ typedef struct {
     uint32_t pulseNumber;  /* newest pulse of the CPI                                 */
 } Detection;
 
+/* A track of the EKF tracker (tracker.c, as track_update.m of the simulator).
+ * Position and velocity relative to the antenna: x East, y North, z up (z = 0
+ * in 2-D). Reported after every update, and once more with deleted = 1. */
+typedef struct {
+    uint32_t id;
+    int      confirmed;    /* 0: tentative                                           */
+    int      deleted;      /* 1: the track has been deleted (last report)            */
+    int      dim;          /* 2 or 3                                                  */
+    double   time_s;       /* time of the last update                                 */
+    double   pos_m[3], vel_mps[3];
+    double   alt_m;        /* height above ground (3-D), NaN in 2-D                  */
+    int      hits;         /* updates                                                 */
+    int      misses;       /* scans without a plot since the last update             */
+} Track;
+
 typedef struct {
     /* called for the pruned CFAR detections of every CPI update (n may be 0) */
     void (*detections)(void *user, int pulse, const Detection *dets, int n);
@@ -175,10 +204,12 @@ typedef struct {
     /* called once per PRI with the antenna azimuth (display) */
     void (*antenna)(void *user, double az_deg, double time_s, uint32_t scan);
     void *user;
+    /* called for every track update and deletion (tracking enabled in the configuration) */
+    void (*track)(void *user, const Track *track);
 } ProcessorCallbacks;
 
 typedef struct {
-    double dbf_ms, mf_ms, mti_ms, doppler_ms, cfar_ms, extract_ms, total_ms;
+    double dbf_ms, mf_ms, mti_ms, doppler_ms, cfar_ms, extract_ms, track_ms, total_ms;
     uint64_t pris, updates;
     uint64_t rejected;   /* PRIs whose layout (channels, DDC samples, sub-pulse samples,
                             DDC rate) differs from the configuration: not processed */
@@ -256,6 +287,12 @@ int  ppi_take_cfar_request(double *threshold_dB);
  * extractor (default), CFAR detections before it, or both. */
 enum { PPI_SHOW_PLOTS = 0, PPI_SHOW_DETECTIONS = 1, PPI_SHOW_BOTH = 2 };
 void ppi_set_display_mode(int mode);
+/* Track updates and deletions (drawn as hollow triangles, Tracks checkbox). */
+void ppi_post_track(const Track *track);
+/* Accumulated processing times: the panel shows the mean per PRI of every
+ * block [us]. detectionName / trackingName label the CFAR and tracking rows
+ * (e.g. "CFAR 2-D", "Tracking EKF 3-D"; NULL keeps the previous). */
+void ppi_post_timing(const ProcessorTiming *timing, const char *detectionName, const char *trackingName);
 
 /* ------------------------------------------------------------------------ */
 /* Platform helpers (platform.c)                                             */

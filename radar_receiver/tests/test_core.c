@@ -195,7 +195,7 @@ static int test_end_to_end(const char *configPath, int mfDirect, double threshol
     if (!isnan(threshold_dB)) processor_set_cfar_alpha(proc, pow(10.0, threshold_dB / 10.0));
     Sink sink;
     memset(&sink, 0, sizeof sink);
-    ProcessorCallbacks cb = { on_detections, on_plot, NULL, &sink };
+    ProcessorCallbacks cb = { on_detections, on_plot, NULL, &sink, NULL };
     srand(42);
     double tProc = 0;
     for (int k = 0; k < nPulses; k++) {

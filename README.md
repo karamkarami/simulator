@@ -33,9 +33,11 @@ optional Qt PPI and serial output (see `radar_receiver/README.md`).
  CPI buffer (circular, the pulses of one CPI)              -> [21 x nRange x 114], short and long
  MTI  fixed PRF: 3-pulse canceller | staggered: weights from file
  Doppler fixed: Hamming + FFT 128 (next power of 2 of 114) | staggered: de-interleave, Hamming, FFT 32, NCI
- 2-D CA-CFAR on every range-Doppler map
+ CA-CFAR on every range-Doppler map: 2-D, 1-D range or 1-D Doppler window (cfg.cfar.method),
+         in a selectable range interval per sub-pulse, range window shifted inwards at the edges
  Pruning (local peaks + sidelobe blanking) -> plot extraction (azimuth peak picking)
- PPI display (updated while the antenna turns)
+ Tracking (optional): EKF, 2-D (range, azimuth) or 3-D (+ elevation)
+ PPI display (updated while the antenna turns): plots / detections, tracks, block processing times
 ```
 
 ## Quick start
@@ -91,7 +93,8 @@ file was built for other values (for example after you change
 | `src/matched_filter.m`, `plot_range_profile.m` | pulse compression, range/delay/index plots |
 | `src/cpi_buffer_*.m` | circular CPI buffers |
 | `src/mti_filter.m`, `doppler_process.m` | clutter filter, Doppler processing |
-| `src/cfar_2d.m`, `cfar_alpha.m` | 2-D CA-CFAR |
+| `src/cfar_detect.m`, `cfar_alpha.m` | CA-CFAR (2-D, 1-D range, 1-D Doppler window) |
+| `src/track_setup.m`, `track_init.m`, `track_update.m`, `track_report.m` | EKF tracker (2-D / 3-D) |
 | `src/prune_peaks.m`, `detection_reports.m`, `plot_extractor*.m` | pruning and plot extraction |
 | `src/ppi_init.m`, `ppi_update.m`, `ppi_callbacks.m` | interactive PPI display |
 | `src/detection_log_init.m`, `detection_log_add.m` | CFAR detections kept for the PPI |
@@ -129,12 +132,16 @@ end of the long window, Tx leakage included. The DDC processes the whole
 block, and its output is then split: a DDC sample belongs to a sub-pulse
 when its whole filter input lies inside that sub-pulse's receive interval.
 The leakage samples are therefore never processed. The short pulse covers
-4.2 - 24.5 km and the long pulse 22.9 - 81.4 km (the long pulse is blind up
-to c x 150 us / 2 = 22.5 km). The CFAR does not test the outermost 11 range
-cells of each window, so the short pulse hands over to the long pulse at
-23.7 km. The latest long-pulse start, and with it the instrumented range, is
-limited by the shortest PRI; `setup_radar` stops with an error when a
-receive interval is too short for the filters and the CFAR window.
+4.2 - 23.7 km and the long pulse 22.9 - 80.6 km (the long pulse is blind up
+to c x 150 us / 2 = 22.5 km). The CFAR tests every range cell of a window
+(its range window is shifted inwards at the edges, see CFAR below), so the
+short pulse is tested up to the first long-pulse cell (handover at 22.9 km);
+its cells beyond that are only CFAR training cells. `cfg.cfar.short` and
+`cfg.cfar.long` (`minRange_m`, `maxRange_m`) restrict the tested ranges of
+each sub-pulse further. The latest long-pulse start, and with it the
+instrumented range, is limited by the shortest PRI; `setup_radar` stops with
+an error when a receive interval is too short for the filters and the CFAR
+window.
 
 Because both sub-pulses share the IF, the short-pulse echo of a target
 beyond 52.5 km also falls into the long-pulse window. The long-pulse matched
@@ -178,8 +185,18 @@ there, at the same beam and Doppler, behind very strong far targets.
   (`target_look.m`), so a target near North does not change its RCS in the
   middle of a dwell.
 * **Clutter:** constant sigma0 (-30 dB) Rayleigh cells (0.25 deg x 15 m) from
-  1 km to the radar horizon, with internal motion (0.1 m/s). Scan modulation
-  comes from the two-way azimuth pattern. The echo is convolved with both
+  1 km to the radar horizon, with internal motion. Scan modulation
+  comes from the two-way azimuth pattern. Two Doppler spectra of the internal
+  motion (`cfg.clutter.spectrum`):
+  * `'gaussian'` (default): every cell moves with a random radial velocity
+    of std `icmStd_mps` (0.1 m/s), a Gaussian spectrum;
+  * `'exponential'`: Billingsley's model of wind-blown land clutter. Every
+    cell has a stationary part with r/(1+r) of its power and a moving part
+    with 1/(1+r) whose velocity is drawn from the exponential spectrum
+    beta/2 exp(-beta |v|). From the wind speed w (`windSpeed_mps`, 4.5 m/s
+    = 10 mph): 1/beta = 0.1 log10(w[mph]) + 0.068 m/s (beta = 5.9 s/m) and
+    r = 489.8 w[mph]^-1.55 f[GHz]^-1.21 (3.6 at 3 GHz). `expBeta_spm` and
+    `dcToAc` set beta and r directly. The echo is convolved with both
   transmitted IF pulses, so partly received (eclipsed) echoes are included.
 * **DDC (fixed point):** the real line is `x .* cos(2*pi*30MHz*t)` and the
   imaginary line `x .* (-sin(2*pi*30MHz*t))` (NCO values with 15
@@ -218,14 +235,49 @@ there, at the same beam and Doppler, behind very strong far targets.
   de-interleaving into 4 rows of 28 samples. Each row is sampled every
   sum(PRI); it gets a Hamming window and a 32-point FFT (the next power of 2
   of 28), and |X|^2 is averaged over the rows.
-* **CFAR:** 2-D CA-CFAR, 8 + 3 (guard) range cells and 4 + 3 Doppler cells on
-  each side, Pfa = 1e-8. The MTI colours the noise ([1 -2 1] gives +4 dB
+* **CFAR:** cell-averaging CFAR with one of three windows (`cfg.cfar.method`),
+  each with its own guard and training cells and Pfa (or a fixed threshold
+  `threshold_dB`):
+
+  | Method | Window (each side) | Training cells | Threshold (Pfa 1e-8) |
+  |---|---|---|---|
+  | `'2d'` (default) | 3 + 8 range, 3 + 4 Doppler | 296 | 12.79 dB |
+  | `'range'` | 3 + 16 range cells | 32 | 13.96 dB |
+  | `'doppler'` | 2 + 8 Doppler bins | 16 | 15.39 dB |
+
+  The MTI colours the noise ([1 -2 1] gives +4 dB
   near PRF/2), so every Doppler bin is first divided by its noise gain and
   the CFAR sees a flat noise floor. The threshold factor uses the effective
   number of independent rows: 1 with a fixed PRF, 1.5 with the default
   stagger, because the de-interleaved rows are built from overlapping MTI
   outputs. The bins within one Doppler window mainlobe of zero (+-2 bins: the
   MTI notch, where the clutter residue is) are not tested.
+  *Edges:* the Doppler axis is circular (the spectrum is periodic), so the
+  Doppler window is always complete. Range is not periodic: wrapping it
+  around would mix the near-range clutter with far-range noise. Instead,
+  at the first and last range cells of a sub-pulse window the range window is
+  shifted inwards: it keeps its length and so its training cells, the cell
+  under test moves away from its middle, and its guard cells are cut at the
+  edge (so it has a few more training cells there; the noise is their mean).
+  Before, the outermost 11 cells of each window (0.8 km at each end) were not
+  tested at all. The noise estimate costs the same: the sums of the shifted
+  windows are sums already computed for the nearest interior cell.
+  Only the cells in the tested range interval (and the cells their windows
+  need) are processed, so a smaller interval is also faster.
+* **Tracking (optional, `cfg.track`):** an extended Kalman filter on the
+  plots. State: position and velocity relative to the antenna (East, North,
+  up), nearly constant velocity with white-acceleration process noise
+  (`sigmaAccel_mps2` = 5 m/s^2 horizontal, `sigmaAccelZ_mps2` = 1 m/s^2
+  vertical). `cfg.track.dim`: `'3d'` measures range, azimuth and elevation
+  (needs the elevation of the DBF), `'2d'` ground range and azimuth in the
+  horizontal plane (slant range when the elevation is unknown: 1 element),
+  `'auto'` (default) takes 3-D with DBF. The measurement h(x) is linearised
+  at the predicted state. Plot errors: 50 m, 0.3 deg, 0.5 deg. A plot is
+  associated with the track of smallest d^2 + ln|S| inside the chi-square
+  gate (`gateProb` 0.999); otherwise it starts a tentative track (zero
+  velocity, velocity std `maxSpeed_mps`/sqrt(3)). A track is confirmed after
+  3 updates and deleted after more than 3 missed scans (tentative: 1). The
+  tracks are in `results.tracker` and on the PPI.
 * **Pruning and plots:** only local maxima in beam x range x Doppler are
   kept. Range, elevation and Doppler sidelobes more than 20 dB below a
   stronger peak are removed. Detections of the same target in successive
@@ -246,7 +298,7 @@ The PPI (`ppi_init.m`) is interactive, also while the simulation runs:
 | mouse wheel | zoom in/out around the cursor (up to x500) |
 | left drag | pan |
 | double click, key `r` | reset the view (whole instrumented range) |
-| hover over a plot, a detection or a true target | data tip: range, azimuth, elevation, radial velocity, SNR, time, sub-pulse, CPI hits, beam/cell/bin (true target: range, azimuth, elevation, height, speed, RCS) |
+| hover over a plot, a detection, a track or a true target | data tip: range, azimuth, elevation, radial velocity, SNR, time, sub-pulse, CPI hits, beam/cell/bin (track: number, state, range, azimuth, height, climb, speed, heading, updates; true target: range, azimuth, elevation, height, speed, RCS) |
 | click on a plot or detection | pin its data tip (click again to remove it) |
 | keys `+` `-`, arrows | zoom, pan |
 | key `c` | remove the pinned data tips |
@@ -264,19 +316,29 @@ The panel on the right has:
   short dash. Start value: `cfg.display.showMode`. The newest
   `cfg.display.maxDetections` (100 000) detections are kept.
 * show/hide of the short- and long-pulse data, the true targets, range
-  rings, plot labels (range and velocity next to each plot) and the antenna;
-  a minimum SNR and a choice of what is shown (all, last scan, last 2 scans).
-  The filters apply to plots and detections.
-* **CFAR threshold [dB]**: the threshold factor of the 2-D CA-CFAR,
-  10 log10(alpha). *Apply* hands the value to the running simulation at its
-  next display update (`ppi_update` returns `sys` with the new
-  `sys.cfar.alpha`), from then on every CFAR uses it. *Default* goes back to
-  the value of `cfg.cfar.pfa`. The line below shows the threshold in use and
-  its false alarm probability (`cfar_pfa.m`, the inverse of `cfar_alpha.m`),
-  e.g. `applied 12.79 dB (Pfa 1.0e-08)`.
+  rings, plot labels (range and velocity next to each plot), the antenna and
+  the **tracks**; a minimum SNR and a choice of what is shown (all, last
+  scan, last 2 scans). The filters apply to plots and detections.
+  A track is a hollow triangle at its last update, so its plot (a filled
+  circle) lies inside it: magenta when confirmed (with its number and a
+  velocity leader of `cfg.display.trackLeader_s` = 30 s of flight), gray
+  while tentative. Start value of the checkbox: `cfg.display.showTracks`.
+* **CFAR threshold [dB]**: the threshold factor 10 log10(alpha) of the
+  selected CFAR method (`cfg.cfar.method`). *Apply* hands the value to the
+  running simulation at its next display update (`ppi_update` returns `sys`
+  with the new `sys.cfar.alpha`), from then on every CFAR uses it. *Default*
+  goes back to the value of the method's Pfa. The line below shows the
+  method, the threshold in use and its false alarm probability (`cfar_pfa.m`,
+  the inverse of `cfar_alpha.m`), e.g. `2-D: 12.79 dB (Pfa 1.0e-08)`.
 * Reset view, Clear display, Remove data tips, Pause, and **Save screenshot
   (PNG)**, which saves the window as it is now (file dialog, default name
   `ppi_<date>_<time>.png`).
+* **Mean time per PRI [us]** (bottom right, above the help): the mean
+  processing time per PRI of every block since the start: DBF, matched
+  filter, MTI (clutter filter, with the CPI buffer), Doppler (FFT and
+  non-coherent integration), CFAR of the selected method with the pruning,
+  plot extractor and tracking, and their total (`results.timing_us`).
+
 The cursor position (range, azimuth, east/north) is shown under the buttons. In MATLAB the zoom, pan and data tip tools of the axes
 toolbar work as well; their data tips also list the plot values.
 `ppi_callbacks(action, fig, ...)` does the same from a script (see
@@ -402,8 +464,10 @@ budget.
 | `test_ddc_replay` | a short run saves only the DDC files (no raw data); `replay_ddc_udp` sends them to localhost bit-exact, with the PRI timing (median delay below 10 % of the PRI); when built, the C sender `radar_stream_send` sends them (saved with `-v6` and `-v7`) bit-exact as well |
 | `test_short_pulse_ghost` | a strong target at 65 km is detected, and its short-pulse echo in the long window gives no ghost plot |
 | `test_six_targets(mode, clutterOn, keepRaw)` | 6 targets (0.5 - 10 m^2 mean RCS, Swerling 1, 8 - 48 km, up to 290 m/s, around the radar) are detected with the right range, azimuth, elevation and ambiguous velocity, with at most 2 false plots; one raw file per PRI, named by the pulse number |
-| `test_ppi_interactive` | PPI interaction: data tips, zoom around the cursor, pan, keys, filters, pinned tips, pause, clear, PNG; detection display (modes, arcs, data tips, filters); CFAR threshold field (Apply, hand-over through `ppi_update`, invalid input, Default, Pfa) |
-| `test_c_receiver(mode)` | the six-target scenario streamed over UDP to the C receiver (`radar_receiver/`): its plots must match the MATLAB plots; the recorded stream is replayed to check repeatability and speed |
+| `test_ppi_interactive` | PPI interaction: data tips, zoom around the cursor, pan, keys, filters, pinned tips, pause, clear, PNG; detection display (modes, arcs, data tips, filters); CFAR threshold field (Apply, hand-over through `ppi_update`, invalid input, Default, Pfa); tracks (triangles, data tip, checkbox); block processing times |
+| `test_cfar` | the three CFAR methods on exponential noise: false alarm rate 1e-3 in the interior and at the range edges (shifted window), targets in the first and last range cell detected, only the tested range interval is tested |
+| `test_tracker` | EKF tracker on synthetic plots of the six targets over 5 scans with false plots, 3-D and 2-D: one confirmed track per target, close to it, no false track; when built, the C tracker gives the same track updates |
+| `test_c_receiver(mode, ..., cfarMethod)` | the six-target scenario streamed over UDP to the C receiver (`radar_receiver/`): its plots and track updates must match MATLAB; the recorded stream is replayed to check repeatability and speed |
 
 Latest results (Octave 8.4): all SNR budget checks agree within 0.7 dB.
 The six-target tests find all 6 targets with no false plot, for both the

@@ -13,6 +13,8 @@ sys.fs     = fs;
 sys.fIF    = cfg.adc.fIF_Hz;                                  % IF carrier at the ADC [Hz]
 sys.fLO    = cfg.fc - sys.fIF;                                % receiver local oscillator [Hz]
 
+sys.cfar = cfar_window(cfg);                                  % window of the selected CFAR method
+
 %% Input files (defaults are built when missing or when made for other cfg values)
 ant  = load_input(cfg, 'antenna', struct('fc', cfg.fc, 'spacing', cfg.ant.elementSpacing_lambda));
 ddcF = load_input(cfg, 'ddc', struct('fs_Hz', fs, 'decimation', cfg.ddc.decimation, ...
@@ -109,9 +111,10 @@ if wl.tTx_s < ws.tTx_s + ws.width_s
     error('The long pulse must start after the end of the short pulse.');
 end
 filterSpan    = (L1-1)/fs + (L2-1)/fs1;                       % input span of one DDC output sample
-cfarSpan      = (cfg.cfar.guardRange + cfg.cfar.trainRange) / sys.fsOut;  % range cells the CFAR cannot test
 sys.rxStart_s = 0;                                            % the record starts with the PRI
-rxEnd = wl.tTx_s + wl.width_s + 2*cfg.rx.maxRange_m/c + filterSpan + cfarSpan + 2/sys.fsOut;
+% (the CFAR tests the range cells up to the end of the window: its range
+% window is shifted inwards at the edges, so no extra cells are needed)
+rxEnd = wl.tTx_s + wl.width_s + 2*cfg.rx.maxRange_m/c + filterSpan + 2/sys.fsOut;
 if rxEnd > min(sys.pri)
     error(['Receive window (%.1f us) does not fit in the shortest PRI (%.1f us): reduce ', ...
            'cfg.rx.maxRange_m or start the long pulse earlier.'], rxEnd*1e6, min(sys.pri)*1e6);
@@ -143,7 +146,7 @@ for i = 1:2
     wv.ddcIdx = find(sys.tAdc(firstAdc) >= iv(1) & sys.tAdc(lastAdc) < iv(2)).';
     % Matched filter (Taylor window for LFM), unit noise gain
     Lp  = round(wv.width_s * sys.fsOut);                      % matched filter length [samples]
-    if numel(wv.ddcIdx) < Lp + 2*(cfg.cfar.guardRange + cfg.cfar.trainRange) + 1
+    if numel(wv.ddcIdx) < Lp + 2*(sys.cfar.guardRange + sys.cfar.trainRange) + 1
         error(['The %s-pulse receive interval is too short for its matched filter and the CFAR ', ...
                'window: move the long pulse later or increase cfg.rx.maxRange_m.'], wv.name);
     end
@@ -164,10 +167,11 @@ for i = 1:2
     wv.range_m = c * wv.delay_s / 2;                              % range axis [m]
     sys.wave.(names{i}) = wv;
 end
-% Handover: the short pulse stops where the long pulse starts to be tested
-% (its first CFAR-tested range cell), so a target is not reported twice.
-oR = cfg.cfar.guardRange + cfg.cfar.trainRange;
-handover_m = sys.wave.long.range_m(oR + 1);
+% Handover: the short pulse is tested up to where the long pulse starts (its
+% first range cell, tested thanks to the shifted CFAR window), so a target is
+% not reported twice. The short pulse keeps oR more cells as training cells.
+oR = sys.cfar.guardRange + sys.cfar.trainRange;
+handover_m = sys.wave.long.range_m(1);
 ws = sys.wave.short;
 nKeep = find(ws.range_m < handover_m, 1, 'last') + oR;        % + cells only used as CFAR training
 if nKeep < ws.nRange
@@ -182,6 +186,23 @@ else
         ws.range_m(end)/1e3, handover_m/1e3);
 end
 sys.handover_m = handover_m;
+
+% Range cells tested by the CFAR (both sub-pulses): cfg.cfar.<pulse>.min/maxRange_m
+% and, for the short pulse, the handover. testIdx = [first last] (1-based).
+for i = 1:2
+    wv = sys.wave.(names{i});
+    lim = cfg.cfar.(names{i});
+    ok = wv.range_m >= lim.minRange_m & wv.range_m <= lim.maxRange_m;
+    if i == 1, ok = ok & wv.range_m < handover_m; end
+    first = find(ok, 1, 'first');
+    last  = find(ok, 1, 'last');
+    if isempty(first)
+        warning('No %s-pulse range cell is tested: check cfg.cfar.%s.minRange_m / maxRange_m.', names{i}, names{i});
+        first = 1;  last = 0;
+    end
+    wv.testIdx = [first last];
+    sys.wave.(names{i}) = wv;
+end
 
 %% Digital beamforming (disabled with a single receive element)
 sys.dbf.enabled = sys.nCh > 1;
@@ -274,15 +295,50 @@ sys.dop.nLooks = min(nLooks(tested));
 L = sys.dop.nLooks;
 sys.dop.medianToMean = fzero(@(x) gammainc(L*x, L) - 0.5, [0.1 2]);
 
-%% CFAR
-sys.cfar = cfg.cfar;
-nOuter = (2*(cfg.cfar.guardRange + cfg.cfar.trainRange) + 1) * (2*(cfg.cfar.guardDoppler + cfg.cfar.trainDoppler) + 1);
-nGuard = (2*cfg.cfar.guardRange + 1) * (2*cfg.cfar.guardDoppler + 1);
+%% CFAR threshold of the selected method
+c = sys.cfar;
+nOuter = (2*(c.guardRange + c.trainRange) + 1) * (2*(c.guardDoppler + c.trainDoppler) + 1);
+nGuard = (2*c.guardRange + 1) * (2*c.guardDoppler + 1);
 sys.cfar.nTrain = nOuter - nGuard;
-sys.cfar.alpha  = cfar_alpha(cfg.cfar.pfa, sys.cfar.nTrain, sys.dop.nLooks);
-if 2*(cfg.cfar.guardDoppler + cfg.cfar.trainDoppler) + 1 > nfft
-    error('CFAR Doppler window is larger than the FFT length.');
+if isempty(c.threshold_dB)
+    sys.cfar.alpha = cfar_alpha(c.pfa, sys.cfar.nTrain, sys.dop.nLooks);
+else
+    sys.cfar.alpha = 10^(c.threshold_dB/10);
 end
+sys.cfar.pfa = cfar_pfa(sys.cfar.alpha, sys.cfar.nTrain, sys.dop.nLooks);   % of the threshold in use
+if 2*(c.guardDoppler + c.trainDoppler) + 1 > nfft
+    error('CFAR Doppler window (%d bins) is larger than the FFT length (%d).', ...
+          2*(c.guardDoppler + c.trainDoppler) + 1, nfft);
+end
+
+%% Tracking
+sys.track = track_setup(cfg, sys);
+end
+
+function w = cfar_window(cfg)
+% Window and threshold settings of the selected CFAR method, as a range x Doppler window.
+c = cfg.cfar;
+w.method = lower(c.method);
+w.notchWidth = c.notchWidth;
+switch w.method
+    case '2d'
+        m = c.twoD;
+        w.guardRange = m.guardRange;    w.trainRange = m.trainRange;
+        w.guardDoppler = m.guardDoppler;  w.trainDoppler = m.trainDoppler;
+        w.label = '2-D';
+    case 'range'
+        m = c.range;
+        w.guardRange = m.guard;  w.trainRange = m.train;  w.guardDoppler = 0;  w.trainDoppler = 0;
+        w.label = '1-D range';
+    case 'doppler'
+        m = c.doppler;
+        w.guardRange = 0;  w.trainRange = 0;  w.guardDoppler = m.guard;  w.trainDoppler = m.train;
+        w.label = '1-D Doppler';
+    otherwise
+        error('cfg.cfar.method must be ''2d'', ''range'' or ''doppler''.');
+end
+w.pfa = m.pfa;
+w.threshold_dB = m.threshold_dB;
 end
 
 function bw = beamwidth_3dB(az_deg, gain_dB)

@@ -137,12 +137,12 @@ ppi_callbacks('option', fig, 'showMode', 'plots');
 %% CFAR threshold
 alpha0 = sys.cfar.alpha;
 dB0 = 10*log10(alpha0);
-ok = check(~isempty(strfind(get(S.h.ui.cfarInfo, 'String'), sprintf('applied %.2f dB', dB0))) ...
+ok = check(~isempty(strfind(get(S.h.ui.cfarInfo, 'String'), sprintf('2-D: %.2f dB', dB0))) ...
            && ~isempty(strfind(get(S.h.ui.cfarInfo, 'String'), 'Pfa 1.0e-08')), ...
            'the panel shows the threshold of cfg.cfar.pfa (1e-8)') && ok;
 ppi_callbacks('cfar', fig, 18);
 sys2 = ppi_update(ppi, sys, 101, 12.1, 2, p, dets);
-ok = check(abs(sys2.cfar.alpha - 10^1.8) < 1e-9 && ~isempty(strfind(get(S.h.ui.cfarInfo, 'String'), 'applied 18.00 dB')), ...
+ok = check(abs(sys2.cfar.alpha - 10^1.8) < 1e-9 && ~isempty(strfind(get(S.h.ui.cfarInfo, 'String'), '2-D: 18.00 dB')), ...
            'Apply: ppi_update hands the new threshold to the processing') && ok;
 sys3 = ppi_update(ppi, sys2, 102, 12.2, 2, p, dets);
 ok = check(sys3.cfar.alpha == sys2.cfar.alpha, 'the request is applied once') && ok;
@@ -153,8 +153,30 @@ ok = check(sys4.cfar.alpha == sys3.cfar.alpha && ~isempty(strfind(get(S.h.ui.cfa
 ppi_callbacks('cfar', fig, dB0);                           % Default button
 sys5 = ppi_update(ppi, sys4, 104, 12.4, 2, p, dets);
 ok = check(abs(sys5.cfar.alpha - alpha0) < 1e-9*alpha0, 'Default restores the threshold of cfg.cfar.pfa') && ok;
-ok = check(abs(cfar_pfa(alpha0, sys.cfar.nTrain, sys.dop.nLooks) - cfg.cfar.pfa) < 1e-3*cfg.cfar.pfa, ...
+ok = check(abs(cfar_pfa(alpha0, sys.cfar.nTrain, sys.dop.nLooks) - cfg.cfar.twoD.pfa) < 1e-3*cfg.cfar.twoD.pfa, ...
            'cfar_pfa is the inverse of cfar_alpha') && ok;
+
+%% Tracks and block processing times
+tk = struct('id', {7, 8}, 'confirmed', {true, false}, 't_s', 11.9, 'pos_m', {[30e3*sind(95) 30e3*cosd(95) 2600], ...
+            [5e3 5e3 0]}, 'vel_mps', {[-100 50 0], [0 0 0]}, 'alt_m', {2606, NaN}, 'hits', {5, 1}, ...
+            'misses', 0, 'dim', 3);
+us = [120 340 56 980 760 15 4];
+ppi_update(ppi, sys, 105, 12.5, 2, p, dets, tk, us);
+S = getappdata(fig, 'ppi');
+ok = check(numel(get(S.h.track, 'XData')) == 1 && numel(get(S.h.trackTent, 'XData')) == 1, ...
+           'confirmed and tentative tracks drawn as triangles') && ok;
+c3 = xy(3);
+ok = check(abs(get(S.h.track, 'XData') - c3(1)) < 0.3, 'the triangle of track 7 surrounds the plot at 30 km') && ok;
+txt = ppi_callbacks('hover', fig, xy(3));
+ok = check(~isempty(strfind(txt, 'Track 7 (confirmed, 3-D EKF)')) && ~isempty(strfind(txt, 'Speed       111.8 m/s')) ...
+           && ~isempty(strfind(txt, 'Height      2606 m')), 'hover over a track (wins over its plot)') && ok;
+str = get(S.h.timing, 'String');
+ok = check(numel(str) == 9 && ~isempty(strfind(str{5}, '980.0')) && ~isempty(strfind(str{6}, 'CFAR 2-D')) ...
+           && ~isempty(strfind(str{9}, '2275.0')), 'block processing times in the panel') && ok;
+ppi_callbacks('option', fig, 'showTracks', false);
+ok = check(all(isnan(get(S.h.track, 'XData'))) && isempty(strfind(ppi_callbacks('hover', fig, xy(3)), 'Track')), ...
+           'Tracks checkbox hides the tracks') && ok;
+ppi_callbacks('option', fig, 'showTracks', true);
 
 %% Pause, clear, save
 ppi_callbacks('pause', fig);

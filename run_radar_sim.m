@@ -20,14 +20,21 @@ function results = run_radar_sim(cfg)
 %                            time a target stays in the 3 dB azimuth beam)
 %     7. MTI + Doppler     : 3-pulse canceller + FFT over the CPI (fixed PRF), or
 %                            stagger MTI + de-interleaving + FFT + NCI (staggered PRF)
-%     8. 2-D CFAR          : on every range-Doppler map
+%     8. CFAR              : on every range-Doppler map (2-D, 1-D range or 1-D
+%                            Doppler window, cfg.cfar.method)
 %     9. Pruning           : local peaks only, then azimuth peak picking (plots)
-%    10. PPI display       : updated while the radar is running: plots and/or the
-%                            CFAR detections before the extractor; the CFAR
+%    10. Tracking          : EKF on the plots, 2-D or 3-D (optional, cfg.track)
+%    11. PPI display       : updated while the radar is running: plots and/or the
+%                            CFAR detections before the extractor, tracks, mean
+%                            processing time of every block; the CFAR
 %                            threshold can be changed in the PPI panel
 %
 %   results.plots holds the extracted plots (time, azimuth, range, elevation,
-%   ambiguous radial velocity, SNR, pulse type).
+%   ambiguous radial velocity, SNR, pulse type). results.tracker holds the
+%   tracks at the end and the log of all track updates (track_update.m).
+%   results.timing_us is the mean processing time per PRI of DBF, matched
+%   filter, MTI, Doppler, detection (CFAR + pruning), plot extractor and
+%   tracking [us].
 
 if nargin < 1, cfg = radar_config(); end
 root = fileparts(mfilename('fullpath'));
@@ -75,6 +82,8 @@ for i = 1:2
     ext.(p) = plot_extractor_init(sys.dop.nfft);
 end
 plots = [];
+tracker = track_init(sys.track);
+blockUs = zeros(1, 7);                     % accumulated processing time of the blocks [us]
 nProcessed = 0;
 wasActive = false;
 % Plot extraction options: minimum azimuth extent -> minimum number of CPI detections
@@ -98,6 +107,9 @@ for k = 1:sched.nPulses
                 buf.(p) = cpi_buffer_init(sys.nBeams, sys.wave.(p).nRange, sys.cpi.length);
                 [ext.(p), newPlots] = plot_extractor(ext.(p), [], flushOpt);
                 plots = [plots, newPlots]; %#ok<AGROW>
+                if sys.track.enable
+                    tracker = track_update(tracker, newPlots, t);
+                end
             end
         end
         wasActive = false;
@@ -129,40 +141,62 @@ for k = 1:sched.nPulses
     bb = complex(single(I), single(Q));
 
     % 4-9) Processing chain, separately for the short and the long sub-pulse
+    priPlots = [];
     for i = 1:2
         p  = names{i};
         wv = sys.wave.(p);
         seg = bb(wv.ddcIdx, :);                         % DDC samples of this sub-pulse
+        tb = tic;
         if sys.dbf.enabled
             bm = digital_beamforming(seg, sys.dbf.W);   % [nBeams x nSamples]
         else
             bm = seg.';                                 % single element: no beamforming
         end
+        blockUs(1) = blockUs(1) + 1e6*toc(tb);
+        tb = tic;
         rp = matched_filter(bm, wv);                    % [nBeams x nRange]
+        blockUs(2) = blockUs(2) + 1e6*toc(tb);
         if k == cfg.display.rangeProfilePulse
             plot_range_profile(rp, wv, cfg.display.rangeProfileAxis);
         end
 
+        tb = tic;                                       % CPI buffer and clutter filter
         buf.(p) = cpi_buffer_push(buf.(p), rp, sched.staggerIdx(k), az, t);
         if buf.(p).count == sys.cpi.length && mod(buf.(p).nPushed, cfg.proc.updateEvery) == 0
             [cpi, info] = cpi_buffer_read(buf.(p));
             y  = mti_filter(cpi, sys.mtiCoeffs, info.staggerIdx);
+            blockUs(3) = blockUs(3) + 1e6*toc(tb);
+            tb = tic;
             rd = doppler_process(y, sys);               % [nBeams x nRange x nfft]
-            [isDet, noise] = cfar_2d(rd, sys);
+            blockUs(4) = blockUs(4) + 1e6*toc(tb);
+            tb = tic;
+            [isDet, noise] = cfar_detect(rd, sys, wv);
             dets = prune_peaks(isDet, rd, noise, sys, wv);
             reports = detection_reports(dets, rd, sys, wv, info);
+            blockUs(5) = blockUs(5) + 1e6*toc(tb);
             if ~isempty(detLog)
                 detLog = detection_log_add(detLog, reports);
             end
+            tb = tic;
             [ext.(p), newPlots] = plot_extractor(ext.(p), reports, extractOpt);
+            blockUs(6) = blockUs(6) + 1e6*toc(tb);
             plots = [plots, newPlots]; %#ok<AGROW>
+            priPlots = [priPlots, newPlots]; %#ok<AGROW>
+        else
+            blockUs(3) = blockUs(3) + 1e6*toc(tb);
         end
+    end
+    if sys.track.enable                                 % 10) tracking (also deletes old tracks)
+        tb = tic;
+        tracker = track_update(tracker, priPlots, t);
+        blockUs(7) = blockUs(7) + 1e6*toc(tb);
     end
     nProcessed = nProcessed + 1;
 
-    % 10) Display
+    % 11) Display
     if ~isempty(ppi) && mod(nProcessed, cfg.display.updateEvery) == 0
-        sys = ppi_update(ppi, sys, az, t, sched.scan(k), plots, detLog.M(1:detLog.n, :));   % may set a new CFAR threshold
+        sys = ppi_update(ppi, sys, az, t, sched.scan(k), plots, detLog.M(1:detLog.n, :), ...
+                         track_report(tracker), blockUs / nProcessed);   % may set a new CFAR threshold
     end
     if cfg.sim.verbose && mod(nProcessed, 500) == 0
         fprintf('  pulse %6d (az %6.1f deg): %d plots so far, %.0f s elapsed\n', k, az, numel(plots), toc(tStart));
@@ -174,9 +208,13 @@ for i = 1:2
     p = names{i};
     [ext.(p), newPlots] = plot_extractor(ext.(p), [], flushOpt);
     plots = [plots, newPlots]; %#ok<AGROW>
+    if sys.track.enable
+        tracker = track_update(tracker, newPlots, sched.time_s(end));
+    end
 end
 if ~isempty(ppi)
-    ppi_update(ppi, sys, sched.az_deg(end), sched.time_s(end), sched.scan(end), plots, detLog.M(1:detLog.n, :));
+    ppi_update(ppi, sys, sched.az_deg(end), sched.time_s(end), sched.scan(end), plots, detLog.M(1:detLog.n, :), ...
+               track_report(tracker), blockUs / max(nProcessed, 1));
     print(ppi.fig, fullfile(cfg.io.outFolder, 'ppi.png'), '-dpng');
 end
 if ~isempty(udp)
@@ -184,12 +222,20 @@ if ~isempty(udp)
 end
 
 results.plots      = plots;
+results.tracker    = tracker;
+results.timing_us  = blockUs / max(nProcessed, 1);
 results.sys        = sys;
 results.targets    = targets;                       % incl. the RCS of every scan (rcsScan)
 results.nProcessed = nProcessed;
 results.runTime_s  = toc(tStart);
 if cfg.sim.verbose
     print_plots(plots);
+    if sys.track.enable
+        print_tracks(tracker);
+    end
+    fprintf(['Mean processing time per PRI [us]: DBF %.0f, matched filter %.0f, MTI %.0f, Doppler %.0f, ' ...
+             'CFAR %s + pruning %.0f, extractor %.0f, tracking %.0f\n'], results.timing_us(1:4), sys.cfar.label, ...
+            results.timing_us(5:7));
     fprintf('%d PRIs simulated and processed in %.1f s (%.1f ms per PRI)\n', nProcessed, ...
         results.runTime_s, 1e3*results.runTime_s/max(nProcessed, 1));
 end
@@ -240,9 +286,24 @@ end
 fprintf('CPI: %.1f ms in the beam -> %d pulses = %d row(s) x %d samples, FFT %d, Doppler bin %.2f m/s, unambiguous +-%.1f m/s\n', ...
     sys.cpi.time_s*1e3, sys.cpi.length, sys.cpi.nRows, sys.cpi.rowLen, sys.dop.nfft, abs(diff(sys.dop.v_mps(1:2))), ...
     sys.lambda/(4*sys.dop.rowPri_s));
-fprintf('CFAR: Pfa = %.0e, %d training cells, %.1f looks, alpha = %.2f (%.1f dB)\n', cfg.cfar.pfa, ...
-    sys.cfar.nTrain, sys.dop.nLooks, sys.cfar.alpha, 10*log10(sys.cfar.alpha));
+fprintf('CFAR %s: Pfa = %.0e, %d training cells, %.1f looks, alpha = %.2f (%.1f dB)\n', sys.cfar.label, ...
+    sys.cfar.pfa, sys.cfar.nTrain, sys.dop.nLooks, sys.cfar.alpha, 10*log10(sys.cfar.alpha));
 fprintf('Simulated pulses: %d of %d (%.1f s of radar time)\n', sum(sched.active), sched.nPulses, sched.time_s(end));
+end
+
+function print_tracks(tracker)
+% List the tracks at the end of the run.
+tk = tracker.tracks;
+fprintf('\nTracks at the end (%d-D EKF): %d (%d confirmed), %d track updates\n', tracker.p.dim, numel(tk), ...
+        sum([tk.confirmed]), size(tracker.log, 1));
+fprintf('%5s %4s %9s %8s %8s %8s %8s %5s\n', 'id', 'conf', 'R[km]', 'az[deg]', 'h[m]', 'v[m/s]', 'hdg[deg]', 'hits');
+for i = 1:numel(tk)
+    x = tk(i).x;  d = tracker.p.dim;
+    z = 0;  if d == 3, z = x(3); end
+    v = x(d+1:d+2);
+    fprintf('%5d %4d %9.3f %8.2f %8.0f %8.1f %8.1f %5d\n', tk(i).id, tk(i).confirmed, norm(x(1:d))/1e3, ...
+            mod(atan2(x(1), x(2))*180/pi, 360), z + tracker.p.height_m, norm(v), mod(atan2(v(1), v(2))*180/pi, 360), tk(i).hits);
+end
 end
 
 function print_plots(plots)

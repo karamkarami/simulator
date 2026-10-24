@@ -13,7 +13,9 @@ function out = ppi_callbacks(action, fig, varargin)
 %     'key', evt                  + - arrows r c d space
 %     'option', name, value       showMode ('plots', 'detections' or 'both'),
 %                                 showShort, showLong, showTruth, showRings,
-%                                 showLabels, showAntenna, minSnr_dB, history
+%                                 showLabels, showAntenna, showTracks,
+%                                 minSnr_dB, history
+%     'timing'                    write the block processing times into the panel
 %     'reset' 'clear' 'cleartips' 'pause'   buttons of the panel
 %     'save' [, fileName]         save a screenshot of the PPI as a PNG file
 %                                 (without fileName: file dialog; out = file)
@@ -28,6 +30,8 @@ S = getappdata(fig, 'ppi');
 switch action
     case 'redraw'
         S = redraw(S);
+    case 'timing'
+        show_timing(S);
     case 'scroll'
         evt = varargin{1};
         p = cursor_km(S);
@@ -94,7 +98,7 @@ switch action
     case 'cfarApplied'
         dB = varargin{1};
         set(S.h.ui.cfar, 'String', sprintf('%.2f', dB));
-        set(S.h.ui.cfarInfo, 'String', sprintf('applied %.2f dB (Pfa %.1e)', dB, ...
+        set(S.h.ui.cfarInfo, 'String', sprintf('%s: %.2f dB (Pfa %.1e)', S.sys.cfar.label, dB, ...
             cfar_pfa(10^(dB/10), S.sys.cfar.nTrain, S.sys.dop.nLooks)));
     case 'reset'
         S = set_limits(S, S.home(1:2), S.home(3:4));
@@ -211,6 +215,10 @@ else
 end
 S.visDet = struct('x', xd(showD), 'y', yd(showD), 'idx', find(showD).');
 
+% Tracks: hollow triangle at the last update (around its plot), velocity leader, number
+S = draw_tracks(S);
+show_timing(S);
+
 % Labels next to the plots
 delete(h.labels(ishandle(h.labels)));
 S.h.labels = [];
@@ -224,6 +232,9 @@ end
 counts = '';
 if showPlots, counts = sprintf('plots %d / %d   ', sum(show), nAll); end
 if showDets, counts = [counts sprintf('detections %d   ', sum(showD))]; end
+if o.showTracks && ~isempty(d.tracks)
+    counts = [counts sprintf('tracks %d   ', sum([d.tracks.confirmed]))];
+end
 set(h.title, 'String', sprintf('Scan %d   t = %.2f s   az = %5.1f deg   %szoom x%.1f', ...
     d.scan, d.t_s, d.az_deg, counts, zoom_factor(S)));
 end
@@ -267,11 +278,18 @@ set(S.h.sel, 'XData', pos(1), 'YData', pos(2));
 end
 
 function [txt, pos] = nearest_text(S, p)
-% Text and position of the nearest plot or true target, '' if none is close.
+% Text and position of the nearest track, plot, detection or true target, '' if none is close.
+% A track (its triangle surrounds its plot) wins unless another object is 3 pixels closer.
 txt = '';  pos = [];
 if isempty(p), return; end
-tol = 8 * km_per_pixel(S, get(S.ax, 'XLim'), get(S.ax, 'YLim'));
-best = tol;
+kpx = km_per_pixel(S, get(S.ax, 'XLim'), get(S.ax, 'YLim'));
+best = 8 * kpx;
+[dist, j] = min(hypot(S.visTrk.x - p(1), S.visTrk.y - p(2)));   % tracks
+if ~isempty(dist) && dist <= best
+    best = max(dist - 3*kpx, 0);
+    pos = [S.visTrk.x(j) S.visTrk.y(j)];
+    txt = track_text(S.data.tracks(S.visTrk.idx(j)), S.sys.ant.height_m);
+end
 [dist, j] = min(hypot(S.vis.x - p(1), S.vis.y - p(2)));     % plots
 if ~isempty(dist) && dist <= best
     best = dist;
@@ -313,6 +331,64 @@ txt = sprintf(['CFAR detection (%s pulse)\nRange       %.3f km\nAzimuth     %.2f
                'Radial vel. %.2f m/s\nSNR         %.1f dB\nTime        %.3f s\n' ...
                'Beam %d, range cell %d, Doppler bin %d'], names{r(7)}, r(3)/1e3, r(2), el, r(5), r(6), r(1), ...
                r(8), r(9), r(10));
+end
+
+function txt = track_text(tk, height_m)
+% Data tip of a track.
+states = {'tentative', 'confirmed'};
+p = tk.pos_m;  v = tk.vel_mps;
+R = norm(p(1:tk.dim));
+txt = sprintf(['Track %d (%s, %d-D EKF)\nRange       %.3f km\nAzimuth     %.2f deg\n'], tk.id, ...
+              states{1 + tk.confirmed}, tk.dim, R/1e3, mod(atan2(p(1), p(2))*180/pi, 360));
+if tk.dim == 3
+    txt = [txt sprintf('Height      %.0f m\nClimb       %.1f m/s\n', p(3) + height_m, v(3))];
+end
+txt = [txt sprintf(['Speed       %.1f m/s\nHeading     %.1f deg\nUpdates     %d (missed scans %d)\n' ...
+                    'Last update %.3f s'], norm(v(1:2)), mod(atan2(v(1), v(2))*180/pi, 360), tk.hits, ...
+                    tk.misses, tk.t_s)];
+end
+
+function S = draw_tracks(S)
+% Confirmed (magenta) and tentative (gray) tracks at their last update, with leaders and numbers.
+h = S.h;  d = S.data;
+delete(h.trackIds(ishandle(h.trackIds)));
+S.h.trackIds = [];
+tk = d.tracks;
+if ~S.opt.showTracks || isempty(tk)
+    set([h.track h.trackTent h.trackLead], 'XData', NaN, 'YData', NaN);
+    S.visTrk = struct('x', [], 'y', [], 'idx', []);
+    return
+end
+P = reshape([tk.pos_m], 3, []) / 1e3;                     % [km]
+V = reshape([tk.vel_mps], 3, []) / 1e3;
+conf = logical([tk.confirmed]);
+set(h.track, 'XData', P(1, conf), 'YData', P(2, conf));
+set(h.trackTent, 'XData', P(1, ~conf), 'YData', P(2, ~conf));
+L = S.sys.cfg.display.trackLeader_s;
+X = [P(1, conf); P(1, conf) + L*V(1, conf); NaN(1, sum(conf))];
+Y = [P(2, conf); P(2, conf) + L*V(2, conf); NaN(1, sum(conf))];
+set(h.trackLead, 'XData', X(:).', 'YData', Y(:).');
+for i = find(conf)
+    S.h.trackIds(end+1) = text(P(1, i), P(2, i), sprintf('   T%d', tk(i).id), 'Parent', S.ax, ...
+        'Color', [1 0.35 1], 'FontSize', 8, 'VerticalAlignment', 'top', 'HitTest', 'off', 'Clipping', 'on');
+end
+S.visTrk = struct('x', P(1, :), 'y', P(2, :), 'idx', 1:numel(tk));
+end
+
+function show_timing(S)
+% Mean processing time per PRI of every block in the panel.
+us = S.data.timing_us;
+if isempty(us), return; end
+names = {'DBF', 'Matched filter', 'MTI (clutter)', 'Doppler FFT+NCI', ['CFAR ' S.sys.cfar.label], ...
+         'Plot extractor', sprintf('Tracking EKF %d-D', S.sys.track.dim)};
+if ~S.sys.track.enable, names{7} = 'Tracking (off)'; end
+rows = cell(1, 9);
+rows{1} = 'Mean time per PRI [us]';
+for i = 1:7
+    rows{i+1} = sprintf('%-17s%9.1f', names{i}, us(i));
+end
+rows{9} = sprintf('%-17s%9.1f', 'Total', sum(us));
+set(S.h.timing, 'String', rows);
 end
 
 function txt = truth_text(S, i)

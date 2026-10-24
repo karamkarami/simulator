@@ -201,6 +201,9 @@ int radar_config_load(const char *path, RadarConfig *cfg, char *err, size_t errL
             snprintf(key, sizeof key, "%s_range_m", names[p]);  pc->range_m = get_doubles(&rs, key, pc->nRange, NULL);
             snprintf(key, sizeof key, "%s_delay_s", names[p]);  pc->delay_s = get_doubles(&rs, key, pc->nRange, NULL);
             snprintf(key, sizeof key, "%s_lambda_m", names[p]); pc->lambda_m = get_scalar(&rs, key);
+            snprintf(key, sizeof key, "%s_testFirst", names[p]); pc->testFirst = (int)get_optional(&rs, key, 0);
+            snprintf(key, sizeof key, "%s_testCount", names[p]);
+            pc->testCount = (int)get_optional(&rs, key, pc->nRange);
             if (!rs.failed && (pc->ddcCount != pc->nRange + pc->nTaps - 1 ||
                                pc->ddcFirst < 0 || pc->ddcFirst + pc->ddcCount > cfg->nDdc))
                 set_error(&rs, "inconsistent DDC segment of the %s pulse", names[p]);
@@ -234,6 +237,7 @@ int radar_config_load(const char *path, RadarConfig *cfg, char *err, size_t errL
         cfg->guardDoppler = get_int(&rs, "guardDoppler");
         cfg->trainDoppler = get_int(&rs, "trainDoppler");
         cfg->nTrain       = get_int(&rs, "nTrain");
+        cfg->cfarMethod   = (int)get_optional(&rs, "cfarMethod", CFAR_2D);
         cfg->alpha        = get_scalar(&rs, "alpha");
         cfg->nLooks       = get_optional(&rs, "nLooks", 0.0);
         cfg->sidelobeMargin_dB = get_scalar(&rs, "sidelobeMargin_dB");
@@ -242,21 +246,48 @@ int radar_config_load(const char *path, RadarConfig *cfg, char *err, size_t errL
         cfg->updateEvery  = get_int(&rs, "updateEvery");
         cfg->minExtent_deg = get_scalar(&rs, "minExtent_deg");
         cfg->meanPri_s    = get_scalar(&rs, "meanPri_s");
+        cfg->trackEnable  = (int)get_optional(&rs, "trackEnable", 0);
+        if (cfg->trackEnable) {
+            cfg->trackDim = get_int(&rs, "trackDim");
+            double *v = get_doubles(&rs, "trackSigma", 3, NULL);
+            double *q = get_doubles(&rs, "trackQ", 3, NULL);
+            if (v) memcpy(cfg->trackSigma, v, sizeof cfg->trackSigma);
+            if (q) memcpy(cfg->trackQ, q, sizeof cfg->trackQ);
+            free(v);
+            free(q);
+            cfg->trackSigmaV0 = get_scalar(&rs, "trackSigmaV0");
+            cfg->trackGate = get_scalar(&rs, "trackGate");
+            cfg->trackConfirmHits = get_int(&rs, "trackConfirmHits");
+            cfg->trackMaxMissTentative = get_int(&rs, "trackMaxMissTentative");
+            cfg->trackMaxMiss = get_int(&rs, "trackMaxMiss");
+            cfg->scanTime_s = get_scalar(&rs, "scanTime_s");
+            if (!rs.failed && ((cfg->trackDim != 2 && cfg->trackDim != 3) || !(cfg->trackGate > 0) ||
+                               !(cfg->scanTime_s > 0)))
+                set_error(&rs, "invalid tracker settings in the configuration");
+        }
 
         if (!rs.failed && (cfg->updateEvery < 1 || cfg->minHits < 1 || cfg->maxMiss < 0 || cfg->cpiLength < 1 ||
                            cfg->nfft < 1 || cfg->nRows < 1 || cfg->rowLen < 1 || cfg->rowLen > cfg->nfft ||
                            cfg->nBeams < 1 || cfg->nCh < 1 || cfg->nStagger < 1 || cfg->nMtiTaps < 1 ||
                            !cfg->mtiCoeffs || cfg->notchBins < 0))
             set_error(&rs, "invalid sizes in the configuration");
-        for (int p = 0; p < N_PULSES && !rs.failed; p++)
-            if (cfg->pulse[p].nTaps < 1 || cfg->pulse[p].nRange < 1)
+        for (int p = 0; p < N_PULSES && !rs.failed; p++) {
+            const PulseConfig *pc = &cfg->pulse[p];
+            if (pc->nTaps < 1 || pc->nRange < 1)
                 set_error(&rs, "invalid matched filter or range axis in the configuration");
+            else if (pc->testFirst < 0 || pc->testCount < 0 || pc->testFirst + pc->testCount > pc->nRange)
+                set_error(&rs, "invalid CFAR range interval in the configuration");
+        }
+        if (!rs.failed && (cfg->cfarMethod < CFAR_2D || cfg->cfarMethod > CFAR_DOPPLER))
+            set_error(&rs, "invalid CFAR method in the configuration");
         if (!rs.failed) {                                  /* CFAR window */
             const int gR = cfg->guardRange, oR = gR + cfg->trainRange;
             const int gD = cfg->guardDoppler, oD = gD + cfg->trainDoppler;
             const int nTrain = (2 * oR + 1) * (2 * oD + 1) - (2 * gR + 1) * (2 * gD + 1);
+            int tooShort = 0;                              /* the shifted range window must fit */
+            for (int p = 0; p < N_PULSES; p++) tooShort |= 2 * oR + 1 > cfg->pulse[p].nRange;
             if (gR < 0 || gD < 0 || cfg->trainRange < 0 || cfg->trainDoppler < 0 || nTrain < 1 ||
-                nTrain != cfg->nTrain || 2 * oD + 1 > cfg->nfft || 2 * oR + 1 >= 64)
+                nTrain != cfg->nTrain || 2 * oD + 1 > cfg->nfft || 2 * oR + 1 >= 64 || tooShort)
                 set_error(&rs, "invalid CFAR window in the configuration");
         }
         if (!rs.failed && (cfg->nfft & (cfg->nfft - 1)) != 0)
@@ -281,4 +312,9 @@ void radar_config_free(RadarConfig *cfg)
     }
     free(cfg->mtiCoeffs);  free(cfg->dopWindow);  free(cfg->noiseGain);  free(cfg->dopFreq_Hz);
     memset(cfg, 0, sizeof(*cfg));
+}
+
+const char *cfar_method_name(int method)
+{
+    return method == CFAR_RANGE ? "1-D range" : method == CFAR_DOPPLER ? "1-D Doppler" : "2-D";
 }

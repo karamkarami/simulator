@@ -4,8 +4,8 @@ function export_receiver_config(cfg, fileName)
 %   EXPORT_RECEIVER_CONFIG(cfg, fileName) runs setup_radar(cfg) and writes
 %   everything the C receiver needs to process the DDC output that the
 %   simulator streams over UDP (DBF matrix, matched filters, range axes, CPI
-%   length, MTI weights, Doppler window and noise gains, CFAR factor, plot
-%   extraction settings). Export again whenever cfg changes, before starting
+%   length, MTI weights, Doppler window and noise gains, CFAR method, window,
+%   factor and tested range cells, plot extraction and tracker settings). Export again whenever cfg changes, before starting
 %   the C receiver. Default file: radar_receiver/config/radar_config.bin.
 %
 %   File format (little-endian): 8 bytes 'RADRXCFG', uint32 version (1),
@@ -45,6 +45,8 @@ for i = 1:2
     r{end+1} = {[names{i} '_range_m'], wv.range_m};
     r{end+1} = {[names{i} '_delay_s'], wv.delay_s};
     r{end+1} = {[names{i} '_lambda_m'], wv.lambda_m};
+    r{end+1} = {[names{i} '_testFirst'], wv.testIdx(1) - 1};    % CFAR-tested range cells (0-based)
+    r{end+1} = {[names{i} '_testCount'], max(0, wv.testIdx(2) - wv.testIdx(1) + 1)};
 end
 r{end+1} = {'cpiLength', sys.cpi.length};
 r{end+1} = {'nStagger', sys.nStagger};
@@ -58,10 +60,11 @@ r{end+1} = {'noiseGain', reshape(sys.dop.noiseGain, 1, [])};
 r{end+1} = {'dopFreq_Hz', sys.dop.f_Hz};
 r{end+1} = {'notchBins', sys.dop.notchBins};
 r{end+1} = {'medianToMean', sys.dop.medianToMean};
-r{end+1} = {'guardRange', cfg.cfar.guardRange};
-r{end+1} = {'trainRange', cfg.cfar.trainRange};
-r{end+1} = {'guardDoppler', cfg.cfar.guardDoppler};
-r{end+1} = {'trainDoppler', cfg.cfar.trainDoppler};
+r{end+1} = {'cfarMethod', find(strcmp(sys.cfar.method, {'2d', 'range', 'doppler'})) - 1};   % 0 2-D, 1 range, 2 Doppler
+r{end+1} = {'guardRange', sys.cfar.guardRange};      % window of the selected method (0 = none in that dimension)
+r{end+1} = {'trainRange', sys.cfar.trainRange};
+r{end+1} = {'guardDoppler', sys.cfar.guardDoppler};
+r{end+1} = {'trainDoppler', sys.cfar.trainDoppler};
 r{end+1} = {'nTrain', sys.cfar.nTrain};
 r{end+1} = {'alpha', sys.cfar.alpha};
 r{end+1} = {'nLooks', sys.dop.nLooks};               % optional in the receiver (Pfa of the threshold)
@@ -72,6 +75,17 @@ r{end+1} = {'maxMiss', cfg.extract.maxMiss};
 r{end+1} = {'updateEvery', cfg.proc.updateEvery};
 r{end+1} = {'minExtent_deg', cfg.extract.minExtent_deg};
 r{end+1} = {'meanPri_s', mean(sys.pri)};
+tk = sys.track;                                      % EKF tracker (track_setup.m)
+r{end+1} = {'trackEnable', double(tk.enable)};
+r{end+1} = {'trackDim', tk.dim};
+r{end+1} = {'trackSigma', [sqrt(diag(tk.R)).', zeros(1, 3 - tk.dim)]};   % range [m], az, el [rad]
+r{end+1} = {'trackQ', [tk.q, zeros(1, 3 - tk.dim)]};                      % per axis [m^2/s^3]
+r{end+1} = {'trackSigmaV0', tk.sigmaV0};
+r{end+1} = {'trackGate', tk.gate};
+r{end+1} = {'trackConfirmHits', tk.confirmHits};
+r{end+1} = {'trackMaxMissTentative', tk.maxMissTentative};
+r{end+1} = {'trackMaxMiss', tk.maxMiss};
+r{end+1} = {'scanTime_s', tk.scanTime_s};
 
 folder = fileparts(fileName);
 if ~isempty(folder) && ~exist(folder, 'dir'), mkdir(folder); end

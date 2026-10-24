@@ -1,4 +1,4 @@
-function [ok, cmp] = test_c_receiver(prfMode, receiverBin, port, targetIdx, replayOnly)
+function [ok, cmp] = test_c_receiver(prfMode, receiverBin, port, targetIdx, replayOnly, cfarMethod)
 %TEST_C_RECEIVER  The C receiver (radar_receiver/) against the MATLAB processing.
 %
 %   [ok, cmp] = TEST_C_RECEIVER(prfMode, receiverBin, port) runs the
@@ -19,6 +19,9 @@ function [ok, cmp] = test_c_receiver(prfMode, receiverBin, port, targetIdx, repl
 %   replayOnly = true: skip the simulation and the live run, and only replay
 %   the recording of an earlier run against its saved MATLAB plots (to check
 %   a changed receiver quickly).
+%   cfarMethod: '2d' (default), 'range' or 'doppler' (cfg.cfar.method).
+%   The tracks (EKF, cfg.track) of both programs are compared as well: the
+%   same track numbers, update by update, with positions within 20 m.
 %   Needs a POSIX shell (Linux, macOS) to start the receiver in the background.
 
 if nargin < 1, prfMode = 'fixed'; end
@@ -30,6 +33,7 @@ end
 if nargin < 3 || isempty(port), port = 50000 + strcmp(prfMode, 'staggered'); end
 if nargin < 4, targetIdx = []; end
 if nargin < 5, replayOnly = false; end
+if nargin < 6 || isempty(cfarMethod), cfarMethod = '2d'; end
 if ~exist(receiverBin, 'file')
     error('C receiver %s not found: build it first (radar_receiver/README.md)', receiverBin);
 end
@@ -37,10 +41,11 @@ end
 %% Configuration: the six-target scenario, DDC output streamed over UDP
 cfg = radar_config();
 cfg.prf.mode        = prfMode;
+cfg.cfar.method     = cfarMethod;
 cfg.clutter.enable  = true;
 cfg.rx.maxRange_m   = 50e3;
 cfg.targets         = six_targets_scenario();
-cfg.io.outFolder    = fullfile(root, 'output', ['c_receiver_' prfMode]);
+cfg.io.outFolder    = fullfile(root, 'output', ['c_receiver_' prfMode '_' cfarMethod]);
 cfg.io.saveRaw      = false;
 cfg.display.enable  = false;
 cfg.udp.enable      = true;
@@ -55,6 +60,7 @@ refFile  = fullfile(out, 'matlab_plots.mat');
 recFile  = fullfile(out, 'ddc_stream.rec');
 plotsC   = fullfile(out, 'plots_c_live.csv');
 plotsR   = fullfile(out, 'plots_c_replay.csv');
+tracksC  = fullfile(out, 'tracks_c_live.csv');
 liveLog  = fullfile(out, 'receiver_live.log');
 replayLog = fullfile(out, 'receiver_replay.log');
 doneFile = fullfile(out, 'receiver_live.done');
@@ -68,14 +74,15 @@ if replayOnly
     ok = true;
     liveDone = false;
 else
-    for f = {recFile, refFile, plotsC, plotsR, liveLog, replayLog, doneFile}
+    for f = {recFile, refFile, plotsC, plotsR, tracksC, liveLog, replayLog, doneFile}
         if exist(f{1}, 'file'), delete(f{1}); end
     end
     export_receiver_config(cfg, cfgFile);
 
     %% Live: start the receiver, run the simulation, wait for the receiver
-    cmd = sprintf(['("%s" --config "%s" --port %d --record "%s" --plots-csv "%s" --idle-timeout 20 --quiet ' ...
-                   '> "%s" 2>&1; echo $? > "%s") &'], receiverBin, cfgFile, port, recFile, plotsC, liveLog, doneFile);
+    cmd = sprintf(['("%s" --config "%s" --port %d --record "%s" --plots-csv "%s" --tracks-csv "%s" ' ...
+                   '--idle-timeout 20 --quiet > "%s" 2>&1; echo $? > "%s") &'], receiverBin, cfgFile, port, recFile, ...
+                  plotsC, tracksC, liveLog, doneFile);
     system(cmd);
     pause(2);                                       % the receiver opens its socket
     results = run_radar_sim(cfg);
@@ -89,11 +96,16 @@ else
     fprintf('\n--- C receiver (live) ---\n%s', fileread(liveLog));
     ref.plots = results.plots;                      % MATLAB plots and the axes needed to compare
     ref.axes = compare_axes(results.sys);
+    ref.trackLog = results.tracker.log;
     save(refFile, '-struct', 'ref');
 
-    %% Compare the plots
+    %% Compare the plots and the tracks
     cmp = compare_plots(ref.plots, read_plots_csv(plotsC), ref.axes);
     ok = cmp.ok;
+    if results.sys.track.enable
+        cmp.tracksOk = compare_tracks(ref.trackLog, tracksC);
+        ok = ok && cmp.tracksOk;
+    end
     liveDone = true;
 end
 
@@ -182,6 +194,26 @@ cmp.nC = numel(pc);
 fprintf('Plots: MATLAB %d, C %d; largest differences: range %.1f m, az %.3f deg, el %.3f deg, vr %.3f m/s, SNR %.2f dB, hits %d\n', ...
     cmp.nMatlab, cmp.nC, cmp.maxDiff.range_m, cmp.maxDiff.az_deg, cmp.maxDiff.el_deg, cmp.maxDiff.vr_mps, ...
     cmp.maxDiff.snr_dB, cmp.maxDiff.hits);
+end
+
+function ok = compare_tracks(logM, fileC)
+% MATLAB track log (track_update.m) against the track updates of the C receiver (--tracks-csv).
+txt = strtrim(fileread(fileC));
+lines = strsplit(txt, {'\n', '\r'});
+C = zeros(0, 12);
+for i = 2:numel(lines)
+    if isempty(strtrim(lines{i})), continue; end
+    C(end+1, :) = str2double(strsplit(lines{i}, ',')); %#ok<AGROW>
+end
+C = C(C(:, 3) == 0, :);                                % updates only (not the deletions)
+n = min(size(C, 1), size(logM, 1));
+sameId = all(C(1:n, 1) == logM(1:n, 2)) && all(C(1:n, 2) == logM(1:n, 3)) && all(C(1:n, 11) == logM(1:n, 10));
+dPos = 0;
+if n > 0, dPos = max(sqrt(sum((C(1:n, 5:7) - logM(1:n, 4:6)).^2, 2))); end
+ok = size(C, 1) == size(logM, 1) && sameId && dPos < 20;
+fprintf('Track updates: MATLAB %d, C %d (%d confirmed tracks); same tracks: %s, largest position difference %.2f m: %s\n', ...
+    size(logM, 1), size(C, 1), numel(unique(logM(logM(:, 3) == 1, 2))), ternary(sameId, 'yes', 'NO'), dPos, ...
+    ternary(ok, 'ok', 'FAIL'));
 end
 
 function p = read_plots_csv(fileName)

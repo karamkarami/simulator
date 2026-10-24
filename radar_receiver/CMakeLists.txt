@@ -52,6 +52,7 @@ add_library(radar_core STATIC
     src/config.c
     src/fft.c
     src/extractor.c
+    src/tracker.c
     src/processor.c
     src/udp_input.c
     src/serial_out.c
@@ -178,6 +179,10 @@ if(RADAR_BUILD_TESTS)
     add_executable(test_core tests/test_core.c)
     target_link_libraries(test_core PRIVATE radar_core)
     add_test(NAME core COMMAND test_core ${CMAKE_CURRENT_SOURCE_DIR}/config/radar_config.bin)
+
+    add_executable(test_tracker tests/test_tracker.c)
+    target_link_libraries(test_tracker PRIVATE radar_core)
+    add_test(NAME tracker COMMAND test_tracker ${CMAKE_CURRENT_SOURCE_DIR}/config/radar_config.bin)
 
     add_executable(test_ddc_files tests/test_ddc_files.c)
     target_link_libraries(test_ddc_files PRIVATE radar_core radar_ddc_files)

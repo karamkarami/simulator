@@ -24,6 +24,7 @@
  */
 #include "radar_rx.h"
 #include "extractor.h"
+#include "tracker.h"
 #include "fft.h"
 
 #include <float.h>
@@ -66,6 +67,7 @@ typedef struct {
     uint32_t newestPulse;
     float *P;                   /* power map [bin][cell]                          */
     unsigned char *det;         /* CFAR detections [bin][cell]                    */
+    double *cntInv;             /* CFAR: 1 / training cells of every range cell (more at the edges) */
     Detection *reports;         /* pruned detections of the latest CPI           */
     int nReports, capReports;
     Extractor ext;
@@ -93,6 +95,9 @@ struct Processor {
     Scratch *scratch;           /* [nThreads] */
     int slowTime;               /* 0: skip the Doppler/CFAR updates (overload)    */
     double alpha;               /* CA-CFAR threshold factor in use                */
+    Tracker tracker;            /* EKF tracker (cfg->trackEnable)                 */
+    Detection *newPlots;        /* plots of the latest extractor update           */
+    int nNewPlots, capNewPlots;
     uint32_t lastPulse;
     int havePulse;
     ProcessorTiming timing;
@@ -201,6 +206,16 @@ Processor *processor_create(const RadarConfig *cfg, int nThreads)
         s->time = xcalloc(s->nSlots, sizeof(double));
         s->P = xcalloc(map, sizeof(float));
         s->det = xcalloc(map, 1);
+        s->cntInv = xcalloc(s->nR, sizeof(double));
+        {
+            const int gR = cfg->guardRange, oR = gR + cfg->trainRange;
+            const int gD = cfg->guardDoppler, oD = gD + cfg->trainDoppler;
+            for (int r = 0; r < s->nR; r++) {          /* guard cells cut at the range edges */
+                const int g0 = r - gR > 0 ? r - gR : 0, g1 = r + gR < s->nR - 1 ? r + gR : s->nR - 1;
+                const int cnt = (2 * oR + 1) * (2 * oD + 1) - (g1 - g0 + 1) * (2 * gD + 1);
+                s->cntInv[r] = 1.0 / cnt;
+            }
+        }
         if (mf_fft_init(cfg, pc, s, cfg->mfMethod, nThr) != 0) { processor_destroy(p); return NULL; }
         extractor_init(&s->ext, cfg->nfft, cfg->minHits, cfg->maxMiss);
         reset_buffers(s);
@@ -209,6 +224,7 @@ Processor *processor_create(const RadarConfig *cfg, int nThreads)
     p->nThreads = nThr;
     p->slowTime = 1;
     p->alpha = cfg->alpha;
+    if (cfg->trackEnable) tracker_init(&p->tracker, cfg);
     p->scratch = xcalloc(nThr, sizeof(Scratch));
     for (int t = 0; t < nThr; t++) {
         Scratch *w = &p->scratch[t];
@@ -233,7 +249,7 @@ void processor_destroy(Processor *p)
         free(s->segRe); free(s->segIm); free(s->beamRe); free(s->beamIm);
         free(s->cpiRe); free(s->cpiIm); free(s->mtiRe); free(s->mtiIm);
         free(s->staggerIdx); free(s->az); free(s->time);
-        free(s->P); free(s->det);
+        free(s->P); free(s->det); free(s->cntInv);
         free(s->reports);
         if (s->mfFft) fft_plan_free(&s->mfPlan);
         free(s->mfHre); free(s->mfHim); free(s->mfWork);
@@ -245,6 +261,8 @@ void processor_destroy(Processor *p)
     }
     free(p->scratch);
     fft_plan_free(&p->fft);
+    tracker_free(&p->tracker);
+    free(p->newPlots);
     free(p);
 }
 
@@ -586,19 +604,31 @@ static void range_box_sums(const float *x, float *yO, float *yG, int nR, int hO,
     }
 }
 
-/* 2-D CA-CFAR (as cfar_2d.m): noise = (sum over the outer window - sum over
- * the guard window) / nTrain; range zero padded, Doppler circular. One beam
- * at a time: range box sums of every Doppler bin, then running sums along
- * Doppler (double, no drift), fused with the threshold test. */
-static void cfar(const Processor *p, PulseState *s)
+/* CA-CFAR (as cfar_detect.m) with the window of the configured method (2-D,
+ * or 1-D along range or Doppler: the other half sizes are 0). Only the range
+ * cells testFirst ... testFirst+testCount-1 are tested, and only the cells
+ * they need are summed. Doppler is circular. At the range edges the outer
+ * window is shifted inwards: its sum is the centred sum of the nearest cell
+ * whose window lies inside the data (rc), the guard window is cut at the edge,
+ * and the noise is divided by the actual number of training cells
+ * (s->cntInv). One beam at a time: range box sums of every Doppler bin, then
+ * running sums along Doppler (double, no drift), fused with the test. */
+static void cfar(const Processor *p, PulseState *s, const PulseConfig *pc)
 {
     const RadarConfig *cfg = p->cfg;
     const int nfft = cfg->nfft, nB = cfg->nBeams, nR = s->nR;
     const int gR = cfg->guardRange, oR = gR + cfg->trainRange;
     const int gD = cfg->guardDoppler, oD = gD + cfg->trainDoppler;
-    const double alpha = p->alpha / cfg->nTrain;
+    const double alpha = p->alpha;
     const int zeroBin = nfft / 2;
     const size_t nCells = (size_t)s->nCells;
+    const int f = pc->testFirst, l = pc->testFirst + pc->testCount - 1;
+
+    memset(s->det, 0, (size_t)nfft * nCells);
+    if (l < f) return;
+    const int lo = f - oR > 0 ? f - oR : 0, hi = l + oR < nR - 1 ? l + oR : nR - 1;
+    const int n = hi - lo + 1;
+    const double *restrict cntInv = s->cntInv;
 
     #pragma omp parallel num_threads(p->nThreads)
     {
@@ -606,34 +636,33 @@ static void cfar(const Processor *p, PulseState *s)
         #pragma omp for schedule(dynamic)
         for (int b = 0; b < nB; b++) {
             for (int d = 0; d < nfft; d++)
-                range_box_sums(s->P + (size_t)d * nCells + (size_t)b * nR, w->sumO + (size_t)d * nR,
-                               w->sumG + (size_t)d * nR, nR, oR, gR, w->partial);
+                range_box_sums(s->P + (size_t)d * nCells + (size_t)b * nR + lo, w->sumO + (size_t)d * nR + lo,
+                               w->sumG + (size_t)d * nR + lo, n, oR, gR, w->partial);
             double *restrict aO = w->accO, *restrict aG = w->accG;
-            for (int r = 0; r < nR; r++) aO[r] = aG[r] = 0.0;
+            for (int r = lo; r <= hi; r++) aO[r] = aG[r] = 0.0;
             for (int k = -oD; k <= oD; k++) {                  /* window of bin 0 */
                 const float *restrict o = w->sumO + (size_t)(((k % nfft) + nfft) % nfft) * nR;
-                for (int r = 0; r < nR; r++) aO[r] += o[r];
+                for (int r = lo; r <= hi; r++) aO[r] += o[r];
             }
             for (int k = -gD; k <= gD; k++) {
                 const float *restrict g = w->sumG + (size_t)(((k % nfft) + nfft) % nfft) * nR;
-                for (int r = 0; r < nR; r++) aG[r] += g[r];
+                for (int r = lo; r <= hi; r++) aG[r] += g[r];
             }
             for (int d = 0; d < nfft; d++) {
                 const float *restrict P = s->P + (size_t)d * nCells + (size_t)b * nR;
                 unsigned char *restrict det = s->det + (size_t)d * nCells + (size_t)b * nR;
-                if (abs(d - zeroBin) <= cfg->notchBins) {
-                    memset(det, 0, nR);
-                } else {
-                    for (int r = 0; r < nR; r++) det[r] = P[r] > alpha * (aO[r] - aG[r]);
-                    for (int r = 0; r < oR && r < nR; r++) det[r] = 0;          /* range edges */
-                    for (int r = nR - oR > 0 ? nR - oR : 0; r < nR; r++) det[r] = 0;
+                if (abs(d - zeroBin) > cfg->notchBins) {
+                    for (int r = f; r <= l; r++) {
+                        const int rc = r < oR ? oR : r > nR - 1 - oR ? nR - 1 - oR : r;   /* shifted window */
+                        det[r] = P[r] > alpha * cntInv[r] * (aO[rc] - aG[r]);
+                    }
                 }
                 /* slide the Doppler windows to bin d + 1 */
                 const float *restrict addO = w->sumO + (size_t)((d + 1 + oD) % nfft) * nR;
                 const float *restrict subO = w->sumO + (size_t)(((d - oD) % nfft + nfft) % nfft) * nR;
                 const float *restrict addG = w->sumG + (size_t)((d + 1 + gD) % nfft) * nR;
                 const float *restrict subG = w->sumG + (size_t)(((d - gD) % nfft + nfft) % nfft) * nR;
-                for (int r = 0; r < nR; r++) {
+                for (int r = lo; r <= hi; r++) {
                     aO[r] += (double)addO[r] - subO[r];
                     aG[r] += (double)addG[r] - subG[r];
                 }
@@ -855,10 +884,41 @@ static double elapsed_ms(double *t0)
     return dt;
 }
 
+/* The extractor's plots are collected first, so that the extractor and the
+ * tracker are timed separately (and the output callbacks are not timed). */
 static void plot_callback(void *user, const Detection *plot)
 {
+    Processor *p = user;
+    if (p->nNewPlots == p->capNewPlots) {
+        p->capNewPlots = p->capNewPlots ? 2 * p->capNewPlots : 16;
+        p->newPlots = xrealloc(p->newPlots, sizeof(Detection) * p->capNewPlots);
+    }
+    p->newPlots[p->nNewPlots++] = *plot;
+}
+
+static void track_deleted(void *user, const Track *track)
+{
     const ProcessorCallbacks *cb = user;
-    if (cb && cb->plot) cb->plot(cb->user, plot);
+    if (cb && cb->track) cb->track(cb->user, track);
+}
+
+/* Hands the collected plots to the output and to the tracker. */
+static void plots_out(Processor *p, const ProcessorCallbacks *cb)
+{
+    for (int k = 0; k < p->nNewPlots; k++) {
+        const Detection *plot = &p->newPlots[k];
+        if (cb && cb->plot) cb->plot(cb->user, plot);
+        if (!p->cfg->trackEnable) continue;
+        double t0 = now_seconds();
+        const int i = tracker_plot(&p->tracker, plot);
+        p->timing.track_ms += elapsed_ms(&t0);
+        if (i >= 0 && cb && cb->track) {
+            Track r;
+            tracker_report(&p->tracker, i, &r);
+            cb->track(cb->user, &r);
+        }
+    }
+    p->nNewPlots = 0;
 }
 
 /* The PRI has the layout of the configuration: channels, DDC samples, the DDC
@@ -877,8 +937,10 @@ static int pri_matches_config(const RadarConfig *cfg, const PriData *pri)
 
 void processor_flush(Processor *p, const ProcessorCallbacks *cb)
 {
-    for (int i = 0; i < N_PULSES; i++)
-        extractor_update(&p->ps[i].ext, NULL, 0, 1, plot_callback, (void *)cb);
+    for (int i = 0; i < N_PULSES; i++) {
+        extractor_update(&p->ps[i].ext, NULL, 0, 1, plot_callback, p);
+        plots_out(p, cb);
+    }
 }
 
 void processor_process(Processor *p, const PriData *pri, const ProcessorCallbacks *cb)
@@ -935,13 +997,20 @@ void processor_process(Processor *p, const PriData *pri, const ProcessorCallback
         s->sinceUpdate = 0;
         doppler(p, s);
         p->timing.doppler_ms += elapsed_ms(&t0);
-        cfar(p, s);
+        cfar(p, s, pc);
         prune_and_report(p, i, s);
         p->timing.cfar_ms += elapsed_ms(&t0);
         if (cb && cb->detections) cb->detections(cb->user, i, s->reports, s->nReports);
-        extractor_update(&s->ext, s->reports, s->nReports, 0, plot_callback, (void *)cb);
+        t0 = now_seconds();
+        extractor_update(&s->ext, s->reports, s->nReports, 0, plot_callback, p);
         p->timing.extract_ms += elapsed_ms(&t0);
+        plots_out(p, cb);
         if (i == 0) p->timing.updates++;
+    }
+    if (cfg->trackEnable) {                                 /* missed scans, deletion */
+        double t0 = now_seconds();
+        tracker_maintain(&p->tracker, pri->time_s, track_deleted, (void *)cb);
+        p->timing.track_ms += elapsed_ms(&t0);
     }
     p->timing.total_ms += (now_seconds() - tStart) * 1e3;
     p->timing.pris++;

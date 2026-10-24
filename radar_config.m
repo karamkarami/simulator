@@ -97,14 +97,46 @@ cfg.proc.nfft         = [];    % Doppler FFT length ([] = next power of 2: of th
                                % with a fixed PRF (114 -> 128), of the samples per row when staggered (28 -> 32))
 cfg.proc.updateEvery  = 1;     % run MTI/Doppler/CFAR every N new pulses (1 = every pulse)
 
-%% 2-D CA-CFAR on every range-Doppler map
-cfg.cfar.pfa          = 1e-8;  % design probability of false alarm (per cell and CPI)
-cfg.cfar.guardRange   = 3;     % guard cells on each side in range
-cfg.cfar.trainRange   = 8;     % training cells on each side in range
-cfg.cfar.guardDoppler = 3;     % guard cells on each side in Doppler
-cfg.cfar.trainDoppler = 4;     % training cells on each side in Doppler
+%% Detection: cell-averaging CFAR on every range-Doppler map
+% method: '2d'      window in range and Doppler around the cell under test
+%         'range'   1-D window along range (same Doppler bin)
+%         'doppler' 1-D window along Doppler (same range cell; circular)
+% Every method has its own window and threshold. The threshold factor alpha
+% comes from pfa (and the training cells), unless threshold_dB is given:
+% alpha = 10^(threshold_dB/10). The PPI threshold field changes the threshold
+% of the selected method while the radar runs.
+% Doppler is circular, so the window is always complete. At the first and
+% last range cells of a sub-pulse the range window is shifted inwards (same
+% number of training cells, the cell under test is no longer in the middle),
+% so every range cell can be tested.
+cfg.cfar.method = '2d';
+
+cfg.cfar.twoD.guardRange   = 3;     % guard cells on each side in range
+cfg.cfar.twoD.trainRange   = 8;     % training cells on each side in range
+cfg.cfar.twoD.guardDoppler = 3;     % guard cells on each side in Doppler
+cfg.cfar.twoD.trainDoppler = 4;     % training cells on each side in Doppler
+cfg.cfar.twoD.pfa          = 1e-8;  % design probability of false alarm (per cell and CPI)
+cfg.cfar.twoD.threshold_dB = [];    % [] = from pfa; else the threshold factor in dB
+
+cfg.cfar.range.guard        = 3;    % guard cells on each side
+cfg.cfar.range.train        = 16;   % training cells on each side
+cfg.cfar.range.pfa          = 1e-8;
+cfg.cfar.range.threshold_dB = [];
+
+cfg.cfar.doppler.guard        = 2;  % guard bins on each side
+cfg.cfar.doppler.train        = 8;  % training bins on each side (2*(guard+train)+1 <= FFT length)
+cfg.cfar.doppler.pfa          = 1e-8;
+cfg.cfar.doppler.threshold_dB = [];
+
 cfg.cfar.notchWidth   = 1;     % half-width of the zero-Doppler band that is not tested (MTI notch,
                                % clutter residue), in Doppler window mainlobes (1 -> +-2 bins)
+% Range interval in which each sub-pulse is tested (all methods); the cells
+% outside it are only used as training cells. The short pulse also stops
+% where the long pulse starts (handover).
+cfg.cfar.short.minRange_m = 0;
+cfg.cfar.short.maxRange_m = Inf;
+cfg.cfar.long.minRange_m  = 0;
+cfg.cfar.long.maxRange_m  = Inf;
 
 %% Pruning of the CFAR detections
 cfg.prune.sidelobeMargin_dB = 20;  % a peak this much weaker than a peak on the same range, beam
@@ -115,6 +147,26 @@ cfg.extract.minExtent_deg = 2; % minimum azimuth extent of the detections of a p
                                % (noise false alarms last only a few CPIs, targets about one beamwidth)
 cfg.extract.maxMiss = 2;       % CPIs without a detection before a plot is closed
 
+%% Target tracking: extended Kalman filter (EKF) on the plots
+% State: position and velocity (nearly constant velocity, white acceleration),
+% relative to the antenna (x = East, y = North, z = up). Measurements: range
+% and azimuth of every plot ('2d', in the horizontal plane, ground range), or
+% range, azimuth and elevation ('3d', needs the elevation from the DBF).
+% A plot is associated with the track of smallest d^2 + ln|S| inside the gate;
+% a plot without a track starts a tentative track (velocity unknown).
+cfg.track.enable          = true;
+cfg.track.dim             = 'auto';  % 'auto' (3d with DBF, 2d without), '2d' or '3d'
+cfg.track.sigmaRange_m    = 50;      % range error of a plot (cell size, range-Doppler coupling) [m]
+cfg.track.sigmaAz_deg     = 0.3;     % azimuth error of a plot [deg]
+cfg.track.sigmaEl_deg     = 0.5;     % elevation error of a plot (3d) [deg]
+cfg.track.sigmaAccel_mps2 = 5;       % horizontal process noise (white acceleration) [m/s^2]
+cfg.track.sigmaAccelZ_mps2 = 1;      % vertical process noise (3d) [m/s^2]
+cfg.track.maxSpeed_mps    = 400;     % initial velocity uncertainty of a new track: std maxSpeed/sqrt(3)
+cfg.track.gateProb        = 0.999;   % probability that the gate holds the correct plot (chi-square)
+cfg.track.confirmHits     = 3;       % updates (incl. the first plot) that confirm a tentative track
+cfg.track.maxMissTentative = 1;      % scans without a plot before a tentative track is deleted
+cfg.track.maxMiss         = 3;       % scans without a plot before a confirmed track is deleted
+
 %% Ground clutter
 cfg.clutter.enable           = true;
 cfg.clutter.sigma0_dB        = -30;   % land clutter reflectivity [dB m^2/m^2]
@@ -122,7 +174,19 @@ cfg.clutter.minRange_m       = 1000;  % clutter starts here [m]
 cfg.clutter.maxRange_m       = [];    % [] = radar horizon (4/3 earth model)
 cfg.clutter.azStep_deg       = 0.25;  % azimuth size of a clutter cell [deg]
 cfg.clutter.rangeStepSamples = 12;    % range size of a clutter cell in ADC samples (12 -> 15 m)
-cfg.clutter.icmStd_mps       = 0.1;   % std of internal clutter motion (wind) [m/s]
+% Doppler spectrum of the internal clutter motion (wind-blown vegetation):
+%   'gaussian'    each clutter cell moves with a Gaussian random radial velocity
+%                 of std icmStd_mps (Gaussian spectrum)
+%   'exponential' Billingsley's model of land clutter: a DC part (stationary
+%                 scatterers) and an AC part with an exponential spectrum
+%                 P(v) = beta/2 * exp(-beta*|v|); DC/AC power ratio r. From the
+%                 wind speed: 1/beta = 0.1*log10(w) + 0.068 m/s and
+%                 r = 489.8 * w^-1.55 * f^-1.21 (w in mph, f in GHz)
+cfg.clutter.spectrum         = 'gaussian';
+cfg.clutter.icmStd_mps       = 0.1;   % 'gaussian': std of internal clutter motion [m/s]
+cfg.clutter.windSpeed_mps    = 4.5;   % 'exponential': wind speed [m/s] (4.5 m/s = 10 mph, breezy)
+cfg.clutter.expBeta_spm      = [];    % 'exponential': beta [s/m] ([] = from the wind speed)
+cfg.clutter.dcToAc           = [];    % 'exponential': DC/AC power ratio r ([] = from the wind speed)
 cfg.clutter.elevation_deg    = 0;     % elevation of the clutter returns [deg]
 
 %% Simulation length
@@ -159,6 +223,8 @@ cfg.display.showTruth         = true;     % draw the true target positions
 cfg.display.showMode          = 'plots';  % PPI shows 'plots' (after the plot extractor), 'detections'
                                           % (CFAR detections before it: arcs) or 'both' (also in the panel)
 cfg.display.maxDetections     = 100000;   % CFAR detections kept for the PPI (the newest)
+cfg.display.showTracks        = true;     % draw the tracks (hollow triangles; also a checkbox in the panel)
+cfg.display.trackLeader_s     = 30;       % length of the velocity leader of a track [s of flight]
 cfg.display.rangeProfilePulse = [];       % pulse number whose matched filter output is plotted
 cfg.display.rangeProfileAxis  = 'range';  % 'range', 'delay' or 'index'
 end

@@ -19,6 +19,8 @@
  *     --update-every N       run Doppler/CFAR every N pulses (default from the configuration)
  *     --plots-csv FILE       plot list (default plots.csv, '' = none)
  *     --detections-csv FILE  list of all pruned CFAR detections (default: none)
+ *     --tracks-csv FILE      every track update and deletion (default: none; tracking is
+ *                            switched on in the configuration, cfg.track.enable)
  *     --idle-timeout S       stop when no data came for S seconds after the first PRI (default 0 = never)
  *     --queue N              PRIs buffered between the input thread and the processing (default 64)
  *     --no-skip              never skip Doppler/CFAR updates when the processing falls behind
@@ -36,7 +38,7 @@
 
 typedef struct {
     const char *configPath, *recordPath, *replayPath, *snapshotPath;
-    const char *serialDevice, *serialContent, *plotsCsv, *detectionsCsv, *mf, *ppiShow;
+    const char *serialDevice, *serialContent, *plotsCsv, *detectionsCsv, *tracksCsv, *mf, *ppiShow;
     int port, baud, threads, updateEvery, ppi, quiet, queue, noSkip;
     double idleTimeout_s;
     double cfarThreshold_dB;      /* NAN: from the configuration */
@@ -46,8 +48,8 @@ typedef struct {
     Options opt;
     RadarConfig cfg;
     SerialOut *serial;
-    FILE *plotsFile, *detFile;
-    uint64_t nPlots, nDetections;
+    FILE *plotsFile, *detFile, *trackFile;
+    uint64_t nPlots, nDetections, nTrackUpdates, nConfirmed;
     double detArc_deg;            /* azimuth step between CPI updates (PPI detection arcs) */
     int exitCode;
 } App;
@@ -67,7 +69,8 @@ static void usage(void)
          "                      [--serial DEVICE] [--baud N]\n"
          "                      [--serial-content detections|plots] [--threads N] [--mf auto|direct|fft]\n"
          "                      [--update-every N]\n"
-         "                      [--plots-csv FILE] [--detections-csv FILE] [--idle-timeout S] [--quiet]\n"
+         "                      [--plots-csv FILE] [--detections-csv FILE] [--tracks-csv FILE]\n"
+         "                      [--idle-timeout S] [--quiet]\n"
          "                      [--queue N] [--no-skip] [--cfar-threshold DB]");
 }
 
@@ -102,6 +105,7 @@ static int parse_options(int argc, char **argv, Options *o)
         else if (!strcmp(a, "--update-every"))   TAKE(o->updateEvery = atoi(v));
         else if (!strcmp(a, "--plots-csv"))      TAKE(o->plotsCsv = v);
         else if (!strcmp(a, "--detections-csv")) TAKE(o->detectionsCsv = v);
+        else if (!strcmp(a, "--tracks-csv"))     TAKE(o->tracksCsv = v);
         else if (!strcmp(a, "--idle-timeout"))   TAKE(o->idleTimeout_s = atof(v));
         else if (!strcmp(a, "--quiet"))          o->quiet = 1;
         else if (!strcmp(a, "--queue"))          TAKE(o->queue = atoi(v));
@@ -178,6 +182,27 @@ static void on_plot(void *user, const Detection *p)
 #endif
 }
 
+static void on_track(void *user, const Track *t)
+{
+    App *app = user;
+    app->nTrackUpdates += !t->deleted;
+    if (t->confirmed && !t->deleted && t->hits == app->cfg.trackConfirmHits) {
+        app->nConfirmed++;
+        if (!app->opt.quiet)
+            printf("track %u confirmed  t %8.3f s  R %8.3f km  az %7.2f deg  speed %6.1f m/s\n", t->id, t->time_s,
+                   hypot(hypot(t->pos_m[0], t->pos_m[1]), t->pos_m[2]) / 1e3,
+                   fmod(atan2(t->pos_m[0], t->pos_m[1]) * 180.0 / 3.14159265358979323846 + 360.0, 360.0),
+                   hypot(t->vel_mps[0], t->vel_mps[1]));
+    }
+    if (app->trackFile)
+        fprintf(app->trackFile, "%u,%d,%d,%.6f,%.2f,%.2f,%.2f,%.3f,%.3f,%.3f,%d,%d\n", t->id, t->confirmed, t->deleted,
+                t->time_s, t->pos_m[0], t->pos_m[1], t->pos_m[2], t->vel_mps[0], t->vel_mps[1], t->vel_mps[2],
+                t->hits, t->misses);
+#ifdef RADAR_WITH_QT
+    if (app->opt.ppi) ppi_post_track(t);
+#endif
+}
+
 static void on_antenna(void *user, double az_deg, double time_s, uint32_t scan)
 {
     App *app = user;
@@ -203,8 +228,8 @@ static void print_timing(const Processor *proc, const UdpInput *in, uint64_t que
             "incomplete PRIs %llu\n", (unsigned long long)t.pris, (unsigned long long)t.updates, wall_s,
             (unsigned long long)u.datagrams, (unsigned long long)u.foreign, (unsigned long long)u.prisIncomplete);
     fprintf(stderr, "Processing time per PRI: %.3f ms (DBF %.3f, MF %.3f, MTI %.3f, Doppler %.3f, "
-            "CFAR+pruning %.3f, extraction %.3f)\n", t.total_ms / n, t.dbf_ms / n, t.mf_ms / n,
-            t.mti_ms / n, t.doppler_ms / n, t.cfar_ms / n, t.extract_ms / n);
+            "CFAR+pruning %.3f, extraction %.3f, tracking %.3f)\n", t.total_ms / n, t.dbf_ms / n, t.mf_ms / n,
+            t.mti_ms / n, t.doppler_ms / n, t.cfar_ms / n, t.extract_ms / n, t.track_ms / n);
     if (t.skipped || queueDrops)
         fprintf(stderr, "Overload: %llu CPI updates skipped, %llu PRIs dropped because the queue was full\n",
                 (unsigned long long)t.skipped, (unsigned long long)queueDrops);
@@ -244,7 +269,14 @@ static int worker(void *arg)
         app->exitCode = 1;
         return 1;
     }
-    ProcessorCallbacks cb = { on_detections, on_plot, on_antenna, app };
+    ProcessorCallbacks cb = { on_detections, on_plot, on_antenna, app, on_track };
+#ifdef RADAR_WITH_QT
+    char detName[32], trackName[32];
+    snprintf(detName, sizeof detName, "CFAR %s", cfar_method_name(app->cfg.cfarMethod));
+    if (app->cfg.trackEnable) snprintf(trackName, sizeof trackName, "Tracking EKF %d-D", app->cfg.trackDim);
+    else snprintf(trackName, sizeof trackName, "Tracking (off)");
+    double lastTiming = 0.0;
+#endif
     const double default_dB = 10.0 * log10(app->cfg.alpha);
     if (!isnan(app->opt.cfarThreshold_dB))
         processor_set_cfar_alpha(proc, pow(10.0, app->opt.cfarThreshold_dB / 10.0));
@@ -286,13 +318,31 @@ static int worker(void *arg)
         if (live && !app->opt.noSkip)
             processor_set_slow_time(proc, input_thread_backlog(input) <= skipAbove);
         processor_process(proc, pri, &cb);
+#ifdef RADAR_WITH_QT
+        if (app->opt.ppi && lastData - lastTiming > 0.25) {   /* block times in the PPI panel */
+            ProcessorTiming tm;
+            processor_timing(proc, &tm);
+            ppi_post_timing(&tm, detName, trackName);
+            lastTiming = lastData;
+        }
+#endif
     }
     const uint64_t queueDrops = input_thread_dropped(input);
     input_thread_stop(input);
     processor_flush(proc, &cb);
     print_timing(proc, in, queueDrops, now_seconds() - t0);
+#ifdef RADAR_WITH_QT
+    if (app->opt.ppi) {
+        ProcessorTiming tm;
+        processor_timing(proc, &tm);
+        ppi_post_timing(&tm, detName, trackName);
+    }
+#endif
     fprintf(stderr, "Plots: %llu, CFAR detections after pruning: %llu\n",
             (unsigned long long)app->nPlots, (unsigned long long)app->nDetections);
+    if (app->cfg.trackEnable)
+        fprintf(stderr, "Tracks (EKF %d-D): %llu updates, %llu confirmed\n", app->cfg.trackDim,
+                (unsigned long long)app->nTrackUpdates, (unsigned long long)app->nConfirmed);
     processor_destroy(proc);
     udp_input_close(in);
     return 0;
@@ -323,11 +373,20 @@ int main(int argc, char **argv)
             "CPI %d pulses, FFT %d x %d row(s), update every %d pulse(s), plots need %d update(s)\n", app.cfg.nCh,
             app.cfg.nBeams, app.cfg.nDdc, app.cfg.pulse[0].nRange, app.cfg.pulse[1].nRange, app.cfg.cpiLength,
             app.cfg.nfft, app.cfg.nRows, app.cfg.updateEvery, app.cfg.minHits);
+    fprintf(stderr, "CFAR %s (window: range %d+%d, Doppler %d+%d guard+training cells per side), ", cfar_method_name(app.cfg.cfarMethod),
+            app.cfg.guardRange, app.cfg.trainRange, app.cfg.guardDoppler, app.cfg.trainDoppler);
+    if (app.cfg.trackEnable) fprintf(stderr, "tracking: EKF %d-D\n", app.cfg.trackDim);
+    else fprintf(stderr, "tracking off\n");
 
     if (app.opt.plotsCsv && app.opt.plotsCsv[0]) {
         app.plotsFile = fopen(app.opt.plotsCsv, "w");
         if (app.plotsFile)
             fprintf(app.plotsFile, "time_s,az_deg,range_m,el_deg,vr_mps,snr_dB,pulse,hits,beam,rangeCell,dopplerBin,pulseNumber\n");
+    }
+    if (app.opt.tracksCsv && app.opt.tracksCsv[0]) {
+        app.trackFile = fopen(app.opt.tracksCsv, "w");
+        if (app.trackFile)
+            fprintf(app.trackFile, "id,confirmed,deleted,time_s,x_m,y_m,z_m,vx_mps,vy_mps,vz_mps,hits,misses\n");
     }
     if (app.opt.detectionsCsv && app.opt.detectionsCsv[0]) {
         app.detFile = fopen(app.opt.detectionsCsv, "w");
@@ -366,6 +425,7 @@ int main(int argc, char **argv)
     }
     if (app.plotsFile) fclose(app.plotsFile);
     if (app.detFile) fclose(app.detFile);
+    if (app.trackFile) fclose(app.trackFile);
     radar_config_free(&app.cfg);
     return app.exitCode;
 }

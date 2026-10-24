@@ -28,6 +28,12 @@ passed(end+1) = test_udp_stream();
 names{end+1}  = 'DDC recording and replay over UDP with the PRI timing';
 passed(end+1) = test_ddc_replay();
 
+names{end+1}  = 'CFAR methods (2-D, range, Doppler), edges, range interval';
+passed(end+1) = test_cfar();
+
+names{end+1}  = 'EKF tracker 3-D and 2-D (and the C tracker when built)';
+passed(end+1) = test_tracker();
+
 names{end+1}  = 'Interactive PPI (data tips, zoom, pan, filters)';
 passed(end+1) = test_ppi_interactive();
 

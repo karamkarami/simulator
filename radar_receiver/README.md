@@ -16,16 +16,18 @@ at 921600 baud.
  CPI ring buffer (the pulses of one CPI) -> MTI ring (MTI output of each pulse computed once)
  Doppler: fixed PRF Hamming + FFT 128 | staggered: de-interleave, Hamming, FFT 32, NCI;
           division by the noise gain of every bin
- 2-D CA-CFAR -> pruning (local peaks, sidelobe blanking) -> reports -> plot extraction
-        |                                   |                         |
+ CA-CFAR (2-D, 1-D range or 1-D Doppler window, tested range interval, shifted range window at the edges)
+   -> pruning (local peaks, sidelobe blanking) -> reports -> plot extraction -> EKF tracking (optional)
+        |                                   |                         |                |
         |                                   +-> serial (detections)   +-> CSV, console, Qt PPI,
-        |                                                                 serial (plots)
+        |                                                                 serial (plots) +-> CSV, Qt PPI
 ```
 
 The algorithms are the same as in the MATLAB simulator (`../src/*.m`, see
 `../README.md`). The C receiver reads every number that MATLAB derives
 (DBF matrix, matched filters, range axes, CPI length, MTI weights, Doppler
-window and noise gains, CFAR threshold factor, extraction settings) from a
+window and noise gains, CFAR method, window, threshold factor and tested
+range cells, extraction and tracker settings) from a
 configuration file that `export_receiver_config.m` writes. Both programs
 therefore always use the same values.
 
@@ -98,7 +100,7 @@ plots of both programs.
 | `--ppi` | show the interactive PPI (Qt build, see below) |
 | `--ppi-snapshot FILE` | save the PPI as a PNG at the end and close it |
 | `--ppi-show MODE` | what the PPI shows at the start: `plots` (default, after the plot extractor), `detections` (CFAR detections before it) or `both` |
-| `--cfar-threshold DB` | CA-CFAR threshold factor 10 log10(alpha) in dB (default: the configuration, i.e. `cfg.cfar.pfa`); can also be changed in the PPI |
+| `--cfar-threshold DB` | CA-CFAR threshold factor 10 log10(alpha) in dB of the configured method (default: the configuration, i.e. the method's Pfa); can also be changed in the PPI |
 | `--serial DEVICE` | send the CFAR output to a serial port (`/dev/ttyUSB0`, `COM3`, ...) |
 | `--baud N` | serial baud rate (default 921600) |
 | `--serial-content X` | `detections` (default: the pruned CFAR detections of every CPI update) or `plots` |
@@ -107,6 +109,7 @@ plots of both programs.
 | `--update-every N` | run Doppler, CFAR and extraction every N pulses (default from the configuration: 1) |
 | `--plots-csv FILE` | plot list (default `plots.csv`; `''` = none) |
 | `--detections-csv FILE` | all pruned CFAR detections (default none) |
+| `--tracks-csv FILE` | every track update and deletion: id, confirmed, deleted, time, x, y, z, vx, vy, vz (East, North, up relative to the antenna), hits, misses (default none) |
 | `--idle-timeout S` | stop when no PRI arrived for S seconds after the first one (default 0 = never) |
 | `--quiet` | do not print every plot |
 | `--queue N` | PRIs buffered between the input thread and the processing (default 64) |
@@ -176,12 +179,29 @@ The panel on the right of the window has:
   they disappear like the plots.
 * **Save screenshot (PNG) ...**: saves the PPI as it is now (without the
   panel); the default file name has the date and time.
-* **CFAR threshold [dB]**: shows the threshold the processing uses and its
-  false alarm probability (`cfar_pfa()`, needs `nLooks` in the configuration
-  file: export it again with the current `export_receiver_config.m`).
-  *Apply* sends the value in the field to the processing thread, which uses
-  it from the next CPI update on and reports it back (also printed on the
-  console); *Default* returns to the value of the configuration.
+* **Tracks (T)**: shows or hides the tracks of the EKF tracker: a hollow
+  triangle at the last update, so the plot (filled circle) lies inside it;
+  magenta with its number and a 30 s velocity leader when confirmed, gray
+  while tentative. Hover over it: number, state, range, azimuth, height and
+  climb (3-D), speed, heading, updates. A deleted track disappears.
+* **CFAR threshold [dB]**: shows the method (`cfg.cfar.method`), the
+  threshold the processing uses and its false alarm probability
+  (`cfar_pfa()`, needs `nLooks` in the configuration file: export it again
+  with the current `export_receiver_config.m`). *Apply* sends the value in
+  the field to the processing thread, which uses it from the next CPI update
+  on and reports it back (also printed on the console); *Default* returns to
+  the value of the configuration.
+* **Mean time per PRI [us]** (bottom right, above the help): the mean
+  processing time per PRI of every block since the start: DBF, matched
+  filter, MTI (clutter filter), Doppler (FFT and non-coherent integration),
+  CFAR of the configured method with the pruning, plot extractor, tracking,
+  and their total. The worker posts its accumulated times 4 times a second.
+
+**Tracking** (`cfg.track.enable` in the configuration, `tracker.c`): the
+same EKF as `track_update.m` (2-D or 3-D, see `../README.md`), fed with every
+plot in the order of the extractor; once per PRI the missed scans are
+counted and old tracks deleted. Confirmations are printed on the console
+(unless `--quiet`), and the number of updates at the end.
 
 The PPI is interactive:
 
@@ -198,6 +218,7 @@ The PPI is interactive:
 | `D` | next display mode (plots / detections / both) |
 | space | pause/resume the display (the processing continues; the plots are shown on resume) |
 | `S` | save a screenshot (PNG) |
+| `T` | show/hide the tracks |
 
 The status line shows the zoom and the range, azimuth and east/north
 position of the cursor.
@@ -320,10 +341,11 @@ Timing:
 
 | Test | What it checks |
 |---|---|
+| `tracker` (`tests/test_tracker.c`) | two crossing targets over 6 scans, 3-D and 2-D: two confirmed tracks that stay on their targets; with plots and the track log from `../tests/test_tracker.m`, every C track update equals MATLAB's (state within 1e-6) |
 | `core` (`tests/test_core.c`) | batched FFT against a direct DFT; plot extractor; a moving target through the whole chain with the exported configuration (one plot at the right range, velocity and beam); direct and fast-convolution matched filters give the same plot; the same target with the CFAR threshold raised to 45 dB at run time gives no detection; `cfar_pfa()` against the closed form (one look) and the Pfa 1e-8 of the configured threshold |
 | `udp_input` | reassembly with shuffled, duplicate, missing and foreign datagrams; timeouts; record and replay; fuzzing |
 | `ddc_files` (`tests/test_ddc_files.c`) | MAT-file reader with files written as MATLAB writes them (data in smaller storage types, small elements, skipped char field, compressed `-v7` with zlib); folder listing; the datagrams of a DDC file are accepted by `udp_input.c` and give back the same PRI; corrupted, truncated, `-v7.3` and big-endian files are refused |
 | `serial` | frame encoding and CRC; real output to a pseudo-terminal (Linux): exact bytes, 200-detection split, non-blocking drops, close |
 | `ppi` | the Qt PPI runs off-screen with antenna updates, plots, detections and a CFAR threshold report and saves a snapshot |
-| `ppi_interactive` | mouse, wheel and key events: data tips, cursor readout, zoom around the cursor, pan, pin/unpin, reset, filters, persistence options, pause, clear; detections (display modes, arcs drawn, data tips, key D); window panel: display mode box, CFAR threshold Apply/Default and its report, screenshot |
+| `ppi_interactive` | mouse, wheel and key events: data tips, cursor readout, zoom around the cursor, pan, pin/unpin, reset, filters, persistence options, pause, clear; detections (display modes, arcs drawn, data tips, key D); window panel: display mode box, CFAR threshold Apply/Default and its report, screenshot, mean block times; tracks (triangle drawn around the plot, data tip, checkbox and key T, deletion) |
 | `../tests/test_c_receiver.m` (Octave/MATLAB) | the six-target scenario streamed over UDP to this receiver: the C plots must match the MATLAB plots; the recording is replayed to check that the result is repeatable and to measure the time |

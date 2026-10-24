@@ -51,6 +51,7 @@
 #include <QCloseEvent>
 #include <QColor>
 #include <QConicalGradient>
+#include <QCheckBox>
 #include <QComboBox>
 #include <QContextMenuEvent>
 #include <QDoubleSpinBox>
@@ -62,6 +63,7 @@
 #include <QPushButton>
 #include <QVBoxLayout>
 #include <QFont>
+#include <QFontDatabase>
 #include <QFontMetrics>
 #include <QKeyEvent>
 #include <QMenu>
@@ -86,7 +88,9 @@
 #include <deque>
 #include <functional>
 #include <mutex>
+#include <map>
 #include <set>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -115,6 +119,10 @@ const QColor kColorGrid(70, 70, 70);
 const QColor kColorRim(120, 120, 120);
 const QColor kColorLabel(150, 150, 150);
 const QColor kColorPin(80, 230, 80);
+const QColor kColorTrack(255, 90, 255);   /* confirmed track: magenta triangle      */
+const QColor kColorTentative(140, 140, 140);
+constexpr double kTrackPx     = 11.0;     /* half size of the track triangle [px]   */
+constexpr double kLeader_s    = 30.0;     /* velocity leader of a track [s]         */
 
 double wrap360(double a)
 {
@@ -168,6 +176,10 @@ struct Shared {
     bool                  clear = false;   /* a new run started: clear the display */
     uint64_t              nextId = 1;
     CfarState             cfar;
+    std::map<uint32_t, Track> trackUpdates;  /* newest report of every track (deleted ones flagged) */
+    ProcessorTiming       timing;          /* accumulated block times               */
+    std::string           detName = "CFAR", trackName = "Tracking";
+    uint64_t              timingSerial = 0;
 };
 
 Shared &shared()
@@ -185,6 +197,9 @@ void reset_shared()
     s.newDets.clear();
     s.clear = true;
     s.cfar = CfarState();
+    s.trackUpdates.clear();
+    s.timing = ProcessorTiming();
+    s.timingSerial = 0;
 }
 
 /* Ground position and antenna sweep of a plot or detection (call with the mutex held). */
@@ -325,11 +340,18 @@ public:
     QPointF screenOf(double east_m, double north_m) { layoutDisplay(); return toScreen(east_m, north_m); }
     /* plot or detection under the cursor (nearest within kPickPx), nullptr if none */
     const PlotMark *pick(QPointF screen) const;
+    /* track under the cursor (within kPickPx; it wins over a plot that is not 3 px closer) */
+    const Track *pickTrack(QPointF screen, double *dist = nullptr) const;
     QString tipText(QPointF screen) const
     {
-        const PlotMark *m = pick(screen);
-        return m ? plot_text(m->det, m->isDet) : QString();
+        uint64_t key;
+        return hoverText(screen, &key);
     }
+    QString hoverText(QPointF screen, uint64_t *key) const;
+    size_t trackCount() const { return tracks_.size(); }
+    size_t confirmedCount() const;
+    void   setShowTracks(bool on) { showTracks_ = on; update(); }
+    bool   showTracks() const { return showTracks_; }
     void   clickAt(QPointF screen);     /* pin / unpin the data tip of a plot or detection */
     size_t pinnedCount() const { return pinned_.size(); }
     size_t plotCount() const { return plots_.size(); }
@@ -345,7 +367,7 @@ public:
     void   setHistory(History h) { history_ = h; refresh(); }
     void   setPaused(bool on) { paused_ = on; update(); }
     bool   paused() const { return paused_; }
-    void   clearPlots() { plots_.clear(); dets_.clear(); pinned_.clear(); update(); }
+    void   clearPlots() { plots_.clear(); dets_.clear(); tracks_.clear(); pinned_.clear(); update(); }
     bool   saveSnapshot(const QString &path);
     QString saveSnapshotDialog();       /* asks for a file name; returns it ('' if cancelled) */
 
@@ -367,6 +389,7 @@ private:
     void   drawAntenna(QPainter &p) const;
     void   drawPlots(QPainter &p) const;
     void   drawDetections(QPainter &p) const;
+    void   drawTracks(QPainter &p) const;
     void   drawPins(QPainter &p) const;
     void   drawStatus(QPainter &p) const;
     void   drawLegend(QPainter &p) const;
@@ -396,6 +419,8 @@ private:
     AntennaState          antenna_;
     std::deque<PlotMark>  plots_;
     std::deque<PlotMark>  dets_;        /* CFAR detections before the extractor */
+    std::map<uint32_t, Track> tracks_;  /* current tracks by number            */
+    std::map<uint32_t, Track> incomingTracks_;
     std::vector<PlotMark> incoming_;    /* buffer swapped with Shared::newPlots */
     std::vector<PlotMark> incomingDets_;
     bool                  finished_ = false;
@@ -419,7 +444,7 @@ private:
     std::set<uint64_t>    pinned_;
     /* options */
     bool                  showShort_ = true, showLong_ = true, showRings_ = true;
-    bool                  showLabels_ = false, showTrail_ = true, paused_ = false;
+    bool                  showLabels_ = false, showTrail_ = true, paused_ = false, showTracks_ = true;
     double                minSnr_dB_ = -1e9;
     History               history_ = History::UntilSwept;
     DisplayMode           mode_ = DisplayMode::Plots;
@@ -436,11 +461,18 @@ void PpiWidget::refresh()
         std::lock_guard<std::mutex> lock(s.mutex);
         incoming_.swap(s.newPlots);     /* the worker keeps the old capacity */
         incomingDets_.swap(s.newDets);
+        incomingTracks_.swap(s.trackUpdates);
+        s.trackUpdates.clear();
         antenna_ = s.antenna;
         clear = s.clear;
         s.clear = false;
     }
-    if (clear) { plots_.clear(); dets_.clear(); pinned_.clear(); }
+    if (clear) { plots_.clear(); dets_.clear(); tracks_.clear(); pinned_.clear(); }
+    for (const auto &u : incomingTracks_) {             /* newest state of every track */
+        if (u.second.deleted) tracks_.erase(u.first);
+        else tracks_[u.first] = u.second;
+    }
+    incomingTracks_.clear();
     auto keep = [this](std::deque<PlotMark> &list, const std::vector<PlotMark> &add, size_t maxSize) {
         list.insert(list.end(), add.begin(), add.end());
         list.erase(std::remove_if(list.begin(), list.end(), [this](const PlotMark &m) { return expired(m); }),
@@ -603,11 +635,11 @@ void PpiWidget::mouseMoveEvent(QMouseEvent *event)
         }
     }
     updateCursor(pos);
-    const PlotMark *m = dragging_ ? nullptr : pick(pos);
-    const uint64_t id = m ? m->id : 0;
+    uint64_t id = 0;
+    const QString text = dragging_ ? QString() : hoverText(pos, &id);
     if (id != hoverId_) {
         hoverId_ = id;
-        if (m) QToolTip::showText(mapToGlobal(pos.toPoint()), plot_text(m->det, m->isDet), this);
+        if (id) QToolTip::showText(mapToGlobal(pos.toPoint()), text, this);
         else QToolTip::hideText();
         update();
     }
@@ -647,6 +679,7 @@ void PpiWidget::keyPressEvent(QKeyEvent *event)
     case Qt::Key_Down:  panPixels(QPointF(0.0, -step)); break;
     case Qt::Key_R: case Qt::Key_Home: resetView(); break;
     case Qt::Key_C:     pinned_.clear(); update(); break;
+    case Qt::Key_T:     setShowTracks(!showTracks_); break;
     case Qt::Key_D:     setDisplayMode(mode_ == DisplayMode::Plots ? DisplayMode::Detections
                                        : mode_ == DisplayMode::Detections ? DisplayMode::Both : DisplayMode::Plots);
                         break;
@@ -688,6 +721,7 @@ void PpiWidget::contextMenuEvent(QContextMenuEvent *event)
     toggle(QStringLiteral("Range rings and spokes"), showRings_,
            [this](bool on) { showRings_ = on; backgroundDirty_ = true; update(); });
     toggle(QStringLiteral("Antenna trail"), showTrail_, [this](bool on) { showTrail_ = on; update(); });
+    toggle(QStringLiteral("Tracks (T)"), showTracks_, [this](bool on) { setShowTracks(on); });
 
     QMenu *hist = menu.addMenu(QStringLiteral("Plots shown"));
     QActionGroup *histGroup = new QActionGroup(hist);
@@ -879,6 +913,87 @@ void PpiWidget::drawPlots(QPainter &p) const
     }
 }
 
+/* Hollow triangle around the position of the last update (the plot lies
+ * inside it), velocity leader and number; tentative tracks in gray. */
+void PpiWidget::drawTracks(QPainter &p) const
+{
+    if (!showTracks_) return;
+    p.setFont(pixel_font(this->font(), 11));
+    for (const auto &e : tracks_) {
+        const Track &t = e.second;
+        const QPointF s = toScreen(t.pos_m[0], t.pos_m[1]);
+        if (!viewRect_.adjusted(-40, -40, 40, 40).contains(s)) continue;
+        const QColor c = t.confirmed ? kColorTrack : kColorTentative;
+        const double h = kTrackPx;
+        const QPointF tri[3] = { s + QPointF(0.0, -h), s + QPointF(h * 0.866, h * 0.5), s + QPointF(-h * 0.866, h * 0.5) };
+        p.setPen(QPen(c, t.confirmed ? 1.6 : 1.0));
+        p.setBrush(Qt::NoBrush);
+        p.drawPolygon(tri, 3);
+        if (!t.confirmed) continue;
+        p.drawLine(s, toScreen(t.pos_m[0] + kLeader_s * t.vel_mps[0], t.pos_m[1] + kLeader_s * t.vel_mps[1]));
+        p.drawText(s + QPointF(h, h + 4.0), QStringLiteral("T%1").arg(t.id));
+        if (hoverId_ == ((1ull << 63) | t.id)) {
+            p.setPen(QPen(Qt::white, 1.5));
+            p.drawEllipse(s, h + 4.0, h + 4.0);
+        }
+    }
+}
+
+size_t PpiWidget::confirmedCount() const
+{
+    return (size_t)std::count_if(tracks_.begin(), tracks_.end(),
+                                 [](const std::pair<const uint32_t, Track> &e) { return e.second.confirmed != 0; });
+}
+
+const Track *PpiWidget::pickTrack(QPointF screen, double *dist) const
+{
+    if (!showTracks_) return nullptr;
+    const Track *best = nullptr;
+    double bestD = kPickPx;
+    for (const auto &e : tracks_) {
+        const QPointF d = toScreen(e.second.pos_m[0], e.second.pos_m[1]) - screen;
+        const double r = std::hypot(d.x(), d.y());
+        if (r <= bestD) { bestD = r; best = &e.second; }
+    }
+    if (dist) *dist = bestD;
+    return best;
+}
+
+/* Data tip of a track. */
+QString track_text(const Track &t)
+{
+    QStringList rows;
+    const double R = std::sqrt(t.pos_m[0] * t.pos_m[0] + t.pos_m[1] * t.pos_m[1] + t.pos_m[2] * t.pos_m[2]);
+    rows << QStringLiteral("<b>Track %1 (%2, %3-D EKF)</b>").arg(t.id).arg(t.confirmed ? "confirmed" : "tentative").arg(t.dim)
+         << QStringLiteral("Range: %1 km").arg(R / 1e3, 0, 'f', 3)
+         << QStringLiteral("Azimuth: %1").arg(deg_text(wrap360(std::atan2(t.pos_m[0], t.pos_m[1]) / kDeg), 2));
+    if (t.dim == 3)
+        rows << QStringLiteral("Height: %1 m").arg(t.alt_m, 0, 'f', 0)
+             << QStringLiteral("Climb: %1 m/s").arg(t.vel_mps[2], 0, 'f', 1);
+    rows << QStringLiteral("Speed: %1 m/s").arg(std::hypot(t.vel_mps[0], t.vel_mps[1]), 0, 'f', 1)
+         << QStringLiteral("Heading: %1").arg(deg_text(wrap360(std::atan2(t.vel_mps[0], t.vel_mps[1]) / kDeg), 1))
+         << QStringLiteral("Updates: %1 (missed scans %2)").arg(t.hits).arg(t.misses)
+         << QStringLiteral("Last update: %1 s").arg(t.time_s, 0, 'f', 3);
+    return rows.join(QStringLiteral("<br>"));
+}
+
+/* Data tip under the cursor and a key for it (plot/detection id, or the track
+ * number with the top bit set; 0 = nothing). */
+QString PpiWidget::hoverText(QPointF screen, uint64_t *key) const
+{
+    double dTrack = 0.0;
+    const Track *t = pickTrack(screen, &dTrack);
+    const PlotMark *m = pick(screen);
+    if (m && t) {
+        const QPointF d = toScreen(m->east_m, m->north_m) - screen;
+        if (std::hypot(d.x(), d.y()) > dTrack - 3.0) m = nullptr;   /* the track wins */
+    }
+    if (m) { *key = m->id; return plot_text(m->det, m->isDet); }
+    if (t) { *key = (1ull << 63) | t->id; return track_text(*t); }
+    *key = 0;
+    return QString();
+}
+
 /* CFAR detections: an arc over the azimuth step of the CPI update at the
  * ground range of the detection (a dot when the arc is shorter than a pixel). */
 void PpiWidget::drawDetections(QPainter &p) const
@@ -959,6 +1074,8 @@ void PpiWidget::drawStatus(QPainter &p) const
             line1 += QStringLiteral("    Plots %1 / %2").arg((qulonglong)visibleCount()).arg((qulonglong)plots_.size());
         if (mode_ != DisplayMode::Plots)
             line1 += QStringLiteral("    Detections %1").arg((qulonglong)visibleDetectionCount());
+        if (showTracks_ && !tracks_.empty())
+            line1 += QStringLiteral("    Tracks %1").arg((qulonglong)confirmedCount());
     }
     else
         line1 = finished_ ? QStringLiteral("No antenna data received")
@@ -989,7 +1106,7 @@ void PpiWidget::drawStatus(QPainter &p) const
 /* Small legend in the bottom-left corner, with the mouse help. */
 void PpiWidget::drawLegend(QPainter &p) const
 {
-    enum Kind { PlotS, PlotL, DetS, DetL, Antenna, Help };
+    enum Kind { PlotS, PlotL, DetS, DetL, TrackK, Antenna, Help };
     std::vector<std::pair<Kind, QString>> rows;
     if (mode_ != DisplayMode::Detections) {
         rows.emplace_back(PlotS, QStringLiteral("Plot, short pulse"));
@@ -999,6 +1116,7 @@ void PpiWidget::drawLegend(QPainter &p) const
         rows.emplace_back(DetS, QStringLiteral("CFAR detection, short pulse"));
         rows.emplace_back(DetL, QStringLiteral("CFAR detection, long pulse"));
     }
+    if (showTracks_) rows.emplace_back(TrackK, QStringLiteral("Track (gray: tentative)"));
     rows.emplace_back(Antenna, QStringLiteral("Antenna"));
     rows.emplace_back(Help, QStringLiteral("Wheel zoom, drag pan, right click options"));
 
@@ -1025,6 +1143,13 @@ void PpiWidget::drawLegend(QPainter &p) const
             p.setPen(QPen(kind == DetS ? kColorDetShort : kColorDetLong, 3.0, Qt::SolidLine, Qt::RoundCap));
             p.setBrush(Qt::NoBrush);
             p.drawArc(QRectF(mark.x() - 8.0, mark.y() - 2.0, 16.0, 16.0), 50 * 16, 80 * 16);
+        } else if (kind == TrackK) {
+            const double h = 7.0;
+            const QPointF tri[3] = { mark + QPointF(0.0, -h), mark + QPointF(h * 0.866, h * 0.5),
+                                     mark + QPointF(-h * 0.866, h * 0.5) };
+            p.setPen(QPen(kColorTrack, 1.5));
+            p.setBrush(Qt::NoBrush);
+            p.drawPolygon(tri, 3);
         } else if (kind == Antenna) {
             p.setPen(QPen(kColorAntenna, 2.0));
             p.drawLine(mark - QPointF(8.0, 0.0), mark + QPointF(8.0, 0.0));
@@ -1048,6 +1173,7 @@ void PpiWidget::paintEvent(QPaintEvent *event)
     drawAntenna(p);
     drawDetections(p);
     drawPlots(p);
+    drawTracks(p);
     p.restore();
     drawPins(p);
     drawStatus(p);
@@ -1093,6 +1219,10 @@ public:
         v->addWidget(mode_);
         QObject::connect(mode_, static_cast<void (QComboBox::*)(int)>(&QComboBox::currentIndexChanged),
                          [this](int i) { ppi_->setDisplayMode((DisplayMode)i); ppi_->setFocus(); });
+        tracks_ = new QCheckBox(QStringLiteral("Tracks (T)"), panel);
+        tracks_->setChecked(ppi_->showTracks());
+        v->addWidget(tracks_);
+        QObject::connect(tracks_, &QCheckBox::toggled, [this](bool on) { ppi_->setShowTracks(on); ppi_->setFocus(); });
 
         title(QStringLiteral("Screenshot"));
         save_ = new QPushButton(QStringLiteral("Save screenshot (PNG) ..."), panel);
@@ -1124,13 +1254,23 @@ public:
         cfarInfo_ = new QLabel(QStringLiteral("waiting for the processing ..."), panel);
         cfarInfo_->setObjectName(QStringLiteral("info"));
         cfarInfo_->setWordWrap(true);
+        cfarInfo_->setMinimumHeight(cfarInfo_->fontMetrics().lineSpacing() * 2 + 4);
         v->addWidget(cfarInfo_);
         QObject::connect(apply_, &QPushButton::clicked, [this]() { requestCfar(cfar_->value()); });
         QObject::connect(default_, &QPushButton::clicked, [this]() { requestCfar(cfarDefault_dB_); });
 
         v->addStretch(1);
+        title(QStringLiteral("Mean time per PRI [us]"));
+        timing_ = new QLabel(QStringLiteral("waiting for the processing ..."), panel);
+        QFont mono = QFontDatabase::systemFont(QFontDatabase::FixedFont);
+        mono.setPixelSize(11);
+        timing_->setFont(mono);
+        timing_->setStyleSheet(QStringLiteral("background: #101010; padding: 4px;"));
+        timing_->setMinimumHeight(QFontMetrics(mono).lineSpacing() * 9 + 12);   /* 9 rows, stable layout */
+        timing_->setAlignment(Qt::AlignLeft | Qt::AlignTop);
+        v->addWidget(timing_);
         QLabel *help = new QLabel(QStringLiteral("Wheel: zoom   Drag: pan\nDouble click: reset\nHover: data tip   "
-                                                 "Click: pin\nKeys: + - arrows R C D S Space\nRight click: more options"),
+                                                 "Click: pin\nKeys: + - arrows R C D T S Space\nRight click: more options"),
                                   panel);
         help->setStyleSheet(QStringLiteral("color: #909090;"));
         v->addWidget(help);
@@ -1144,6 +1284,8 @@ public:
     }
 
     PpiWidget &ppi() { return *ppi_; }
+    QCheckBox *tracksBox() { return tracks_; }
+    QString timingText() const { return timing_->text(); }
     QComboBox *modeBox() { return mode_; }
     QPushButton *applyButton() { return apply_; }
     QPushButton *defaultButton() { return default_; }
@@ -1160,6 +1302,12 @@ public:
     void refresh()
     {
         ppi_->refresh();
+        if (tracks_->isChecked() != ppi_->showTracks()) {          /* changed with T or the context menu */
+            const bool b = tracks_->blockSignals(true);
+            tracks_->setChecked(ppi_->showTracks());
+            tracks_->blockSignals(b);
+        }
+        showTiming();
         if (mode_->currentIndex() != (int)ppi_->displayMode()) {   /* changed with D or the context menu */
             const bool b = mode_->blockSignals(true);
             mode_->setCurrentIndex((int)ppi_->displayMode());
@@ -1179,8 +1327,44 @@ public:
         default_->setEnabled(std::isfinite(c.default_dB));
         cfar_->setValue(c.dB);
         cfarInfo_->setText(std::isfinite(c.pfa)
-                               ? QStringLiteral("applied %1 dB (Pfa %2)").arg(c.dB, 0, 'f', 2).arg(c.pfa, 0, 'e', 1)
-                               : QStringLiteral("applied %1 dB").arg(c.dB, 0, 'f', 2));
+                               ? QStringLiteral("%1: %2 dB (Pfa %3)").arg(detName_).arg(c.dB, 0, 'f', 2).arg(c.pfa, 0, 'e', 1)
+                               : QStringLiteral("%1: %2 dB").arg(detName_).arg(c.dB, 0, 'f', 2));
+    }
+
+    /* mean time per PRI of every block, from the worker's accumulated times */
+    void showTiming()
+    {
+        ProcessorTiming t;
+        uint64_t serial;
+        std::string det, trk;
+        {
+            Shared &s = shared();
+            std::lock_guard<std::mutex> lock(s.mutex);
+            t = s.timing;
+            serial = s.timingSerial;
+            det = s.detName;
+            trk = s.trackName;
+        }
+        if (serial == timingSerial_ || t.pris == 0) return;
+        timingSerial_ = serial;
+        const bool newName = detName_ != QString::fromStdString(det);
+        detName_ = QString::fromStdString(det);
+        if (newName) cfarSerial_ = 0;                          /* rewrite the CFAR line with the name */
+        const double k = 1e3 / (double)t.pris;                 /* ms in total -> us per PRI */
+        const std::pair<QString, double> rows[] = {
+            { QStringLiteral("DBF"), t.dbf_ms }, { QStringLiteral("Matched filter"), t.mf_ms },
+            { QStringLiteral("MTI (clutter)"), t.mti_ms }, { QStringLiteral("Doppler FFT+NCI"), t.doppler_ms },
+            { detName_, t.cfar_ms }, { QStringLiteral("Plot extractor"), t.extract_ms },
+            { QString::fromStdString(trk), t.track_ms } };
+        QStringList lines;
+        double sum = 0.0;
+        for (const auto &r : rows) {
+            lines << QStringLiteral("%1%2").arg(r.first, -17).arg(r.second * k, 9, 'f', 1);
+            sum += r.second * k;
+        }
+        lines << QStringLiteral("%1%2").arg(QStringLiteral("Total"), -17).arg(sum, 9, 'f', 1);
+        lines << QStringLiteral("%1 PRIs").arg((qulonglong)t.pris);
+        timing_->setText(lines.join(QChar('\n')));
     }
 
 protected:
@@ -1208,6 +1392,10 @@ private:
     PpiWidget             *ppi_;
     volatile sig_atomic_t *stopFlag_;
     QComboBox             *mode_;
+    QCheckBox             *tracks_;
+    QLabel                *timing_;
+    uint64_t               timingSerial_ = 0;
+    QString                detName_ = QStringLiteral("CFAR");
     QPushButton           *save_, *apply_, *default_;
     QLabel                *saved_, *cfarInfo_;
     QDoubleSpinBox        *cfar_;
@@ -1274,6 +1462,25 @@ extern "C" void ppi_post_detections(const Detection *dets, int n, double arcWidt
         m.arc_deg = arc;
         s.newDets.push_back(m);
     }
+}
+
+extern "C" void ppi_post_track(const Track *track)
+{
+    if (!track) return;
+    Shared &s = shared();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    s.trackUpdates[track->id] = *track;                   /* the GUI needs only the newest state */
+}
+
+extern "C" void ppi_post_timing(const ProcessorTiming *timing, const char *detectionName, const char *trackingName)
+{
+    if (!timing) return;
+    Shared &s = shared();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    s.timing = *timing;
+    if (detectionName) s.detName = detectionName;
+    if (trackingName) s.trackName = trackingName;
+    s.timingSerial++;
 }
 
 extern "C" void ppi_post_cfar_threshold(double threshold_dB, double pfa, double default_dB)

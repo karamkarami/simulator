@@ -8,6 +8,8 @@ function ppi = ppi_init(sys)
 %     hover over a plot    data tip with range, azimuth, elevation, radial
 %                          velocity, SNR, time, sub-pulse, hits, beam
 %     click on a plot      pin its data tip (click again to remove it)
+%     hover over a track   data tip with number, state, position, height (3-D),
+%                          speed, heading, updates
 %     keys                 + / - zoom, arrows pan, r reset, c clear the
 %                          pinned data tips, space pause/resume the display,
 %                          d next display mode
@@ -16,7 +18,10 @@ function ppi = ppi_init(sys)
 %   an arc over the azimuth step of its CPI update, so a target appears as an
 %   arc about one beamwidth long) or both; shows or hides the short/long-pulse
 %   data, the true targets, range rings, plot labels and the antenna; filters
-%   by SNR and age; sets the CFAR threshold [dB] of the running processing
+%   by SNR and age; shows or hides the tracks (hollow triangles: confirmed
+%   magenta, tentative gray, with a velocity leader); shows the mean
+%   processing time per PRI of every block [us]; sets the CFAR threshold [dB]
+%   of the selected CFAR method of the running processing
 %   (Apply; Default = the value from cfg.cfar.pfa); clears the display; and
 %   saves a screenshot (PNG). The MATLAB zoom/pan/data tip tools of the axes
 %   toolbar also work.
@@ -27,7 +32,7 @@ rMax = rMax / 1e3;                                         % km
 if cfg.display.visible, vis = 'on'; else, vis = 'off'; end
 
 fig = figure('Name', 'PPI', 'Color', 'k', 'Visible', vis, 'InvertHardcopy', 'off', ...
-             'NumberTitle', 'off', 'Position', [100 100 1000 760]);
+             'NumberTitle', 'off', 'Position', [100 60 1040 880]);
 ax  = axes('Parent', fig, 'Color', 'k', 'XColor', [0.6 0.6 0.6], 'YColor', [0.6 0.6 0.6], ...
            'Units', 'normalized', 'Position', [0.07 0.12 0.66 0.8]);
 hold(ax, 'on');
@@ -70,9 +75,16 @@ h.detShort = plot(ax, NaN, NaN, '-', 'Color', [0 0.55 0.65], 'LineWidth', 2.5, '
 h.detLong  = plot(ax, NaN, NaN, '-', 'Color', [0.75 0.55 0], 'LineWidth', 2.5, 'HitTest', 'off', 'Clipping', 'on');
 h.short = plot(ax, NaN, NaN, 'o', 'Color', [0 0.9 1], 'MarkerFaceColor', [0 0.9 1], 'MarkerSize', 5);
 h.long  = plot(ax, NaN, NaN, 'o', 'Color', [1 0.9 0], 'MarkerFaceColor', [1 0.9 0], 'MarkerSize', 5);
+% Tracks: hollow triangles around the plot (confirmed: magenta, tentative: gray), velocity leaders
+h.trackLead = plot(ax, NaN, NaN, '-', 'Color', [0.9 0.3 0.9], 'LineWidth', 1, 'HitTest', 'off', 'Clipping', 'on');
+h.trackTent = plot(ax, NaN, NaN, '^', 'Color', [0.55 0.55 0.55], 'MarkerSize', 14, 'LineWidth', 1, ...
+                   'HitTest', 'off', 'Clipping', 'on');
+h.track = plot(ax, NaN, NaN, '^', 'Color', [1 0.35 1], 'MarkerSize', 14, 'LineWidth', 1.5, ...
+               'HitTest', 'off', 'Clipping', 'on');
+h.trackIds = [];                                           % track numbers next to confirmed tracks
 h.labels = [];                                             % plot labels (option)
-hLeg = legend([h.truth h.short h.long h.detShort h.detLong], {'true target', 'plot (short)', 'plot (long)', ...
-       'detection (short)', 'detection (long)'}, ...
+hLeg = legend([h.truth h.short h.long h.detShort h.detLong h.track], {'true target', 'plot (short)', ...
+       'plot (long)', 'detection (short)', 'detection (long)', 'track'}, ...
        'TextColor', 'w', 'Color', 'k', 'Location', 'southoutside', 'Orientation', 'horizontal');
 try
     set(hLeg, 'AutoUpdate', 'off');                        % data tips and labels stay out of the legend
@@ -89,7 +101,7 @@ h.pins = {};                                               % pinned data tips: {
 
 %% Control panel (right)
 bg = [0.15 0.15 0.15];  fg = [0.9 0.9 0.9];
-x0 = 0.76;  w = 0.22;  rowH = 0.034;
+x0 = 0.76;  w = 0.22;  rowH = 0.03;
 y = 0.95;
 label = @(str, pos) uicontrol(fig, 'Style', 'text', 'String', str, 'Units', 'normalized', 'Position', pos, ...
                               'BackgroundColor', 'k', 'ForegroundColor', fg, 'HorizontalAlignment', 'left');
@@ -106,7 +118,8 @@ h.ui.showMode = uicontrol(fig, 'Style', 'popupmenu', 'Units', 'normalized', 'Pos
 opt.showMode = cfg.display.showMode;
 checks = {'showShort', 'Short pulse', true;  'showLong', 'Long pulse', true;
           'showTruth', 'True targets', logical(cfg.display.showTruth);  'showRings', 'Range rings', true;
-          'showLabels', 'Plot labels', false;  'showAntenna', 'Antenna', true};
+          'showLabels', 'Plot labels', false;  'showAntenna', 'Antenna', true;
+          'showTracks', 'Tracks', logical(cfg.display.showTracks)};
 for i = 1:size(checks, 1)
     y = y - rowH;
     h.ui.(checks{i, 1}) = uicontrol(fig, 'Style', 'checkbox', 'String', checks{i, 2}, 'Value', checks{i, 3}, ...
@@ -156,10 +169,15 @@ end
 y = y - 2.1*rowH;
 h.cursor = uicontrol(fig, 'Style', 'text', 'String', '', 'Units', 'normalized', 'Position', [x0 y w 2*rowH], ...
                      'BackgroundColor', 'k', 'ForegroundColor', [0.7 0.9 0.7], 'HorizontalAlignment', 'left');
-uicontrol(fig, 'Style', 'text', 'Units', 'normalized', 'Position', [x0 0.01 w y-0.02], ...
+% Mean processing time of every block (set by ppi_callbacks('redraw') from ppi_update)
+helpH = 0.075;
+h.timing = uicontrol(fig, 'Style', 'text', 'String', '', 'Units', 'normalized', ...
+    'Position', [x0 0.01+helpH w y-0.015-helpH-0.01], 'BackgroundColor', [0.08 0.08 0.08], ...
+    'ForegroundColor', [0.85 0.85 0.85], 'HorizontalAlignment', 'left', 'FontName', 'FixedWidth', 'FontSize', 8);
+uicontrol(fig, 'Style', 'text', 'Units', 'normalized', 'Position', [x0 0.01 w helpH], ...
     'BackgroundColor', 'k', 'ForegroundColor', [0.6 0.6 0.6], 'HorizontalAlignment', 'left', ...
-    'String', {'Wheel: zoom   Drag: pan', 'Double click: reset', 'Hover: data tip', ...
-               'Click: pin the tip', 'Keys: + - arrows r c d space'});
+    'String', {'Wheel: zoom   Drag: pan', 'Double click: reset   Hover: tip', ...
+               'Click: pin   Keys: + - arrows r c d space'});
 
 %% State (used by ppi_update and ppi_callbacks)
 opt.clearTime_s = -Inf;                                    % plots up to this time are cleared
@@ -172,9 +190,11 @@ S.rMax = rMax;
 S.home = rMax*[-1.05 1.05 -1.05 1.05];
 S.opt = opt;
 S.sys = sys;
-S.data = struct('az_deg', 0, 't_s', 0, 'scan', 1, 'plots', [], 'dets', zeros(0, 10));
+S.data = struct('az_deg', 0, 't_s', 0, 'scan', 1, 'plots', [], 'dets', zeros(0, 10), ...
+                'tracks', [], 'timing_us', []);
 S.vis = struct('x', [], 'y', [], 'idx', []);               % visible plots (for picking)
 S.visDet = struct('x', [], 'y', [], 'idx', []);            % visible detections
+S.visTrk = struct('x', [], 'y', [], 'idx', []);            % visible tracks
 S.detArc_deg = sys.ant.rate_dps * mean(sys.pri) * cfg.proc.updateEvery;   % azimuth step of a CPI update
 S.drag = [];
 setappdata(fig, 'ppi', S);

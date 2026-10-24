@@ -264,6 +264,13 @@ there, at the same beam and Doppler, behind very strong far targets.
   windows are sums already computed for the nearest interior cell.
   Only the cells in the tested range interval (and the cells their windows
   need) are processed, so a smaller interval is also faster.
+  The 2-D window adapts best to clutter residue (its Doppler extent sees the
+  residue around the notch). A 1-D range window at the start of the
+  short-pulse window, where the near-range clutter falls off steeply, only
+  sees weaker clutter farther out: in the six-target test the `'range'`
+  method gave one false plot at 4.2 km (clutter residue at -2.3 m/s) that
+  the `'2d'` and `'doppler'` methods do not give. Raise
+  `cfg.cfar.short.minRange_m` (e.g. to 5 km) or the threshold there.
 * **Tracking (optional, `cfg.track`):** an extended Kalman filter on the
   plots. State: position and velocity relative to the antenna (East, North,
   up), nearly constant velocity with white-acceleration process noise
@@ -473,7 +480,14 @@ Latest results (Octave 8.4): all SNR budget checks agree within 0.7 dB.
 The six-target tests find all 6 targets with no false plot, for both the
 fixed and the staggered PRF. In `test_c_receiver` the C receiver gives the
 same 6 plots as MATLAB (same cells, range, azimuth, elevation, velocity, SNR
-and number of detections) for both PRF modes.
+and number of detections) for both PRF modes. After the CFAR changes
+(methods, shifted range window, no extra CFAR cells in the receive window):
+the 2-D CFAR still finds all 6 targets with no false plot (fixed PRF), and
+the C receiver gives exactly the same plots and track updates as MATLAB with
+the 2-D (six targets, fixed PRF; two targets, staggered PRF), the 1-D range
+and the 1-D Doppler CFAR (two targets). With 3 scans of two targets both
+tracks are confirmed: speed within 4 m/s, heading within 0.3 deg, height
+within 25 m of the truth.
 
 `tests/run_all_tests.m` runs all of them for the fixed and the staggered
 PRF. The six-target test simulates only the azimuth sectors around the

@@ -18,6 +18,8 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
 
+set(CMAKE_PREFIX_PATH "C:/Qt/6.12.0/mingw_64")
+
 # Compiler flags. No -ffast-math: the elevation of a plot is NaN without
 # beamforming and the processing relies on IEEE behaviour.
 include(CheckCCompilerFlag)
@@ -62,6 +64,14 @@ if(RADAR_OPENMP)
     find_package(OpenMP COMPONENTS C)
     if(OpenMP_C_FOUND)
         target_link_libraries(radar_core PUBLIC OpenMP::OpenMP_C)
+        # OpenMP::OpenMP_C only adds -fopenmp at link time when the C linker
+        # is used ($<LINK_LANGUAGE:C>). Programs that also link the Qt PPI use
+        # the C++ linker, so pass the flag for that case too; otherwise GCC /
+        # MinGW gives "undefined reference to GOMP_parallel, omp_get_num_threads".
+        if(NOT MSVC AND OpenMP_C_FLAGS)
+            target_link_options(radar_core INTERFACE
+                "$<$<LINK_LANGUAGE:CXX>:${OpenMP_C_FLAGS}>")
+        endif()
     else()
         message(WARNING "OpenMP not found: the receiver runs single-threaded")
     endif()

@@ -256,13 +256,19 @@ int radar_config_load(const char *path, RadarConfig *cfg, char *err, size_t errL
             free(v);
             free(q);
             cfg->trackSigmaV0 = get_scalar(&rs, "trackSigmaV0");
+            /* older files: constant velocity, the batch associated at the next PRI */
+            cfg->trackModel = (int)get_optional(&rs, "trackModel", TRACK_CV);
+            cfg->trackSigmaA0 = get_optional(&rs, "trackSigmaA0", 0.0);
+            cfg->trackBatchGap_s = get_optional(&rs, "trackBatchGap_s", 0.0);
+            cfg->trackBatchMax_s = get_optional(&rs, "trackBatchMax_s", 0.0);
             cfg->trackGate = get_scalar(&rs, "trackGate");
             cfg->trackConfirmHits = get_int(&rs, "trackConfirmHits");
             cfg->trackMaxMissTentative = get_int(&rs, "trackMaxMissTentative");
             cfg->trackMaxMiss = get_int(&rs, "trackMaxMiss");
             cfg->scanTime_s = get_scalar(&rs, "scanTime_s");
             if (!rs.failed && ((cfg->trackDim != 2 && cfg->trackDim != 3) || !(cfg->trackGate > 0) ||
-                               !(cfg->scanTime_s > 0)))
+                               !(cfg->scanTime_s > 0) || (cfg->trackModel != TRACK_CV && cfg->trackModel != TRACK_CA) ||
+                               !(cfg->trackBatchGap_s >= 0) || !(cfg->trackBatchMax_s >= 0)))
                 set_error(&rs, "invalid tracker settings in the configuration");
         }
 

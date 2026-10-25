@@ -1,15 +1,19 @@
 /*
  * test_tracker.c - the C EKF tracker (tracker.c) against the MATLAB tracker.
  *
- *   test_tracker CONFIG                      self test: two crossing targets, 3-D and 2-D
- *   test_tracker CONFIG PLOTS.csv LOG.csv DIM GATE
+ *   test_tracker CONFIG                      self tests: two crossing targets, 3-D and 2-D;
+ *                                            GNN with two targets 200 m apart
+ *   test_tracker CONFIG PLOTS.csv LOG.csv TEND
+ *       CONFIG:    exported for the case (export_receiver_config.m): dimension,
+ *                  motion model, gate and GNN batch as in tests/test_tracker.m
  *       PLOTS.csv: time_s,az_deg,range_m,el_deg of every plot in processing order
  *       LOG.csv:   the MATLAB track log (track_update.m): time,id,confirmed,x,y,z,vx,vy,vz,hits,plotIndex
- *       DIM, GATE: tracker dimension and chi-square gate (they replace those of CONFIG)
- *       Every plot is given to the tracker (with maintenance at the plot time,
- *       as tests/test_tracker.m does); every track update must match the log:
- *       same track number, state and number of updates, positions and
- *       velocities within 1e-6 relative.
+ *       TEND:      time of the last call (the open batch is associated)
+ *       Every plot is given to the tracker in a call of its own at the plot
+ *       time (as tests/test_tracker.m does), then a call at TEND with flush;
+ *       every track update must match the log in the same order: same plot,
+ *       track number, state and number of updates, positions and velocities
+ *       within 1e-6 relative.
  *
  * Prints PASS or FAIL and returns 0 on success.
  */
@@ -64,10 +68,10 @@ static void self_test(RadarConfig *cfg, int dim)
             d.range_m = R + cfg->trackSigma[0] * gauss();
             d.az_deg = (atan2(x, y) + cfg->trackSigma[1] * gauss()) * 180.0 / PI;
             d.el_deg = dim == 3 ? (asin(z / R) + cfg->trackSigma[2] * gauss()) * 180.0 / PI : NAN;
-            tracker_plot(&t, &d);
-            tracker_maintain(&t, tt, NULL, NULL);
+            tracker_update(&t, &d, 1, tt, 0, NULL, NULL);
         }
     }
+    tracker_update(&t, NULL, 0, 6 * T, 1, NULL, NULL);
     int confirmed = 0;
     for (int j = 0; j < t.nTracks; j++) {
         Track r;
@@ -93,72 +97,121 @@ static void self_test(RadarConfig *cfg, int dim)
     tracker_free(&t);
 }
 
-static int compare_with_matlab(RadarConfig *cfg, const char *plotsPath, const char *logPath, int dim, double gate)
+/* GNN: two targets 200 m apart in range at azimuth 30 deg, receding at 100 m/s,
+ * plots without errors (as gnn_case in tests/test_tracker.m). At the second
+ * scan plot 1 is closer to track 2: only the global assignment keeps the tracks. */
+static void gnn_test(RadarConfig *cfg)
 {
-    FILE *fp = fopen(plotsPath, "r"), *fl = fopen(logPath, "r");
-    if (!fp || !fl) {
-        printf("FAIL: cannot open %s or %s\n", plotsPath, logPath);
-        if (fp) fclose(fp);
-        if (fl) fclose(fl);
-        return 0;
-    }
-    cfg->trackDim = dim;
-    cfg->trackGate = gate;
+    cfg->trackDim = 2;
     Tracker t;
     tracker_init(&t, cfg);
+    const double R0[2] = { 20e3, 20.2e3 }, v = 100.0, az = 30.0, T = cfg->scanTime_s;
+    for (int scan = 0; scan < 6; scan++) {
+        Detection d[2];
+        memset(d, 0, sizeof d);
+        for (int i = 0; i < 2; i++) {
+            d[i].time_s = scan * T;
+            d[i].range_m = R0[i] + v * scan * T;
+            d[i].az_deg = az;
+            d[i].el_deg = NAN;
+        }
+        tracker_update(&t, d, 2, scan * T, 1, NULL, NULL);
+    }
+    CHECK(t.nTracks == 2, "GNN: %d tracks (expected 2)", t.nTracks);
+    for (int j = 0; j < t.nTracks; j++) {
+        Track r;
+        tracker_report(&t, j, &r);
+        const double R = hypot(r.pos_m[0], r.pos_m[1]);
+        const int i = fabs(R - R0[1] - v * r.time_s) < fabs(R - R0[0] - v * r.time_s);
+        const double dv = hypot(r.vel_mps[0] - v * sin(az * PI / 180), r.vel_mps[1] - v * cos(az * PI / 180));
+        printf("  GNN: track %u on target %d, %d updates, range error %.2f m, velocity error %.3f m/s\n", r.id, i + 1,
+               r.hits, R - R0[i] - v * r.time_s, dv);
+        CHECK(r.confirmed && r.hits == 6 && (int)r.id == i + 1 && fabs(R - R0[i] - v * r.time_s) < 5 && dv < 1,
+              "GNN: track %u does not follow target %d", r.id, i + 1);
+    }
+    tracker_free(&t);
+}
+
+typedef struct {
+    FILE *log;
     double ref[11];
-    int haveRef = fscanf(fl, "%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf", &ref[0], &ref[1], &ref[2], &ref[3], &ref[4],
-                         &ref[5], &ref[6], &ref[7], &ref[8], &ref[9], &ref[10]) == 11;
-    int plotIndex = 0, updates = 0, bad = 0;
-    double maxRel = 0.0;
+    int haveRef, updates, bad;
+    double maxRel;
+} Compare;
+
+static int read_ref(Compare *c)
+{
+    double *r = c->ref;
+    return fscanf(c->log, "%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf", &r[0], &r[1], &r[2], &r[3], &r[4], &r[5],
+                  &r[6], &r[7], &r[8], &r[9], &r[10]) == 11;
+}
+
+static void on_update(void *user, const Track *r, int plotIndex)
+{
+    Compare *c = user;
+    if (r->deleted) return;
+    c->updates++;
+    if (!c->haveRef || (int)c->ref[10] != plotIndex) {
+        c->bad++;
+        printf("FAIL: plot %d updated track %u, MATLAB updated with plot %.0f\n", plotIndex, r->id,
+               c->haveRef ? c->ref[10] : -1.0);
+        return;
+    }
+    const double v[9] = { r->time_s, (double)r->id, (double)r->confirmed, r->pos_m[0], r->pos_m[1], r->pos_m[2],
+                          r->vel_mps[0], r->vel_mps[1], r->vel_mps[2] };
+    int same = v[1] == c->ref[1] && v[2] == c->ref[2] && r->hits == (int)c->ref[9];
+    for (int k = 3; k < 9; k++) {
+        const double rel = fabs(v[k] - c->ref[k]) / (fabs(c->ref[k]) + 1.0);
+        if (rel > c->maxRel) c->maxRel = rel;
+        same &= rel < 1e-6;
+    }
+    if (!same) {
+        c->bad++;
+        if (c->bad < 5) printf("FAIL: plot %d: C track %u (conf %d, hits %d), MATLAB track %.0f (conf %.0f, hits %.0f)\n",
+                               plotIndex, r->id, r->confirmed, r->hits, c->ref[1], c->ref[2], c->ref[9]);
+    }
+    c->haveRef = read_ref(c);
+}
+
+static int compare_with_matlab(RadarConfig *cfg, const char *plotsPath, const char *logPath, double tEnd)
+{
+    FILE *fp = fopen(plotsPath, "r");
+    Compare c;
+    memset(&c, 0, sizeof c);
+    c.log = fopen(logPath, "r");
+    if (!fp || !c.log) {
+        printf("FAIL: cannot open %s or %s\n", plotsPath, logPath);
+        if (fp) fclose(fp);
+        if (c.log) fclose(c.log);
+        return 0;
+    }
+    Tracker t;
+    tracker_init(&t, cfg);
+    c.haveRef = read_ref(&c);
+    int nPlots = 0;
     double tp, az, R, el;
     while (fscanf(fp, "%lf,%lf,%lf,%lf", &tp, &az, &R, &el) == 4) {
-        plotIndex++;
+        nPlots++;
         Detection d;
         memset(&d, 0, sizeof d);
         d.time_s = tp;  d.az_deg = az;  d.range_m = R;  d.el_deg = el;
-        const int i = tracker_plot(&t, &d);
-        if (i >= 0) {
-            Track r;
-            tracker_report(&t, i, &r);
-            updates++;
-            if (!haveRef || (int)ref[10] != plotIndex) {
-                bad++;
-                printf("FAIL: plot %d updated track %u, MATLAB did not\n", plotIndex, r.id);
-            } else {
-                const double c[9] = { r.time_s, (double)r.id, (double)r.confirmed, r.pos_m[0], r.pos_m[1], r.pos_m[2],
-                                      r.vel_mps[0], r.vel_mps[1], r.vel_mps[2] };
-                int same = c[1] == ref[1] && c[2] == ref[2] && r.hits == (int)ref[9];
-                for (int k = 3; k < 9; k++) {
-                    const double rel = fabs(c[k] - ref[k]) / (fabs(ref[k]) + 1.0);
-                    if (rel > maxRel) maxRel = rel;
-                    same &= rel < 1e-6;
-                }
-                if (!same) {
-                    bad++;
-                    if (bad < 5) printf("FAIL: plot %d: C track %u (conf %d, hits %d), MATLAB track %.0f (conf %.0f, hits %.0f)\n",
-                                        plotIndex, r.id, r.confirmed, r.hits, ref[1], ref[2], ref[9]);
-                }
-                haveRef = fscanf(fl, "%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf", &ref[0], &ref[1], &ref[2], &ref[3],
-                                 &ref[4], &ref[5], &ref[6], &ref[7], &ref[8], &ref[9], &ref[10]) == 11;
-            }
-        }
-        tracker_maintain(&t, tp, NULL, NULL);
+        tracker_update(&t, &d, 1, tp, 0, on_update, &c);
     }
-    if (haveRef) { bad++; printf("FAIL: MATLAB has more track updates than C\n"); }
-    printf("  %d-D: %d plots, %d track updates, %d different from MATLAB, max relative state difference %.1e\n",
-           dim, plotIndex, updates, bad, maxRel);
+    tracker_update(&t, NULL, 0, tEnd, 1, on_update, &c);
+    if (c.haveRef) { c.bad++; printf("FAIL: MATLAB has more track updates than C\n"); }
+    printf("  %d-D %s: %d plots, %d track updates, %d different from MATLAB, max relative state difference %.1e\n",
+           t.dim, t.nd == 3 ? "CA" : "CV", nPlots, c.updates, c.bad, c.maxRel);
     fclose(fp);
-    fclose(fl);
+    fclose(c.log);
     tracker_free(&t);
-    failures += bad > 0;
-    return bad == 0;
+    failures += c.bad > 0;
+    return c.bad == 0;
 }
 
 int main(int argc, char **argv)
 {
     if (argc < 2) {
-        printf("usage: test_tracker CONFIG [PLOTS.csv LOG.csv DIM GATE]\n");
+        printf("usage: test_tracker CONFIG [PLOTS.csv LOG.csv TEND]\n");
         return 2;
     }
     RadarConfig cfg;
@@ -168,11 +221,12 @@ int main(int argc, char **argv)
         return 1;
     }
     if (!cfg.trackEnable) printf("(tracking is off in the configuration; its parameters are used anyway)\n");
-    if (argc >= 6) {
-        compare_with_matlab(&cfg, argv[2], argv[3], atoi(argv[4]), atof(argv[5]));
+    if (argc >= 5) {
+        compare_with_matlab(&cfg, argv[2], argv[3], atof(argv[4]));
     } else {
         self_test(&cfg, 3);
         self_test(&cfg, 2);
+        gnn_test(&cfg);
     }
     radar_config_free(&cfg);
     printf(failures ? "FAIL\n" : "PASS\n");

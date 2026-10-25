@@ -1,16 +1,18 @@
 function make_input_files(cfg, which)
 %MAKE_INPUT_FILES  Create the default input .mat files of the simulator.
 %
-%   MAKE_INPUT_FILES(cfg) writes the four input files named in radar_config.m:
+%   MAKE_INPUT_FILES(cfg) writes the five input files named in radar_config.m:
 %     antenna_pattern.mat : element spacing, azimuth pattern, elevation element
 %                           pattern, transmit elevation pattern, peak gains
-%     ddc_filters.mat     : low-pass FIR filters of the two DDC stages (h1, h2),
-%                           signed 16-bit integers with 13 fractional bits
+%     ddc_filters.mat     : low-pass FIR filters of the two DDC stages (h1, h2) for
+%                           the 2 MHz output, signed 16-bit integers with 13
+%                           fractional bits
+%     ddc_filters_4MHz.mat: the same for the 4 MHz output (other h2)
 %     dbf_matrix.mat      : elevation DBF matrix W [nBeams x cfg.ant.nElements]
 %                           and beam elevations
 %     stagger_prf.mat     : staggered PRI vector and the matching MTI weights
 %   MAKE_INPUT_FILES(cfg, which) writes only one of them: which = 'antenna',
-%   'ddc', 'dbf' or 'stagger'.
+%   'ddc', 'ddc4MHz', 'dbf' or 'stagger'.
 %
 %   Every default file stores in 'madeFor' the configuration values it was
 %   built for. setup_radar.m rebuilds a default file when they no longer match
@@ -58,15 +60,22 @@ if doAll || strcmpi(which, 'antenna')
 end
 
 %% 2) DDC low-pass filters (windowed sinc, Blackman window, unit DC gain)
-% After the 30 MHz mixer the signal occupies +-0.5 MHz around 0 Hz.
-if doAll || strcmpi(which, 'ddc')
-    fs  = cfg.adc.fs_Hz;
-    fs1 = fs / cfg.ddc.decimation(1);
-    q   = 2^cfg.ddc.coefFracBits;         % fixed point: signed 16 bit, 13 fractional bits
-    h1  = int16(round(q * lowpass_fir(70, 5.8e6 / fs)));    % stage 1: pass +-1 MHz, stop above 10.5 MHz
-    h2  = int16(round(q * lowpass_fir(66, 1.0e6 / fs1)));   % stage 2: pass +-0.5 MHz, stop above 1.5 MHz
-    madeFor = struct('fs_Hz', fs, 'decimation', cfg.ddc.decimation, 'coefFracBits', cfg.ddc.coefFracBits); %#ok<NASGU>
-    save(cfg.files.ddc, 'h1', 'h2', 'madeFor', '-v7');
+% After the 30 MHz mixer the signal occupies +-0.5 MHz around 0 Hz. Stage 1
+% is the same for both output rates; stage 2 is a wider filter for 4 MHz.
+fs = cfg.adc.fs_Hz;
+q  = 2^cfg.ddc.coefFracBits;              % fixed point: signed 16 bit, 13 fractional bits
+for rate = [2e6 4e6]
+    [D, key] = ddc_decimation(cfg, rate);
+    if ~(doAll || strcmpi(which, key)), continue; end
+    fs1 = fs / D(1);
+    h1  = int16(round(q * lowpass_fir(70, 5.8e6 / fs)));     % stage 1: pass +-1 MHz, stop above 10.5 MHz
+    if rate == 2e6
+        h2 = int16(round(q * lowpass_fir(66, 1.0e6 / fs1)));  % stage 2: pass +-0.5 MHz, stop above 1.5 MHz
+    else
+        h2 = int16(round(q * lowpass_fir(66, 1.5e6 / fs1)));  % stage 2: pass +-1 MHz, stop above 2 MHz
+    end
+    madeFor = struct('fs_Hz', fs, 'decimation', D, 'coefFracBits', cfg.ddc.coefFracBits); %#ok<NASGU>
+    save(cfg.files.(key), 'h1', 'h2', 'madeFor', '-v7');
 end
 
 %% 3) Elevation DBF matrix: 21 beams equally spaced in u = sin(angle from broadside)

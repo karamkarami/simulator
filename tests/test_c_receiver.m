@@ -203,7 +203,8 @@ lines = strsplit(txt, {'\n', '\r'});
 C = zeros(0, 12);
 for i = 2:numel(lines)
     if isempty(strtrim(lines{i})), continue; end
-    C(end+1, :) = str2double(strsplit(lines{i}, ',')); %#ok<AGROW>
+    v = str2double(strsplit(lines{i}, ','));
+    C(end+1, :) = v(1:12); %#ok<AGROW>                  % (then the acceleration)
 end
 C = C(C(:, 3) == 0, :);                                % updates only (not the deletions)
 n = min(size(C, 1), size(logM, 1));

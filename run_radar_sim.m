@@ -23,18 +23,20 @@ function results = run_radar_sim(cfg)
 %     8. CFAR              : on every range-Doppler map (2-D, 1-D range or 1-D
 %                            Doppler window, cfg.cfar.method)
 %     9. Pruning           : local peaks only, then azimuth peak picking (plots)
-%    10. Tracking          : EKF on the plots, 2-D or 3-D (optional, cfg.track)
+%    10. Tracking          : EKF on the plots, 2-D or 3-D, constant velocity or
+%                            constant acceleration, GNN association (optional, cfg.track)
 %    11. PPI display       : updated while the radar is running: plots and/or the
 %                            CFAR detections before the extractor, tracks, mean
-%                            processing time of every block; the CFAR
-%                            threshold can be changed in the PPI panel
+%                            processing time of every block (also of the display
+%                            and of the console output); the CFAR threshold can
+%                            be changed in the PPI panel
 %
 %   results.plots holds the extracted plots (time, azimuth, range, elevation,
 %   ambiguous radial velocity, SNR, pulse type). results.tracker holds the
 %   tracks at the end and the log of all track updates (track_update.m).
-%   results.timing_us is the mean processing time per PRI of DBF, matched
-%   filter, MTI, Doppler, detection (CFAR + pruning), plot extractor and
-%   tracking [us].
+%   results.timing_us is the mean time per PRI of DBF, matched filter, MTI,
+%   Doppler, detection (CFAR + pruning), plot extractor, tracking, console
+%   output (progress lines) and display (PPI updates) [us].
 
 if nargin < 1, cfg = radar_config(); end
 root = fileparts(mfilename('fullpath'));
@@ -83,7 +85,7 @@ for i = 1:2
 end
 plots = [];
 tracker = track_init(sys.track);
-blockUs = zeros(1, 7);                     % accumulated processing time of the blocks [us]
+blockUs = zeros(1, 9);                     % accumulated time of the blocks, console, display [us]
 nProcessed = 0;
 wasActive = false;
 % Plot extraction options: minimum azimuth extent -> minimum number of CPI detections
@@ -102,14 +104,16 @@ for k = 1:sched.nPulses
     % Skipped sector: restart the CPI buffers and close the open plots
     if ~sched.active(k)
         if wasActive
+            gapPlots = [];
             for i = 1:2
                 p = names{i};
                 buf.(p) = cpi_buffer_init(sys.nBeams, sys.wave.(p).nRange, sys.cpi.length);
                 [ext.(p), newPlots] = plot_extractor(ext.(p), [], flushOpt);
                 plots = [plots, newPlots]; %#ok<AGROW>
-                if sys.track.enable
-                    tracker = track_update(tracker, newPlots, t);
-                end
+                gapPlots = [gapPlots, newPlots]; %#ok<AGROW>
+            end
+            if sys.track.enable                     % at the last PRI before the gap (as the C receiver)
+                tracker = track_update(tracker, gapPlots, sched.time_s(k-1), true);
             end
         end
         wasActive = false;
@@ -195,22 +199,29 @@ for k = 1:sched.nPulses
 
     % 11) Display
     if ~isempty(ppi) && mod(nProcessed, cfg.display.updateEvery) == 0
+        tb = tic;
         sys = ppi_update(ppi, sys, az, t, sched.scan(k), plots, detLog.M(1:detLog.n, :), ...
                          track_report(tracker), blockUs / nProcessed);   % may set a new CFAR threshold
+        blockUs(9) = blockUs(9) + 1e6*toc(tb);
     end
     if cfg.sim.verbose && mod(nProcessed, 500) == 0
+        tb = tic;
         fprintf('  pulse %6d (az %6.1f deg): %d plots so far, %.0f s elapsed\n', k, az, numel(plots), toc(tStart));
+        blockUs(8) = blockUs(8) + 1e6*toc(tb);
     end
 end
 
-%% Close the remaining plots
+%% Close the remaining plots, associate the last GNN batch
+endPlots = [];
 for i = 1:2
     p = names{i};
     [ext.(p), newPlots] = plot_extractor(ext.(p), [], flushOpt);
     plots = [plots, newPlots]; %#ok<AGROW>
-    if sys.track.enable
-        tracker = track_update(tracker, newPlots, sched.time_s(end));
-    end
+    endPlots = [endPlots, newPlots]; %#ok<AGROW>
+end
+lastActive = find(sched.active, 1, 'last');
+if sys.track.enable && ~isempty(lastActive)
+    tracker = track_update(tracker, endPlots, sched.time_s(lastActive), true);
 end
 if ~isempty(ppi)
     ppi_update(ppi, sys, sched.az_deg(end), sched.time_s(end), sched.scan(end), plots, detLog.M(1:detLog.n, :), ...
@@ -234,31 +245,11 @@ if cfg.sim.verbose
         print_tracks(tracker);
     end
     fprintf(['Mean processing time per PRI [us]: DBF %.0f, matched filter %.0f, MTI %.0f, Doppler %.0f, ' ...
-             'CFAR %s + pruning %.0f, extractor %.0f, tracking %.0f\n'], results.timing_us(1:4), sys.cfar.label, ...
-            results.timing_us(5:7));
+             'CFAR %s + pruning %.0f, extractor %.0f, tracking %.0f, console %.0f, display %.0f\n'], ...
+            results.timing_us(1:4), sys.cfar.label, results.timing_us(5:9));
     fprintf('%d PRIs simulated and processed in %.1f s (%.1f ms per PRI)\n', nProcessed, ...
         results.runTime_s, 1e3*results.runTime_s/max(nProcessed, 1));
 end
-end
-
-function hdr = pulse_header(sys, sched, k)
-% Information stored with the raw data of PRI k (and sent with its DDC output).
-hdr.pulseNumber    = k;
-hdr.scanNumber     = sched.scan(k);
-hdr.time_s         = sched.time_s(k);
-hdr.antennaAz_deg  = sched.az_deg(k);
-hdr.pri_s          = sched.pri_s(k);
-hdr.staggerIndex   = sched.staggerIdx(k);
-hdr.fs_Hz          = sys.fs;
-hdr.fIF_Hz         = sys.fIF;
-hdr.fc_Hz          = sys.cfg.fc;
-hdr.rxStart_s      = sys.rxStart_s;                  % time of the first ADC sample in the PRI
-hdr.shortTx_s      = [sys.wave.short.tTx_s, sys.wave.short.width_s];   % [start width]
-hdr.longTx_s       = [sys.wave.long.tTx_s,  sys.wave.long.width_s];
-hdr.ddcFs_Hz       = sys.fsOut;                  % DDC output: signed 16-bit I/Q
-hdr.ddcT0_s        = sys.tDdc(1);                    % time of the first DDC sample in the PRI
-hdr.shortDdcIdx    = sys.wave.short.ddcIdx([1 end]); % DDC samples of the short pulse [first last]
-hdr.longDdcIdx     = sys.wave.long.ddcIdx([1 end]);
 end
 
 function print_summary(sys, sched)
@@ -294,7 +285,8 @@ end
 function print_tracks(tracker)
 % List the tracks at the end of the run.
 tk = tracker.tracks;
-fprintf('\nTracks at the end (%d-D EKF): %d (%d confirmed), %d track updates\n', tracker.p.dim, numel(tk), ...
+fprintf('\nTracks at the end (%d-D EKF, %s model, GNN): %d (%d confirmed), %d track updates\n', tracker.p.dim, ...
+        upper(tracker.p.model), numel(tk), ...
         sum([tk.confirmed]), size(tracker.log, 1));
 fprintf('%5s %4s %9s %8s %8s %8s %8s %5s\n', 'id', 'conf', 'R[km]', 'az[deg]', 'h[m]', 'v[m/s]', 'hdg[deg]', 'hits');
 for i = 1:numel(tk)

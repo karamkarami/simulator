@@ -83,6 +83,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <deque>
@@ -181,6 +182,12 @@ struct Shared {
     std::string           detName = "CFAR", trackName = "Tracking";
     uint64_t              timingSerial = 0;
 };
+
+/* Monotonic clock of the GUI thread's display time [s]. */
+double gui_seconds()
+{
+    return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 
 Shared &shared()
 {
@@ -324,6 +331,9 @@ public:
     }
 
     void refresh();                     /* takes the posted data (GUI thread) */
+    /* GUI thread time spent on the display: taking the data and drawing [ms] */
+    double guiMs() const { return guiMs_; }
+    void addGuiMs(double ms) { guiMs_ += ms; }
     void setFinished(int workerCode)
     {
         finished_ = true;
@@ -384,6 +394,7 @@ protected:
     void contextMenuEvent(QContextMenuEvent *event) override;
 
 private:
+    double guiMs_ = 0.0;
     void   layoutDisplay();
     void   drawBackground();
     void   drawAntenna(QPainter &p) const;
@@ -971,8 +982,10 @@ QString track_text(const Track &t)
         rows << QStringLiteral("Height: %1 m").arg(t.alt_m, 0, 'f', 0)
              << QStringLiteral("Climb: %1 m/s").arg(t.vel_mps[2], 0, 'f', 1);
     rows << QStringLiteral("Speed: %1 m/s").arg(std::hypot(t.vel_mps[0], t.vel_mps[1]), 0, 'f', 1)
-         << QStringLiteral("Heading: %1").arg(deg_text(wrap360(std::atan2(t.vel_mps[0], t.vel_mps[1]) / kDeg), 1))
-         << QStringLiteral("Updates: %1 (missed scans %2)").arg(t.hits).arg(t.misses)
+         << QStringLiteral("Heading: %1").arg(deg_text(wrap360(std::atan2(t.vel_mps[0], t.vel_mps[1]) / kDeg), 1));
+    const double acc = std::hypot(t.acc_mps2[0], t.acc_mps2[1]);
+    if (acc > 0.0) rows << QStringLiteral("Acceleration: %1 m/s\u00b2").arg(acc, 0, 'f', 2);   /* CA model */
+    rows << QStringLiteral("Updates: %1 (missed scans %2)").arg(t.hits).arg(t.misses)
          << QStringLiteral("Last update: %1 s").arg(t.time_s, 0, 'f', 3);
     return rows.join(QStringLiteral("<br>"));
 }
@@ -1162,6 +1175,12 @@ void PpiWidget::drawLegend(QPainter &p) const
 void PpiWidget::paintEvent(QPaintEvent *event)
 {
     (void)event;
+    const double t0 = gui_seconds();
+    struct AddTime {                    /* also when a draw call returns early */
+        PpiWidget *w;
+        double t0;
+        ~AddTime() { w->addGuiMs((gui_seconds() - t0) * 1e3); }
+    } addTime{ this, t0 };
     layoutDisplay();
     if (background_.isNull() || backgroundDirty_ || backgroundSize_ != size()) drawBackground();
 
@@ -1266,7 +1285,7 @@ public:
         mono.setPixelSize(11);
         timing_->setFont(mono);
         timing_->setStyleSheet(QStringLiteral("background: #101010; padding: 4px;"));
-        timing_->setMinimumHeight(QFontMetrics(mono).lineSpacing() * 9 + 12);   /* 9 rows, stable layout */
+        timing_->setMinimumHeight(QFontMetrics(mono).lineSpacing() * 12 + 12);  /* 12 rows, stable layout */
         timing_->setAlignment(Qt::AlignLeft | Qt::AlignTop);
         v->addWidget(timing_);
         QLabel *help = new QLabel(QStringLiteral("Wheel: zoom   Drag: pan\nDouble click: reset\nHover: data tip   "
@@ -1301,7 +1320,9 @@ public:
     /* GUI timer: new data for the PPI, threshold reported by the worker */
     void refresh()
     {
+        const double t0 = gui_seconds();
         ppi_->refresh();
+        ppi_->addGuiMs((gui_seconds() - t0) * 1e3);
         if (tracks_->isChecked() != ppi_->showTracks()) {          /* changed with T or the context menu */
             const bool b = tracks_->blockSignals(true);
             tracks_->setChecked(ppi_->showTracks());
@@ -1351,11 +1372,14 @@ public:
         detName_ = QString::fromStdString(det);
         if (newName) cfarSerial_ = 0;                          /* rewrite the CFAR line with the name */
         const double k = 1e3 / (double)t.pris;                 /* ms in total -> us per PRI */
+        /* processing thread: the blocks, the console output and the data handed
+         * to the PPI; the drawing runs in the GUI thread, at the same time */
         const std::pair<QString, double> rows[] = {
             { QStringLiteral("DBF"), t.dbf_ms }, { QStringLiteral("Matched filter"), t.mf_ms },
             { QStringLiteral("MTI (clutter)"), t.mti_ms }, { QStringLiteral("Doppler FFT+NCI"), t.doppler_ms },
             { detName_, t.cfar_ms }, { QStringLiteral("Plot extractor"), t.extract_ms },
-            { QString::fromStdString(trk), t.track_ms } };
+            { QString::fromStdString(trk), t.track_ms }, { QStringLiteral("Console output"), t.console_ms },
+            { QStringLiteral("Display (post)"), t.display_ms } };
         QStringList lines;
         double sum = 0.0;
         for (const auto &r : rows) {
@@ -1363,6 +1387,7 @@ public:
             sum += r.second * k;
         }
         lines << QStringLiteral("%1%2").arg(QStringLiteral("Total"), -17).arg(sum, 9, 'f', 1);
+        lines << QStringLiteral("%1%2").arg(QStringLiteral("PPI drawing (GUI)"), -17).arg(ppi_->guiMs() * k, 9, 'f', 1);
         lines << QStringLiteral("%1 PRIs").arg((qulonglong)t.pris);
         timing_->setText(lines.join(QChar('\n')));
     }

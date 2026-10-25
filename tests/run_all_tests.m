@@ -21,12 +21,19 @@ names{end+1}  = 'SNR budget (fixed PRF, long pulse, P4 phase code)';
 passed(end+1) = test_snr_budget('fixed', 'long', 'phasecode');
 names{end+1}  = 'SNR budget (single element, no beamforming)';
 passed(end+1) = test_snr_budget('fixed', 'short', 'lfm', 1);
+for pulse = {'short', 'long'}
+    names{end+1}  = sprintf('SNR budget (4 MHz DDC output, %s pulse)', pulse{1}); %#ok<SAGROW>
+    passed(end+1) = test_snr_budget('fixed', pulse{1}, 'lfm', 48, 4e6);          %#ok<SAGROW>
+end
 
 names{end+1}  = 'UDP streaming of the DDC output';
 passed(end+1) = test_udp_stream();
 
 names{end+1}  = 'DDC recording and replay over UDP with the PRI timing';
 passed(end+1) = test_ddc_replay();
+
+names{end+1}  = 'DDC file generation with parfor (generate_ddc_files)';
+passed(end+1) = test_generate_ddc();
 
 names{end+1}  = 'CFAR methods (2-D, range, Doppler), edges, range interval';
 passed(end+1) = test_cfar();

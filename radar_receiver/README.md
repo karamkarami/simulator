@@ -109,7 +109,7 @@ plots of both programs.
 | `--update-every N` | run Doppler, CFAR and extraction every N pulses (default from the configuration: 1) |
 | `--plots-csv FILE` | plot list (default `plots.csv`; `''` = none) |
 | `--detections-csv FILE` | all pruned CFAR detections (default none) |
-| `--tracks-csv FILE` | every track update and deletion: id, confirmed, deleted, time, x, y, z, vx, vy, vz (East, North, up relative to the antenna), hits, misses (default none) |
+| `--tracks-csv FILE` | every track update and deletion: id, confirmed, deleted, time, x, y, z, vx, vy, vz (East, North, up relative to the antenna), hits, misses, ax, ay, az (0 with the constant-velocity model) (default none) |
 | `--idle-timeout S` | stop when no PRI arrived for S seconds after the first one (default 0 = never) |
 | `--quiet` | do not print every plot |
 | `--queue N` | PRIs buffered between the input thread and the processing (default 64) |
@@ -183,7 +183,8 @@ The panel on the right of the window has:
   triangle at the last update, so the plot (filled circle) lies inside it;
   magenta with its number and a 30 s velocity leader when confirmed, gray
   while tentative. Hover over it: number, state, range, azimuth, height and
-  climb (3-D), speed, heading, updates. A deleted track disappears.
+  climb (3-D), speed, heading, acceleration (constant-acceleration model),
+  updates. A deleted track disappears.
 * **CFAR threshold [dB]**: shows the method (`cfg.cfar.method`), the
   threshold the processing uses and its false alarm probability
   (`cfar_pfa()`, needs `nLooks` in the configuration file: export it again
@@ -192,16 +193,26 @@ The panel on the right of the window has:
   on and reports it back (also printed on the console); *Default* returns to
   the value of the configuration.
 * **Mean time per PRI [us]** (bottom right, above the help): the mean
-  processing time per PRI of every block since the start: DBF, matched
-  filter, MTI (clutter filter), Doppler (FFT and non-coherent integration),
-  CFAR of the configured method with the pruning, plot extractor, tracking,
-  and their total. The worker posts its accumulated times 4 times a second.
+  time per PRI since the start of every block of the processing thread:
+  DBF, matched filter, MTI (clutter filter), Doppler (FFT and non-coherent
+  integration), CFAR of the configured method with the pruning, plot
+  extractor, tracking, the console output (printing the plots, track
+  confirmations and messages; 0 with `--quiet`) and the display calls
+  (handing the antenna, plots, detections, tracks and times to the PPI),
+  and their total. Then *PPI drawing (GUI)*: the time the GUI thread spends
+  taking the data and drawing the PPI, per PRI; it runs on another core at
+  the same time, so it is not in the total. The worker posts its
+  accumulated times 4 times a second; the console and display times are
+  also printed at the end (`Output per PRI`).
 
 **Tracking** (`cfg.track.enable` in the configuration, `tracker.c`): the
-same EKF as `track_update.m` (2-D or 3-D, see `../README.md`), fed with every
-plot in the order of the extractor; once per PRI the missed scans are
-counted and old tracks deleted. Confirmations are printed on the console
-(unless `--quiet`), and the number of updates at the end.
+same EKF as `track_update.m` (2-D or 3-D, constant velocity or constant
+acceleration, global nearest neighbour association on batches of plots,
+see `../README.md`). Once per PRI it gets the plots of that PRI, associates
+a complete batch and deletes old tracks, as `run_radar_sim.m` does; a gap
+in the pulse numbers and the end of the data associate the open batch.
+Confirmations are printed on the console (unless `--quiet`), and the number
+of updates at the end.
 
 The PPI is interactive:
 
@@ -346,7 +357,7 @@ Timing:
 
 | Test | What it checks |
 |---|---|
-| `tracker` (`tests/test_tracker.c`) | two crossing targets over 6 scans, 3-D and 2-D: two confirmed tracks that stay on their targets; with plots and the track log from `../tests/test_tracker.m`, every C track update equals MATLAB's (state within 1e-6) |
+| `tracker` (`tests/test_tracker.c`) | two crossing targets over 6 scans, 3-D and 2-D: two confirmed tracks that stay on their targets; GNN with two targets 200 m apart: each track stays on its own target; with plots, a configuration and the track log from `../tests/test_tracker.m` (CV and CA, 2-D and 3-D), every C track update equals MATLAB's (same plot, state within 1e-6) |
 | `core` (`tests/test_core.c`) | batched FFT against a direct DFT; plot extractor; a moving target through the whole chain with the exported configuration (one plot at the right range, velocity and beam); direct and fast-convolution matched filters give the same plot; the same target with the CFAR threshold raised to 45 dB at run time gives no detection; `cfar_pfa()` against the closed form (one look) and the Pfa 1e-8 of the configured threshold |
 | `udp_input` | reassembly with shuffled, duplicate, missing and foreign datagrams; timeouts; record and replay; fuzzing |
 | `ddc_files` (`tests/test_ddc_files.c`) | MAT-file reader with files written as MATLAB writes them (data in smaller storage types, small elements, skipped char field, compressed `-v7` with zlib); folder listing; the datagrams of a DDC file are accepted by `udp_input.c` and give back the same PRI; corrupted, truncated, `-v7.3` and big-endian files are refused |

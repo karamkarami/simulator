@@ -29,6 +29,7 @@ extern "C" {
 enum { PULSE_SHORT = 0, PULSE_LONG = 1, N_PULSES = 2 };
 enum { MF_AUTO = 0, MF_DIRECT = 1, MF_FFT = 2 };
 enum { CFAR_2D = 0, CFAR_RANGE = 1, CFAR_DOPPLER = 2 };
+enum { TRACK_CV = 0, TRACK_CA = 1 };
 const char *cfar_method_name(int method);   /* "2-D", "1-D range", "1-D Doppler" */
 
 typedef struct {
@@ -91,9 +92,14 @@ typedef struct {
 
     /* EKF tracker (optional in the file: off if missing) */
     int     trackEnable, trackDim;   /* dimension 2 (range, azimuth) or 3 (+ elevation)  */
+    int     trackModel;     /* TRACK_CV (constant velocity) or TRACK_CA (constant acceleration) */
     double  trackSigma[3];  /* measurement errors: range [m], azimuth, elevation [rad]   */
-    double  trackQ[3];      /* white-acceleration spectral density per axis [m^2/s^3]    */
+    double  trackQ[3];      /* process noise per axis: white acceleration [m^2/s^3] (CV)
+                               or white jerk [m^2/s^5] (CA) spectral density              */
     double  trackSigmaV0;   /* velocity std of a new track [m/s]                          */
+    double  trackSigmaA0;   /* acceleration std of a new track (CA) [m/s^2]               */
+    double  trackBatchGap_s, trackBatchMax_s;   /* GNN batch: time without a new plot,
+                                                   longest collection time [s]            */
     double  trackGate;      /* chi-square gate of d^2                                     */
     int     trackConfirmHits, trackMaxMissTentative, trackMaxMiss;
     double  scanTime_s;     /* antenna revolution                                         */
@@ -191,6 +197,7 @@ typedef struct {
     int      dim;          /* 2 or 3                                                  */
     double   time_s;       /* time of the last update                                 */
     double   pos_m[3], vel_mps[3];
+    double   acc_mps2[3];  /* acceleration (constant-acceleration model, else 0)     */
     double   alt_m;        /* height above ground (3-D), NaN in 2-D                  */
     int      hits;         /* updates                                                 */
     int      misses;       /* scans without a plot since the last update             */
@@ -210,6 +217,10 @@ typedef struct {
 
 typedef struct {
     double dbf_ms, mf_ms, mti_ms, doppler_ms, cfar_ms, extract_ms, track_ms, total_ms;
+    /* time of the application in its output callbacks (main.c adds it; the
+     * processor leaves it 0): console output (printf of plots, tracks and
+     * messages) and the data handed to the PPI display */
+    double console_ms, display_ms;
     uint64_t pris, updates;
     uint64_t rejected;   /* PRIs whose layout (channels, DDC samples, sub-pulse samples,
                             DDC rate) differs from the configuration: not processed */
@@ -291,7 +302,7 @@ void ppi_set_display_mode(int mode);
 void ppi_post_track(const Track *track);
 /* Accumulated processing times: the panel shows the mean per PRI of every
  * block [us]. detectionName / trackingName label the CFAR and tracking rows
- * (e.g. "CFAR 2-D", "Tracking EKF 3-D"; NULL keeps the previous). */
+ * (e.g. "CFAR 2-D", "Tracking 3-D CV"; NULL keeps the previous). */
 void ppi_post_timing(const ProcessorTiming *timing, const char *detectionName, const char *trackingName);
 
 /* ------------------------------------------------------------------------ */

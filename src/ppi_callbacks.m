@@ -343,9 +343,11 @@ txt = sprintf(['Track %d (%s, %d-D EKF)\nRange       %.3f km\nAzimuth     %.2f d
 if tk.dim == 3
     txt = [txt sprintf('Height      %.0f m\nClimb       %.1f m/s\n', p(3) + height_m, v(3))];
 end
-txt = [txt sprintf(['Speed       %.1f m/s\nHeading     %.1f deg\nUpdates     %d (missed scans %d)\n' ...
-                    'Last update %.3f s'], norm(v(1:2)), mod(atan2(v(1), v(2))*180/pi, 360), tk.hits, ...
-                    tk.misses, tk.t_s)];
+txt = [txt sprintf('Speed       %.1f m/s\nHeading     %.1f deg\n', norm(v(1:2)), mod(atan2(v(1), v(2))*180/pi, 360))];
+if isfield(tk, 'acc_mps2') && any(tk.acc_mps2 ~= 0)                     % constant-acceleration model
+    txt = [txt sprintf('Accel.      %.2f m/s^2\n', norm(tk.acc_mps2(1:2)))];
+end
+txt = [txt sprintf('Updates     %d (missed scans %d)\nLast update %.3f s', tk.hits, tk.misses, tk.t_s)];
 end
 
 function S = draw_tracks(S)
@@ -376,18 +378,20 @@ S.visTrk = struct('x', P(1, :), 'y', P(2, :), 'idx', 1:numel(tk));
 end
 
 function show_timing(S)
-% Mean processing time per PRI of every block in the panel.
+% Mean time per PRI of every block, of the console output and of the display in the panel.
 us = S.data.timing_us;
 if isempty(us), return; end
 names = {'DBF', 'Matched filter', 'MTI (clutter)', 'Doppler FFT+NCI', ['CFAR ' S.sys.cfar.label], ...
-         'Plot extractor', sprintf('Tracking EKF %d-D', S.sys.track.dim)};
+         'Plot extractor', sprintf('Tracking %d-D %s', S.sys.track.dim, upper(S.sys.track.model)), ...
+         'Console output', 'Display (PPI)'};
 if ~S.sys.track.enable, names{7} = 'Tracking (off)'; end
-rows = cell(1, 9);
+n = min(numel(us), numel(names));
+rows = cell(1, n + 2);
 rows{1} = 'Mean time per PRI [us]';
-for i = 1:7
+for i = 1:n
     rows{i+1} = sprintf('%-17s%9.1f', names{i}, us(i));
 end
-rows{9} = sprintf('%-17s%9.1f', 'Total', sum(us));
+rows{n+2} = sprintf('%-17s%9.1f', 'Total', sum(us(1:n)));
 set(S.h.timing, 'String', rows);
 end
 

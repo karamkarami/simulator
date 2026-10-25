@@ -51,6 +51,7 @@ typedef struct {
     FILE *plotsFile, *detFile, *trackFile;
     uint64_t nPlots, nDetections, nTrackUpdates, nConfirmed;
     double detArc_deg;            /* azimuth step between CPI updates (PPI detection arcs) */
+    double console_ms, display_ms;   /* time in the console output and in the PPI calls */
     int exitCode;
 } App;
 
@@ -140,6 +141,8 @@ static int parse_options(int argc, char **argv, Options *o)
 
 static const char *pulse_name(int pulse) { return pulse == PULSE_SHORT ? "short" : "long"; }
 
+static double ms_since(double t0) { return (now_seconds() - t0) * 1e3; }
+
 static void on_detections(void *user, int pulse, const Detection *dets, int n)
 {
     App *app = user;
@@ -160,7 +163,11 @@ static void on_detections(void *user, int pulse, const Detection *dets, int n)
         }
     }
 #ifdef RADAR_WITH_QT
-    if (app->opt.ppi && n > 0) ppi_post_detections(dets, n, app->detArc_deg);
+    if (app->opt.ppi && n > 0) {
+        const double t0 = now_seconds();
+        ppi_post_detections(dets, n, app->detArc_deg);
+        app->display_ms += ms_since(t0);
+    }
 #endif
 }
 
@@ -168,9 +175,12 @@ static void on_plot(void *user, const Detection *p)
 {
     App *app = user;
     app->nPlots++;
-    if (!app->opt.quiet)
+    if (!app->opt.quiet) {
+        const double t0 = now_seconds();
         printf("plot  t %8.3f s  az %7.2f deg  R %8.3f km  el %6.2f deg  vr %7.2f m/s  SNR %5.1f dB  %-5s  hits %d\n",
                p->time_s, p->az_deg, p->range_m / 1e3, p->el_deg, p->vr_mps, p->snr_dB, pulse_name(p->pulse), p->hits);
+        app->console_ms += ms_since(t0);
+    }
     if (app->plotsFile) {
         fprintf(app->plotsFile, "%.6f,%.4f,%.2f,%.4f,%.4f,%.2f,%s,%d,%d,%d,%d,%u\n", p->time_s, p->az_deg, p->range_m,
                 p->el_deg, p->vr_mps, p->snr_dB, pulse_name(p->pulse), p->hits, p->beam, p->rIdx, p->dIdx, p->pulseNumber);
@@ -178,7 +188,11 @@ static void on_plot(void *user, const Detection *p)
     }
     if (app->serial && !strcmp(app->opt.serialContent, "plots")) serial_send_plot(app->serial, p);
 #ifdef RADAR_WITH_QT
-    if (app->opt.ppi) ppi_post_plot(p);
+    if (app->opt.ppi) {
+        const double t0 = now_seconds();
+        ppi_post_plot(p);
+        app->display_ms += ms_since(t0);
+    }
 #endif
 }
 
@@ -188,18 +202,25 @@ static void on_track(void *user, const Track *t)
     app->nTrackUpdates += !t->deleted;
     if (t->confirmed && !t->deleted && t->hits == app->cfg.trackConfirmHits) {
         app->nConfirmed++;
-        if (!app->opt.quiet)
+        if (!app->opt.quiet) {
+            const double t0 = now_seconds();
             printf("track %u confirmed  t %8.3f s  R %8.3f km  az %7.2f deg  speed %6.1f m/s\n", t->id, t->time_s,
                    hypot(hypot(t->pos_m[0], t->pos_m[1]), t->pos_m[2]) / 1e3,
                    fmod(atan2(t->pos_m[0], t->pos_m[1]) * 180.0 / 3.14159265358979323846 + 360.0, 360.0),
                    hypot(t->vel_mps[0], t->vel_mps[1]));
+            app->console_ms += ms_since(t0);
+        }
     }
     if (app->trackFile)
-        fprintf(app->trackFile, "%u,%d,%d,%.6f,%.2f,%.2f,%.2f,%.3f,%.3f,%.3f,%d,%d\n", t->id, t->confirmed, t->deleted,
-                t->time_s, t->pos_m[0], t->pos_m[1], t->pos_m[2], t->vel_mps[0], t->vel_mps[1], t->vel_mps[2],
-                t->hits, t->misses);
+        fprintf(app->trackFile, "%u,%d,%d,%.6f,%.2f,%.2f,%.2f,%.3f,%.3f,%.3f,%d,%d,%.4f,%.4f,%.4f\n", t->id, t->confirmed,
+                t->deleted, t->time_s, t->pos_m[0], t->pos_m[1], t->pos_m[2], t->vel_mps[0], t->vel_mps[1], t->vel_mps[2],
+                t->hits, t->misses, t->acc_mps2[0], t->acc_mps2[1], t->acc_mps2[2]);
 #ifdef RADAR_WITH_QT
-    if (app->opt.ppi) ppi_post_track(t);
+    if (app->opt.ppi) {
+        const double t0 = now_seconds();
+        ppi_post_track(t);
+        app->display_ms += ms_since(t0);
+    }
 #endif
 }
 
@@ -207,7 +228,11 @@ static void on_antenna(void *user, double az_deg, double time_s, uint32_t scan)
 {
     App *app = user;
 #ifdef RADAR_WITH_QT
-    if (app->opt.ppi) ppi_post_antenna(az_deg, time_s, scan);
+    if (app->opt.ppi) {
+        const double t0 = now_seconds();
+        ppi_post_antenna(az_deg, time_s, scan);
+        app->display_ms += ms_since(t0);
+    }
 #else
     (void)app; (void)az_deg; (void)time_s; (void)scan;
 #endif
@@ -217,11 +242,19 @@ static void on_antenna(void *user, double az_deg, double time_s, uint32_t scan)
 /* Worker: input -> processing                                              */
 /* ------------------------------------------------------------------------ */
 
-static void print_timing(const Processor *proc, const UdpInput *in, uint64_t queueDrops, double wall_s)
+/* Block times of the processor and the application's console and display times. */
+static void app_timing(const App *app, const Processor *proc, ProcessorTiming *t)
+{
+    processor_timing(proc, t);
+    t->console_ms = app->console_ms;
+    t->display_ms = app->display_ms;
+}
+
+static void print_timing(const App *app, const Processor *proc, const UdpInput *in, uint64_t queueDrops, double wall_s)
 {
     ProcessorTiming t;
     UdpStats u;
-    processor_timing(proc, &t);
+    app_timing(app, proc, &t);
     udp_input_stats(in, &u);
     const double n = t.pris ? (double)t.pris : 1.0;
     fprintf(stderr, "\nPRIs processed: %llu (%llu CPI updates) in %.1f s; datagrams %llu, foreign %llu, "
@@ -230,6 +263,7 @@ static void print_timing(const Processor *proc, const UdpInput *in, uint64_t que
     fprintf(stderr, "Processing time per PRI: %.3f ms (DBF %.3f, MF %.3f, MTI %.3f, Doppler %.3f, "
             "CFAR+pruning %.3f, extraction %.3f, tracking %.3f)\n", t.total_ms / n, t.dbf_ms / n, t.mf_ms / n,
             t.mti_ms / n, t.doppler_ms / n, t.cfar_ms / n, t.extract_ms / n, t.track_ms / n);
+    fprintf(stderr, "Output per PRI: console %.3f ms, display (PPI calls) %.3f ms\n", t.console_ms / n, t.display_ms / n);
     if (t.skipped || queueDrops)
         fprintf(stderr, "Overload: %llu CPI updates skipped, %llu PRIs dropped because the queue was full\n",
                 (unsigned long long)t.skipped, (unsigned long long)queueDrops);
@@ -244,11 +278,17 @@ static void report_cfar(App *app, const Processor *proc, double default_dB, int 
     const double alpha = processor_cfar_alpha(proc), dB = 10.0 * log10(alpha);
     const double pfa = cfar_pfa(alpha, app->cfg.nTrain, app->cfg.nLooks);
     if (changed || fabs(dB - default_dB) > 1e-9) {
+        const double t0 = now_seconds();
         if (isnan(pfa)) fprintf(stderr, "CFAR threshold %.2f dB\n", dB);
         else fprintf(stderr, "CFAR threshold %.2f dB (Pfa %.1e)\n", dB, pfa);
+        app->console_ms += ms_since(t0);
     }
 #ifdef RADAR_WITH_QT
-    if (app->opt.ppi) ppi_post_cfar_threshold(dB, pfa, default_dB);
+    if (app->opt.ppi) {
+        const double t0 = now_seconds();
+        ppi_post_cfar_threshold(dB, pfa, default_dB);
+        app->display_ms += ms_since(t0);
+    }
 #endif
 }
 
@@ -273,7 +313,8 @@ static int worker(void *arg)
 #ifdef RADAR_WITH_QT
     char detName[32], trackName[32];
     snprintf(detName, sizeof detName, "CFAR %s", cfar_method_name(app->cfg.cfarMethod));
-    if (app->cfg.trackEnable) snprintf(trackName, sizeof trackName, "Tracking EKF %d-D", app->cfg.trackDim);
+    if (app->cfg.trackEnable)
+        snprintf(trackName, sizeof trackName, "Tracking %d-D %s", app->cfg.trackDim, app->cfg.trackModel == TRACK_CA ? "CA" : "CV");
     else snprintf(trackName, sizeof trackName, "Tracking (off)");
     double lastTiming = 0.0;
 #endif
@@ -310,7 +351,10 @@ static int worker(void *arg)
         lastData = now_seconds();
 #ifdef RADAR_WITH_QT
         double request_dB;
-        if (app->opt.ppi && ppi_take_cfar_request(&request_dB)) {   /* Apply in the PPI */
+        const double tReq = now_seconds();
+        const int request = app->opt.ppi && ppi_take_cfar_request(&request_dB);
+        if (app->opt.ppi) app->display_ms += ms_since(tReq);
+        if (request) {                                         /* Apply in the PPI */
             processor_set_cfar_alpha(proc, pow(10.0, request_dB / 10.0));
             report_cfar(app, proc, default_dB, 1);
         }
@@ -320,9 +364,11 @@ static int worker(void *arg)
         processor_process(proc, pri, &cb);
 #ifdef RADAR_WITH_QT
         if (app->opt.ppi && lastData - lastTiming > 0.25) {   /* block times in the PPI panel */
+            const double tPost = now_seconds();
             ProcessorTiming tm;
-            processor_timing(proc, &tm);
+            app_timing(app, proc, &tm);
             ppi_post_timing(&tm, detName, trackName);
+            app->display_ms += ms_since(tPost);
             lastTiming = lastData;
         }
 #endif
@@ -330,11 +376,11 @@ static int worker(void *arg)
     const uint64_t queueDrops = input_thread_dropped(input);
     input_thread_stop(input);
     processor_flush(proc, &cb);
-    print_timing(proc, in, queueDrops, now_seconds() - t0);
+    print_timing(app, proc, in, queueDrops, now_seconds() - t0);
 #ifdef RADAR_WITH_QT
     if (app->opt.ppi) {
         ProcessorTiming tm;
-        processor_timing(proc, &tm);
+        app_timing(app, proc, &tm);
         ppi_post_timing(&tm, detName, trackName);
     }
 #endif
@@ -375,7 +421,9 @@ int main(int argc, char **argv)
             app.cfg.nfft, app.cfg.nRows, app.cfg.updateEvery, app.cfg.minHits);
     fprintf(stderr, "CFAR %s (window: range %d+%d, Doppler %d+%d guard+training cells per side), ", cfar_method_name(app.cfg.cfarMethod),
             app.cfg.guardRange, app.cfg.trainRange, app.cfg.guardDoppler, app.cfg.trainDoppler);
-    if (app.cfg.trackEnable) fprintf(stderr, "tracking: EKF %d-D\n", app.cfg.trackDim);
+    if (app.cfg.trackEnable)
+        fprintf(stderr, "tracking: EKF %d-D, %s model, GNN association\n", app.cfg.trackDim,
+                app.cfg.trackModel == TRACK_CA ? "constant-acceleration" : "constant-velocity");
     else fprintf(stderr, "tracking off\n");
 
     if (app.opt.plotsCsv && app.opt.plotsCsv[0]) {
@@ -386,7 +434,8 @@ int main(int argc, char **argv)
     if (app.opt.tracksCsv && app.opt.tracksCsv[0]) {
         app.trackFile = fopen(app.opt.tracksCsv, "w");
         if (app.trackFile)
-            fprintf(app.trackFile, "id,confirmed,deleted,time_s,x_m,y_m,z_m,vx_mps,vy_mps,vz_mps,hits,misses\n");
+            fprintf(app.trackFile, "id,confirmed,deleted,time_s,x_m,y_m,z_m,vx_mps,vy_mps,vz_mps,hits,misses,"
+                    "ax_mps2,ay_mps2,az_mps2\n");
     }
     if (app.opt.detectionsCsv && app.opt.detectionsCsv[0]) {
         app.detFile = fopen(app.opt.detectionsCsv, "w");

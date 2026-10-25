@@ -25,7 +25,8 @@ cfg.const.T0 = 290;             % reference noise temperature [K]
 
 %% Input files
 cfg.files.antenna = fullfile(root, 'inputs', 'antenna_pattern.mat'); % patterns, element spacing, gains
-cfg.files.ddc     = fullfile(root, 'inputs', 'ddc_filters.mat');     % low-pass filters of the 2 DDC stages
+cfg.files.ddc     = fullfile(root, 'inputs', 'ddc_filters.mat');     % low-pass filters of the 2 DDC stages, 2 MHz output
+cfg.files.ddc4MHz = fullfile(root, 'inputs', 'ddc_filters_4MHz.mat'); % the same for the 4 MHz output
 cfg.files.dbf     = fullfile(root, 'inputs', 'dbf_matrix.mat');      % elevation beamforming matrix
 cfg.files.stagger = fullfile(root, 'inputs', 'stagger_prf.mat');     % staggered PRIs + MTI weights
 
@@ -81,8 +82,12 @@ cfg.wave.long.tTx_s         = 200e-6;
 cfg.prf.mode  = 'fixed';   % 'fixed' or 'staggered' (staggered PRIs come from cfg.files.stagger)
 cfg.prf.pri_s = 1e-3;      % PRI in fixed mode [s]
 
-%% DDC (filters come from cfg.files.ddc)
-cfg.ddc.decimation = [10 6];   % decimation factor of stage 1 and stage 2 (120 -> 12 -> 2 MHz)
+%% DDC (filters come from cfg.files.ddc for 2 MHz, cfg.files.ddc4MHz for 4 MHz)
+cfg.ddc.outputRate_Hz = 2e6;   % DDC output sample rate: 2e6 or 4e6 [Hz]. Stage 1 decimates by 10
+                               % (120 -> 12 MHz), stage 2 by 6 (-> 2 MHz) or by 3 (-> 4 MHz). The
+                               % 4 MHz output halves the range cell (37.5 m instead of 75 m) and doubles
+                               % the matched filter taps and range cells; the CFAR windows are in cells.
+cfg.ddc.stage1Decimation = 10; % decimation of stage 1 (120 -> 12 MHz)
 cfg.ddc.coefFracBits = 13;     % filter coefficients in the file: signed 16-bit, 13 fractional bits
 cfg.ddc.shift      = [13 13];  % right shift of the accumulator of each stage (13 = unit gain);
                                % every stage output is rounded and saturated to signed 16 bit
@@ -148,20 +153,34 @@ cfg.extract.minExtent_deg = 2; % minimum azimuth extent of the detections of a p
 cfg.extract.maxMiss = 2;       % CPIs without a detection before a plot is closed
 
 %% Target tracking: extended Kalman filter (EKF) on the plots
-% State: position and velocity (nearly constant velocity, white acceleration),
-% relative to the antenna (x = East, y = North, z = up). Measurements: range
-% and azimuth of every plot ('2d', in the horizontal plane, ground range), or
-% range, azimuth and elevation ('3d', needs the elevation from the DBF).
-% A plot is associated with the track of smallest d^2 + ln|S| inside the gate;
-% a plot without a track starts a tentative track (velocity unknown).
+% State relative to the antenna (x = East, y = North, z = up): position and
+% velocity ('cv': nearly constant velocity, white acceleration) or position,
+% velocity and acceleration ('ca': nearly constant acceleration, white jerk).
+% Measurements: range and azimuth of every plot ('2d', in the horizontal
+% plane, ground range), or range, azimuth and elevation ('3d', needs the
+% elevation from the DBF).
+% Association: global nearest neighbour (GNN). The plots are collected until
+% the antenna has turned gnnSector_deg without a new plot (or for at most
+% gnnMaxSector_deg after the first one); then every track gets at most one plot of the
+% batch: the assignment with the most plot-track pairs inside their gates and,
+% among those, the smallest sum of d^2 + ln|S| (Hungarian algorithm). A plot
+% without a track starts a tentative track (velocity, acceleration unknown).
 cfg.track.enable          = true;
 cfg.track.dim             = 'auto';  % 'auto' (3d with DBF, 2d without), '2d' or '3d'
+cfg.track.model           = 'cv';    % motion model: 'cv' constant velocity or 'ca' constant acceleration
 cfg.track.sigmaRange_m    = 50;      % range error of a plot (cell size, range-Doppler coupling) [m]
 cfg.track.sigmaAz_deg     = 0.3;     % azimuth error of a plot [deg]
 cfg.track.sigmaEl_deg     = 0.5;     % elevation error of a plot (3d) [deg]
-cfg.track.sigmaAccel_mps2 = 5;       % horizontal process noise (white acceleration) [m/s^2]
-cfg.track.sigmaAccelZ_mps2 = 1;      % vertical process noise (3d) [m/s^2]
+cfg.track.sigmaAccel_mps2 = 5;       % 'cv': horizontal process noise (white acceleration) [m/s^2]
+cfg.track.sigmaAccelZ_mps2 = 1;      % 'cv': vertical process noise (3d) [m/s^2]
+cfg.track.sigmaJerk_mps3  = 0.5;     % 'ca': horizontal process noise (white jerk) [m/s^3]
+cfg.track.sigmaJerkZ_mps3 = 0.1;     % 'ca': vertical process noise (3d) [m/s^3]
 cfg.track.maxSpeed_mps    = 400;     % initial velocity uncertainty of a new track: std maxSpeed/sqrt(3)
+cfg.track.maxAccel_mps2   = 5;       % 'ca': initial acceleration uncertainty: std maxAccel/sqrt(3); with
+                                     % 3 unknowns per axis 3 plots always fit a track, so a large value
+                                     % makes false plots confirm tracks more easily
+cfg.track.gnnSector_deg   = 5;       % GNN batch: associated after this antenna turn without a new plot [deg]
+cfg.track.gnnMaxSector_deg = 30;     % GNN batch: at the latest this antenna turn after its first plot [deg]
 cfg.track.gateProb        = 0.999;   % probability that the gate holds the correct plot (chi-square)
 cfg.track.confirmHits     = 3;       % updates (incl. the first plot) that confirm a tentative track
 cfg.track.maxMissTentative = 1;      % scans without a plot before a tentative track is deleted

@@ -17,8 +17,9 @@ sys.cfar = cfar_window(cfg);                                  % window of the se
 
 %% Input files (defaults are built when missing or when made for other cfg values)
 ant  = load_input(cfg, 'antenna', struct('fc', cfg.fc, 'spacing', cfg.ant.elementSpacing_lambda));
-ddcF = load_input(cfg, 'ddc', struct('fs_Hz', fs, 'decimation', cfg.ddc.decimation, ...
-                                     'coefFracBits', cfg.ddc.coefFracBits));
+[ddcDecim, ddcFile] = ddc_decimation(cfg);                    % 2 or 4 MHz output: its filter file
+ddcF = load_input(cfg, ddcFile, struct('fs_Hz', fs, 'decimation', ddcDecim, ...
+                                       'coefFracBits', cfg.ddc.coefFracBits));
 
 %% Antenna
 sys.ant = ant;
@@ -72,8 +73,8 @@ if size(sys.mtiCoeffs, 1) == 1
 end
 
 %% DDC filters (signed 16-bit integers with coefFracBits fractional bits) and NCO
-D1 = cfg.ddc.decimation(1);
-D2 = cfg.ddc.decimation(2);
+D1 = ddcDecim(1);
+D2 = ddcDecim(2);
 sys.ddc.h1 = double(ddcF.h1(:));                              % integer coefficients
 sys.ddc.h2 = double(ddcF.h2(:));
 sys.ddc.shift = cfg.ddc.shift;

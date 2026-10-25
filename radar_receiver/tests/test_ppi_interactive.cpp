@@ -251,11 +251,21 @@ int main(int argc, char **argv)
     tm.pris = 1000;
     tm.dbf_ms = 120.0;  tm.mf_ms = 340.0;  tm.mti_ms = 56.0;  tm.doppler_ms = 980.0;
     tm.cfar_ms = 760.0; tm.extract_ms = 15.0; tm.track_ms = 4.0;
-    ppi_post_timing(&tm, "CFAR 1-D range", "Tracking EKF 3-D");
+    tm.console_ms = 30.0; tm.display_ms = 50.0;
+    ppi_post_timing(&tm, "CFAR 1-D range", "Tracking 3-D CV");
     win.refresh();
     const QString timing = win.timingText();
+    auto row = [](const char *name, double us) { return QStringLiteral("%1%2").arg(QString(name), -17).arg(us, 9, 'f', 1); };
     check(timing.contains("Doppler FFT+NCI") && timing.contains("980.0") && timing.contains("CFAR 1-D range") &&
-          timing.contains("Tracking EKF 3-D") && timing.contains("2275.0"), "mean block times per PRI in the panel");
+          timing.contains("Tracking 3-D CV") && timing.contains(row("Total", 2355.0)), "mean block times per PRI in the panel");
+    check(timing.contains(row("Console output", 30.0)) && timing.contains(row("Display (post)", 50.0)) &&
+          timing.contains("PPI drawing (GUI)"), "console, display and GUI drawing times in the panel");
+    win.grab();                                          /* draws the PPI in the GUI thread */
+    ppi_post_timing(&tm, "CFAR 1-D range", "Tracking 3-D CV");
+    win.refresh();
+    const QString timing2 = win.timingText();
+    const int iGui = timing2.indexOf("PPI drawing (GUI)");
+    check(iGui >= 0 && timing2.mid(iGui + 17, 9).trimmed().toDouble() > 0.0, "the drawing time of the GUI is counted");
     check(win.cfarInfo().contains("CFAR 1-D range: 17.50 dB"), "the CFAR line names the method");
 
     /* tracks: hollow triangles around their plot, checkbox, deletion */

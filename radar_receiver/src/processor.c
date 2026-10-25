@@ -98,7 +98,10 @@ struct Processor {
     Tracker tracker;            /* EKF tracker (cfg->trackEnable)                 */
     Detection *newPlots;        /* plots of the latest extractor update           */
     int nNewPlots, capNewPlots;
+    Detection *trackPlots;      /* plots of this PRI for the tracker              */
+    int nTrackPlots, capTrackPlots;
     uint32_t lastPulse;
+    double lastTime;            /* time of the newest PRI                          */
     int havePulse;
     ProcessorTiming timing;
 };
@@ -274,6 +277,7 @@ void processor_destroy(Processor *p)
     fft_plan_free(&p->fft);
     tracker_free(&p->tracker);
     free(p->newPlots);
+    free(p->trackPlots);
     free(p);
 }
 
@@ -909,29 +913,53 @@ static void plot_callback(void *user, const Detection *plot)
     p->newPlots[p->nNewPlots++] = *plot;
 }
 
-static void track_deleted(void *user, const Track *track)
+/* Track updates and deletions are collected first and reported after the
+ * tracker has run (so that the output callbacks are not timed). */
+typedef struct {
+    Track *list;
+    int n, cap;
+} TrackReports;
+
+static void track_callback(void *user, const Track *track, int plotIndex)
 {
-    const ProcessorCallbacks *cb = user;
-    if (cb && cb->track) cb->track(cb->user, track);
+    TrackReports *r = user;
+    (void)plotIndex;
+    if (r->n == r->cap) {
+        r->cap = r->cap ? 2 * r->cap : 16;
+        r->list = xrealloc(r->list, sizeof(Track) * r->cap);
+    }
+    r->list[r->n++] = *track;
 }
 
-/* Hands the collected plots to the output and to the tracker. */
+/* Hands the collected plots to the output; the tracker gets them at the end of the PRI. */
 static void plots_out(Processor *p, const ProcessorCallbacks *cb)
 {
     for (int k = 0; k < p->nNewPlots; k++) {
         const Detection *plot = &p->newPlots[k];
         if (cb && cb->plot) cb->plot(cb->user, plot);
         if (!p->cfg->trackEnable) continue;
-        double t0 = now_seconds();
-        const int i = tracker_plot(&p->tracker, plot);
-        p->timing.track_ms += elapsed_ms(&t0);
-        if (i >= 0 && cb && cb->track) {
-            Track r;
-            tracker_report(&p->tracker, i, &r);
-            cb->track(cb->user, &r);
+        if (p->nTrackPlots == p->capTrackPlots) {
+            p->capTrackPlots = p->capTrackPlots ? 2 * p->capTrackPlots : 16;
+            p->trackPlots = xrealloc(p->trackPlots, sizeof(Detection) * p->capTrackPlots);
         }
+        p->trackPlots[p->nTrackPlots++] = *plot;
     }
     p->nNewPlots = 0;
+}
+
+/* The plots of this PRI to the tracker (GNN batches, deletions) at time t_s, as
+ * track_update.m once per PRI; flush = 1 associates the open batch. */
+static void run_tracker(Processor *p, double t_s, int flush, const ProcessorCallbacks *cb)
+{
+    if (!p->cfg->trackEnable) return;
+    TrackReports r = { NULL, 0, 0 };
+    double t0 = now_seconds();
+    tracker_update(&p->tracker, p->trackPlots, p->nTrackPlots, t_s, flush, track_callback, &r);
+    p->timing.track_ms += elapsed_ms(&t0);
+    p->nTrackPlots = 0;
+    for (int i = 0; i < r.n; i++)
+        if (cb && cb->track) cb->track(cb->user, &r.list[i]);
+    free(r.list);
 }
 
 /* The PRI has the layout of the configuration: channels, DDC samples, the DDC
@@ -954,6 +982,7 @@ void processor_flush(Processor *p, const ProcessorCallbacks *cb)
         extractor_update(&p->ps[i].ext, NULL, 0, 1, plot_callback, p);
         plots_out(p, cb);
     }
+    if (p->havePulse) run_tracker(p, p->lastTime, 1, cb);   /* at the newest PRI, as run_radar_sim.m */
 }
 
 void processor_process(Processor *p, const PriData *pri, const ProcessorCallbacks *cb)
@@ -970,6 +999,7 @@ void processor_process(Processor *p, const PriData *pri, const ProcessorCallback
         for (int i = 0; i < N_PULSES; i++) reset_buffers(&p->ps[i]);
     }
     p->lastPulse = pri->pulseNumber;
+    p->lastTime = pri->time_s;
     p->havePulse = 1;
     if (cb && cb->antenna) cb->antenna(cb->user, pri->az_deg, pri->time_s, pri->scanNumber);
 
@@ -1020,11 +1050,7 @@ void processor_process(Processor *p, const PriData *pri, const ProcessorCallback
         plots_out(p, cb);
         if (i == 0) p->timing.updates++;
     }
-    if (cfg->trackEnable) {                                 /* missed scans, deletion */
-        double t0 = now_seconds();
-        tracker_maintain(&p->tracker, pri->time_s, track_deleted, (void *)cb);
-        p->timing.track_ms += elapsed_ms(&t0);
-    }
+    run_tracker(p, pri->time_s, 0, cb);                    /* plots of this PRI, missed scans, deletion */
     p->timing.total_ms += (now_seconds() - tStart) * 1e3;
     p->timing.pris++;
 }

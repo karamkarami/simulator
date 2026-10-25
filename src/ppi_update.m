@@ -5,8 +5,9 @@ function sys = ppi_update(ppi, sys, az_deg, t_s, scan, plots, dets, tracks, timi
 %   ppi_callbacks.m (filters, zoom, data tips) can redraw it at any time.
 %   dets are the CFAR detections before the plot extractor (rows of
 %   detection_log_init.m), tracks the current tracks (track_report.m) and
-%   timing_us the mean processing time per PRI of DBF, matched filter, MTI,
-%   Doppler, detection, plot extractor and tracking [us] (all optional).
+%   timing_us the mean time per PRI of DBF, matched filter, MTI, Doppler,
+%   detection, plot extractor, tracking, console output and display [us]
+%   (all optional).
 %   While the display is paused (space key or the Pause button) the data is
 %   still stored but not drawn.
 %   When the user applied a new CFAR threshold in the panel, the returned sys

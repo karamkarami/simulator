@@ -3,8 +3,8 @@ function packets = udp_make_packets(hdr, I, Q, payloadBytes)
 %   packets = UDP_MAKE_PACKETS(hdr, I, Q, payloadBytes) returns a cell array
 %   of uint8 row vectors, one per datagram: a 64-byte header + up to
 %   payloadBytes bytes of the signed 16-bit DDC output I, Q [nSamples x
-%   nChannels] of the PRI described by hdr (see pulse_header in
-%   run_radar_sim.m). Header (little-endian):
+%   nChannels] of the PRI described by hdr (see
+%   pulse_header.m). Header (little-endian):
 %     bytes  0-3   uint32  magic 0x52444443 ('RDDC')
 %     bytes  4-7   uint32  pulse number
 %     bytes  8-11  uint32  scan number

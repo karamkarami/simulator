@@ -20,7 +20,7 @@ optional Qt PPI and serial output (see `radar_receiver/README.md`).
  x receiver gain (60 dB) -> ADC 120 MHz, 16 bit, ENOB 12.7 -> int16
         |                       \--> optional raw data: output/raw_pulses/pulse_<n>.mat
         v
- DDC: x*cos(30 MHz) | x*(-sin(30 MHz)) -> FIR h1, /10 -> FIR h2, /6
+ DDC: x*cos(30 MHz) | x*(-sin(30 MHz)) -> FIR h1, /10 -> FIR h2, /6 (2 MHz) or /3 (4 MHz)
       (int16 coefficients with 13 fractional bits, time-domain sliding valid convolutions,
        every stage rounded and saturated to int16)                     -> int16 [nDdc x 48]
         |                       \--> optional DDC files: output/ddc_pulses/ddc_<n>.mat
@@ -36,8 +36,9 @@ optional Qt PPI and serial output (see `radar_receiver/README.md`).
  CA-CFAR on every range-Doppler map: 2-D, 1-D range or 1-D Doppler window (cfg.cfar.method),
          in a selectable range interval per sub-pulse, range window shifted inwards at the edges
  Pruning (local peaks + sidelobe blanking) -> plot extraction (azimuth peak picking)
- Tracking (optional): EKF, 2-D (range, azimuth) or 3-D (+ elevation)
- PPI display (updated while the antenna turns): plots / detections, tracks, block processing times
+ Tracking (optional): EKF, 2-D (range, azimuth) or 3-D (+ elevation), constant velocity or
+          constant acceleration, global nearest neighbour (GNN) association
+ PPI display (updated while the antenna turns): plots / detections, tracks, block, console and display times
 ```
 
 ## Quick start
@@ -54,6 +55,11 @@ cfg.io.saveRaw = false;             % recordings per PRI: raw ADC data and/or DD
 cfg.io.saveDdc = true;
 results = run_radar_sim(cfg);
 replay_ddc_udp;                     % send the DDC files over UDP with the PRI timing
+
+cfg = radar_config;                 % only the DDC files, in parallel (parfor, Parallel Computing Toolbox)
+cfg.io.saveRaw = false;
+cfg.ddc.outputRate_Hz = 4e6;        % DDC output at 2 MHz (default) or 4 MHz
+info = generate_ddc_files(cfg, 8);  % 8 workers -> output/ddc_pulses/ddc_<n>.mat
 
 cd tests
 run_all_tests                       % SNR budget, UDP, ghost and six-target tests
@@ -82,19 +88,20 @@ file was built for other values (for example after you change
 | `export_receiver_config.m` | writes the configuration of the C receiver (`radar_receiver/config/radar_config.bin`) |
 | `run_radar_sim.m` | main loop: generation, recording, DDC/streaming, processing, display |
 | `replay_ddc_udp.m` | sends recorded DDC files (`ddc_<n>.mat`) over UDP, unchanged, with the original PRI timing |
+| `generate_ddc_files.m` | simulates every PRI only up to the DDC output and saves the DDC files, the PRIs in parallel (`parfor`) |
 | `make_input_files.m` | default input .mat files |
 | `src/setup_radar.m` | derives the PRI timeline, NCO, DDC segments, matched filters, axes, CPI length, FFT length, CFAR factor ... |
 | `src/generate_rx_signal.m`, `clutter_init.m`, `clutter_signal.m`, `adc_sample.m` | signal generation |
 | `src/target_rcs.m`, `draw_target_rcs.m` | Swerling 1 target RCS (a new value every scan) |
-| `src/save_pulse_file.m`, `save_ddc_file.m` | raw ADC data / DDC output of a PRI to a .mat file |
-| `src/ddc.m`, `fir_decimate_valid.m` | two-stage DDC with I/Q mixer |
+| `src/save_pulse_file.m`, `save_ddc_file.m`, `pulse_header.m` | raw ADC data / DDC output of a PRI to a .mat file, its header |
+| `src/ddc.m`, `fir_decimate_valid.m`, `ddc_decimation.m` | two-stage DDC with I/Q mixer, decimation and filter file of the 2 / 4 MHz output |
 | `src/udp_sender_open.m`, `udp_make_packets.m`, `udp_send_pulse.m`, `udp_send_packets.m`, `udp_send_datagram.m`, `udp_sender_close.m`, `udp_receiver_open.m`, `udp_receive_pulse.m` | UDP streaming of the DDC output (sender and reference receiver) |
 | `src/digital_beamforming.m` | DBF |
 | `src/matched_filter.m`, `plot_range_profile.m` | pulse compression, range/delay/index plots |
 | `src/cpi_buffer_*.m` | circular CPI buffers |
 | `src/mti_filter.m`, `doppler_process.m` | clutter filter, Doppler processing |
 | `src/cfar_detect.m`, `cfar_alpha.m` | CA-CFAR (2-D, 1-D range, 1-D Doppler window) |
-| `src/track_setup.m`, `track_init.m`, `track_update.m`, `track_report.m` | EKF tracker (2-D / 3-D) |
+| `src/track_setup.m`, `track_init.m`, `track_update.m`, `track_report.m` | EKF tracker (2-D / 3-D, CV / CA model, GNN association) |
 | `src/prune_peaks.m`, `detection_reports.m`, `plot_extractor*.m` | pruning and plot extraction |
 | `src/ppi_init.m`, `ppi_update.m`, `ppi_callbacks.m` | interactive PPI display |
 | `src/detection_log_init.m`, `detection_log_add.m` | CFAR detections kept for the PPI |
@@ -109,7 +116,8 @@ file was built for other values (for example after you change
 | File | Variables |
 |---|---|
 | `antenna_pattern.mat` | `elementSpacing_m` (0.66 wavelength), `az_deg`, `azGain_dB` (one-way, 4.1 deg), `elRel_deg`, `elElemGain_dB` (element pattern vs. angle from broadside, 70 deg), `txElGain_dB`, `rxChannelGain_dBi`, `txGain_dBi` |
-| `ddc_filters.mat` | `h1` (stage 1 at 120 MHz, 70 taps), `h2` (stage 2 at 12 MHz, 66 taps): int16 with 13 fractional bits (coefficient = value / 8192), DC gain about 1 |
+| `ddc_filters.mat` | DDC output 2 MHz: `h1` (stage 1 at 120 MHz, 70 taps), `h2` (stage 2 at 12 MHz, 66 taps, pass +-0.5 MHz, stop above 1.5 MHz): int16 with 13 fractional bits (coefficient = value / 8192), DC gain about 1 |
+| `ddc_filters_4MHz.mat` | DDC output 4 MHz (`cfg.ddc.outputRate_Hz = 4e6`): the same `h1`, `h2` with 66 taps passing +-1 MHz and stopping above 2 MHz (the Nyquist frequency of 4 MHz) |
 | `dbf_matrix.mat` | `W` [21 x nElements] (beam = W * x), `beamEl_deg` |
 | `stagger_prf.mat` | `priVector_s` [K x 1], `mtiCoeffs` [K x L] (row k = weights of an MTI output whose first pulse has stagger position k; one row = fixed weights) |
 
@@ -201,7 +209,12 @@ there, at the same beam and Doppler, behind very strong far targets.
 * **DDC (fixed point):** the real line is `x .* cos(2*pi*30MHz*t)` and the
   imaginary line `x .* (-sin(2*pi*30MHz*t))` (NCO values with 15
   fractional bits). Each line then goes through h1 with decimation by 10
-  and h2 with decimation by 6. Both are valid convolutions in the time
+  and h2 with decimation by 6 (2 MHz output, `cfg.files.ddc`) or by 3
+  (4 MHz, `cfg.ddc.outputRate_Hz = 4e6`, filters `cfg.files.ddc4MHz`). With
+  4 MHz the range cells are 37.5 m instead of 75 m: twice the matched
+  filter taps and range cells (the CFAR windows count cells, so they cover
+  half the distance), and about twice the processing; the SNR after the
+  matched filter is the same. Both are valid convolutions in the time
   domain: the filter slides over the signal and is evaluated only at the
   kept output samples (`fir_decimate_valid.m`, equal to
   `conv(x,h,'valid')` followed by `y(1:D:end)`; no FFT). The filter
@@ -272,17 +285,32 @@ there, at the same beam and Doppler, behind very strong far targets.
   the `'2d'` and `'doppler'` methods do not give. Raise
   `cfg.cfar.short.minRange_m` (e.g. to 5 km) or the threshold there.
 * **Tracking (optional, `cfg.track`):** an extended Kalman filter on the
-  plots. State: position and velocity relative to the antenna (East, North,
-  up), nearly constant velocity with white-acceleration process noise
-  (`sigmaAccel_mps2` = 5 m/s^2 horizontal, `sigmaAccelZ_mps2` = 1 m/s^2
-  vertical). `cfg.track.dim`: `'3d'` measures range, azimuth and elevation
+  plots. State relative to the antenna (East, North, up), `cfg.track.model`:
+  `'cv'` (default) position and velocity, nearly constant velocity with
+  white-acceleration process noise (`sigmaAccel_mps2` = 5 m/s^2 horizontal,
+  `sigmaAccelZ_mps2` = 1 m/s^2 vertical); `'ca'` position, velocity and
+  acceleration, nearly constant acceleration with white-jerk process noise
+  (`sigmaJerk_mps3` = 0.5, `sigmaJerkZ_mps3` = 0.1 m/s^3) and the initial
+  acceleration std `maxAccel_mps2`/sqrt(3) (5 m/s^2: with three unknowns per
+  axis, three plots always fit a track, so a wide start lets false plots
+  confirm tracks). CA follows accelerating targets (4 m/s^2 in
+  `test_tracker`: 136 m instead of 394 m position error) and is less precise
+  than CV for targets flying straight. `cfg.track.dim`: `'3d'` measures range, azimuth and elevation
   (needs the elevation of the DBF), `'2d'` ground range and azimuth in the
   horizontal plane (slant range when the elevation is unknown: 1 element),
   `'auto'` (default) takes 3-D with DBF. The measurement h(x) is linearised
-  at the predicted state. Plot errors: 50 m, 0.3 deg, 0.5 deg. A plot is
-  associated with the track of smallest d^2 + ln|S| inside the chi-square
-  gate (`gateProb` 0.999); otherwise it starts a tentative track (zero
-  velocity, velocity std `maxSpeed_mps`/sqrt(3)). A track is confirmed after
+  at the predicted state. Plot errors: 50 m, 0.3 deg, 0.5 deg.
+  Association: global nearest neighbour (GNN). The plots are collected
+  until the antenna has turned `gnnSector_deg` (5 deg) without a new plot,
+  at most `gnnMaxSector_deg` (30 deg) after the first one. Then every
+  plot-track pair inside the chi-square gate (`gateProb` 0.999) costs
+  d^2 + ln|S|, and the assignment (each track at most one plot of the batch,
+  each plot at most one track) has the most pairs and, among those, the
+  smallest total cost (Hungarian algorithm). Unlike a nearest-neighbour
+  association plot by plot, two plots never update the same track, and
+  close targets keep their own tracks (`test_tracker`: two targets 200 m
+  apart). A plot without a track starts a tentative track (zero velocity
+  and acceleration, velocity std `maxSpeed_mps`/sqrt(3)). A track is confirmed after
   3 updates and deleted after more than 3 missed scans (tentative: 1). The
   tracks are in `results.tracker` and on the PPI.
 * **Pruning and plots:** only local maxima in beam x range x Doppler are
@@ -341,10 +369,12 @@ The panel on the right has:
   (PNG)**, which saves the window as it is now (file dialog, default name
   `ppi_<date>_<time>.png`).
 * **Mean time per PRI [us]** (bottom right, above the help): the mean
-  processing time per PRI of every block since the start: DBF, matched
-  filter, MTI (clutter filter, with the CPI buffer), Doppler (FFT and
-  non-coherent integration), CFAR of the selected method with the pruning,
-  plot extractor and tracking, and their total (`results.timing_us`).
+  time per PRI of every block since the start: DBF, matched filter, MTI
+  (clutter filter, with the CPI buffer), Doppler (FFT and non-coherent
+  integration), CFAR of the selected method with the pruning, plot
+  extractor and tracking, then the console output (progress lines) and the
+  display (the PPI updates, every `cfg.display.updateEvery` PRIs, averaged
+  over all PRIs), and their total (`results.timing_us`).
 
 The cursor position (range, azimuth, east/north) is shown under the buttons. In MATLAB the zoom, pan and data tip tools of the axes
 toolbar work as well; their data tips also list the plot values.
@@ -364,8 +394,29 @@ Both files also hold `hdr`: pulse number, scan number, time, antenna
 azimuth, PRI, stagger index, fs, IF, carrier, record start, pulse timing,
 DDC rate and the DDC samples of each sub-pulse. At 80 km instrumented range
 one PRI is about 9.5 MB of raw data (a full scan of 10 000 PRIs is about
-95 GB) and 342 kB of DDC output (3.4 GB per scan). Use
-`cfg.sim.sectors_deg` or a smaller `cfg.rx.maxRange_m` for long runs.
+95 GB) and 342 kB of DDC output (3.4 GB per scan; twice that with the
+4 MHz DDC output). Use `cfg.sim.sectors_deg` or a smaller
+`cfg.rx.maxRange_m` for long runs.
+
+### Generating the DDC files in parallel
+
+`generate_ddc_files(cfg, nWorkers)` runs only the first three steps of
+every PRI (signal generation, ADC, DDC) and saves the same `ddc_<n>.mat`
+files (and, with `cfg.io.saveRaw`, the raw data), with no processing after
+the DDC. The PRIs are independent of each other, so they run in a `parfor`
+loop over the workers of the Parallel Computing Toolbox (`nWorkers`
+workers; `0` = this MATLAB session; without the toolbox and in Octave the
+loop runs serially). The target RCS of every scan and the clutter map are
+drawn first, as in `run_radar_sim`; the noise of every pulse comes from its
+own random stream (substream = pulse number), so the files do not depend on
+the number of workers or on the order of the pulses. Without noise the
+files are bit-identical to those of `run_radar_sim` (`test_generate_ddc`).
+
+```matlab
+cfg = radar_config;  cfg.io.saveRaw = false;  cfg.sim.nScans = 3;
+info = generate_ddc_files(cfg, 8);                    % -> cfg.io.ddcFolder
+radar_receiver/build/radar_stream_send output/ddc_pulses --port 50000   % (shell) to the C receiver
+```
 
 ### Replaying the DDC files over UDP
 
@@ -466,14 +517,15 @@ budget.
 
 | Test | What it checks |
 |---|---|
-| `test_snr_budget(mode, pulse, type, nElements)` | measured vs. expected SNR after each block (LFM or P4, 1 or 48 elements) |
+| `test_snr_budget(mode, pulse, type, nElements, ddcRate)` | measured vs. expected SNR after each block (LFM or P4, 1 or 48 elements, 2 or 4 MHz DDC output) |
 | `test_udp_stream` | the DDC output of a PRI sent over UDP to localhost is received bit-exact, with its header |
 | `test_ddc_replay` | a short run saves only the DDC files (no raw data); `replay_ddc_udp` sends them to localhost bit-exact, with the PRI timing (median delay below 10 % of the PRI); when built, the C sender `radar_stream_send` sends them (saved with `-v6` and `-v7`) bit-exact as well |
+| `test_generate_ddc` | `generate_ddc_files`: without noise its DDC files equal those of `run_radar_sim` bit by bit (2 and 4 MHz, header included); with noise a pulse gives the same file whatever other pulses are generated (order and number of workers do not matter) |
 | `test_short_pulse_ghost` | a strong target at 65 km is detected, and its short-pulse echo in the long window gives no ghost plot |
 | `test_six_targets(mode, clutterOn, keepRaw)` | 6 targets (0.5 - 10 m^2 mean RCS, Swerling 1, 8 - 48 km, up to 290 m/s, around the radar) are detected with the right range, azimuth, elevation and ambiguous velocity, with at most 2 false plots; one raw file per PRI, named by the pulse number |
 | `test_ppi_interactive` | PPI interaction: data tips, zoom around the cursor, pan, keys, filters, pinned tips, pause, clear, PNG; detection display (modes, arcs, data tips, filters); CFAR threshold field (Apply, hand-over through `ppi_update`, invalid input, Default, Pfa); tracks (triangles, data tip, checkbox); block processing times |
 | `test_cfar` | the three CFAR methods on exponential noise: false alarm rate 1e-3 in the interior and at the range edges (shifted window), targets in the first and last range cell detected, only the tested range interval is tested |
-| `test_tracker` | EKF tracker on synthetic plots of the six targets over 5 scans with false plots, 3-D and 2-D: one confirmed track per target, close to it, no false track; when built, the C tracker gives the same track updates |
+| `test_tracker` | EKF tracker on synthetic plots of the six targets over 5 scans with false plots, 3-D and 2-D, CV and CA: one confirmed track per target, close to it, no false track; GNN with two targets 200 m apart (nearest neighbour would merge them); CA against CV on a target accelerating at 4 m/s^2; when built, the C tracker gives the same track updates |
 | `test_c_receiver(mode, ..., cfarMethod)` | the six-target scenario streamed over UDP to the C receiver (`radar_receiver/`): its plots and track updates must match MATLAB; the recorded stream is replayed to check repeatability and speed |
 
 Latest results (Octave 8.4): all SNR budget checks agree within 0.7 dB.

@@ -20,7 +20,8 @@ function ppi = ppi_init(sys)
 %   data, the true targets, range rings, plot labels and the antenna; filters
 %   by SNR and age; shows or hides the tracks (hollow triangles: confirmed
 %   magenta, tentative gray, with a velocity leader); shows the mean
-%   processing time per PRI of every block [us]; sets the CFAR threshold [dB]
+%   time per PRI of every block, of the console output and of the display
+%   [us]; sets the CFAR threshold [dB]
 %   of the selected CFAR method of the running processing
 %   (Apply; Default = the value from the method's Pfa); clears the display; and
 %   saves a screenshot (PNG). The MATLAB zoom/pan/data tip tools of the axes
@@ -175,7 +176,7 @@ helpH = 0.085;
 mono = 'FixedWidth';                                       % MATLAB's monospaced font
 if exist('OCTAVE_VERSION', 'builtin'), mono = 'Monospace'; end
 h.timing = uicontrol(fig, 'Style', 'text', 'String', '', 'Units', 'normalized', ...
-    'Position', [x0 0.015+helpH w 0.16], 'BackgroundColor', [0.08 0.08 0.08], ...
+    'Position', [x0 0.015+helpH w 0.19], 'BackgroundColor', [0.08 0.08 0.08], ...
     'ForegroundColor', [0.85 0.85 0.85], 'HorizontalAlignment', 'left', 'FontName', mono, 'FontSize', 8);
 uicontrol(fig, 'Style', 'text', 'Units', 'normalized', 'Position', [x0 0.01 w helpH], ...
     'BackgroundColor', 'k', 'ForegroundColor', [0.6 0.6 0.6], 'HorizontalAlignment', 'left', ...

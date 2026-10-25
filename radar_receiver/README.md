@@ -239,7 +239,12 @@ The processing is written for x86 CPUs with AVX2:
   from partial sums, and Doppler sums are running sums. The noise floor
   median uses a histogram.
 * All stages are split over threads with OpenMP, and all buffers are
-  allocated once.
+  allocated once. A loop never gets more threads than it has work items
+  (beams, cell blocks): with a single element (no DBF) the loops over beams
+  (matched filter, CFAR) run in the processing thread. Otherwise every idle
+  thread has to be woken and reach the closing barrier; with the PPI and the
+  UDP input on the other cores that wait made the single-beam matched filter
+  take more than 1 ms per PRI instead of about 0.1 ms.
 
 Measured processing time per PRI (replay of the six-target streams of
 `tests/test_c_receiver.m`: 48 channels, 21 beams, both sub-pulses, 273 +

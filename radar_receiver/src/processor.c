@@ -139,6 +139,17 @@ static int thread_num(void)
 #endif
 }
 
+/* Threads for a parallel loop of nWork items: no more than there are items
+ * (and no parallel region for one item: if(nWork > 1)).
+ * Every thread of a team has to be woken and reach the closing barrier even
+ * without work; when the other cores are busy (display, UDP input) that wait
+ * costs more than the work. With one beam (no DBF) the loops over beams run
+ * in the calling thread. */
+static int team_size(int nThreads, int nWork)
+{
+    return nWork < nThreads ? (nWork > 1 ? nWork : 1) : nThreads;
+}
+
 /* Fast convolution of the matched filter: FFT length and the FFT of the taps.
  * It is used when its estimated time is shorter than that of the direct
  * convolution (which is split over the threads beam by beam; the FFTs of
@@ -151,8 +162,8 @@ static int mf_fft_init(const RadarConfig *cfg, const PulseConfig *pc, PulseState
     int log2N = 0;
     while ((1 << log2N) < N) log2N++;
     const int nChunks = (cfg->nBeams + MF_LANES - 1) / MF_LANES;
-    const double direct = 0.3 * pc->nTaps * pc->nRange * cfg->nBeams / nThreads;
-    const double fast = 0.6 * ((double)N * log2N + N) * nChunks * MF_LANES / (nThreads < nChunks ? nThreads : nChunks);
+    const double direct = 0.3 * pc->nTaps * pc->nRange * cfg->nBeams / team_size(nThreads, cfg->nBeams);
+    const double fast = 0.6 * ((double)N * log2N + N) * nChunks * MF_LANES / team_size(nThreads, nChunks);
     s->mfFft = method == MF_FFT || (method == MF_AUTO && fast < direct);
     if (!s->mfFft) return 0;
     s->mfN = N;
@@ -349,16 +360,17 @@ static void load_segment(const RadarConfig *cfg, const PulseConfig *pc, const Pr
 
 /* beam b = sum over channels of W[b][ch] * x[ch]  (or the single channel).
  * Three beams are updated per pass over a channel (fewer loads). */
-static void beamform(const RadarConfig *cfg, const PulseConfig *pc, PulseState *s)
+static void beamform(const RadarConfig *cfg, const PulseConfig *pc, PulseState *s, int nThreads)
 {
     const int n = pc->ddcCount, nB = cfg->nBeams, nCh = cfg->nCh;
+    (void)nThreads;                                         /* without OpenMP */
     if (!cfg->dbfEnabled) {
         memcpy(s->beamRe, s->segRe, sizeof(float) * n);
         memcpy(s->beamIm, s->segIm, sizeof(float) * n);
         return;
     }
     const int nGroups = (nB + 2) / 3;
-    #pragma omp parallel for schedule(static)
+    #pragma omp parallel for schedule(static) num_threads(team_size(nThreads, nGroups)) if(nGroups > 1)
     for (int g = 0; g < nGroups; g++) {
         const int b0 = 3 * g, nb = nB - b0 < 3 ? nB - b0 : 3;
         float *y0r = s->beamRe + (size_t)b0 * n, *y0i = s->beamIm + (size_t)b0 * n;
@@ -400,11 +412,12 @@ static void beamform(const RadarConfig *cfg, const PulseConfig *pc, PulseState *
  * mfN >= ddcCount equals the linear one at the valid outputs r + nTaps - 1.
  * Inverse FFT = conj(FFT(conj(.))) (1/mfN is in the taps). The beams are
  * processed in chunks of MF_LANES that are the fast index of the FFT rows. */
-static void matched_filter_fft(const RadarConfig *cfg, const PulseConfig *pc, PulseState *s, int slot)
+static void matched_filter_fft(const RadarConfig *cfg, const PulseConfig *pc, PulseState *s, int slot, int nThreads)
 {
     const int N = s->mfN, n = pc->ddcCount, L = pc->nTaps, nR = s->nR, nB = cfg->nBeams;
     const int *rev = s->mfPlan.bitrev;
-    #pragma omp parallel for schedule(static)
+    (void)nThreads;                                         /* without OpenMP */
+    #pragma omp parallel for schedule(static) num_threads(team_size(nThreads, s->mfChunks)) if(s->mfChunks > 1)
     for (int c = 0; c < s->mfChunks; c++) {
         const int b0 = c * MF_LANES, nb = (nB - b0 < MF_LANES) ? nB - b0 : MF_LANES;
         float *Xr = s->mfWork + (size_t)c * 4 * N * MF_LANES;
@@ -442,14 +455,14 @@ static void matched_filter_fft(const RadarConfig *cfg, const PulseConfig *pc, Pu
 
 /* Valid convolution of every beam with the matched filter, written into the
  * CPI buffer slot: y[r] = sum_j h[j] * x[r + nTaps - 1 - j]. */
-static void matched_filter(const RadarConfig *cfg, const PulseConfig *pc, PulseState *s, int slot)
+static void matched_filter(const RadarConfig *cfg, const PulseConfig *pc, PulseState *s, int slot, int nThreads)
 {
     if (s->mfFft) {
-        matched_filter_fft(cfg, pc, s, slot);
+        matched_filter_fft(cfg, pc, s, slot, nThreads);
         return;
     }
     const int n = pc->ddcCount, L = pc->nTaps, nR = s->nR;
-    #pragma omp parallel for schedule(static)
+    #pragma omp parallel for schedule(static) num_threads(team_size(nThreads, cfg->nBeams)) if(cfg->nBeams > 1)
     for (int b = 0; b < cfg->nBeams; b++) {
         const float *restrict xr = s->beamRe + (size_t)b * n, *restrict xi = s->beamIm + (size_t)b * n;
         float *restrict yr = s->cpiRe + (size_t)slot * s->nCells + (size_t)b * nR;
@@ -509,7 +522,7 @@ static void doppler(const Processor *p, PulseState *s)
     const int nBlocks = (s->nCells + CELL_BLOCK - 1) / CELL_BLOCK;
     const float scale = 1.0f / nRows;
 
-    #pragma omp parallel num_threads(p->nThreads)
+    #pragma omp parallel num_threads(team_size(p->nThreads, nBlocks)) if(nBlocks > 1)
     {
         float *xr = p->scratch[thread_num()].xr;
         float *xi = p->scratch[thread_num()].xi;
@@ -630,7 +643,7 @@ static void cfar(const Processor *p, PulseState *s, const PulseConfig *pc)
     const int n = hi - lo + 1;
     const double *restrict cntInv = s->cntInv;
 
-    #pragma omp parallel num_threads(p->nThreads)
+    #pragma omp parallel num_threads(team_size(p->nThreads, nB)) if(nB > 1)
     {
         Scratch *w = &p->scratch[thread_num()];
         #pragma omp for schedule(dynamic)
@@ -829,7 +842,7 @@ static void prune_and_report(const Processor *p, int pulse, PulseState *s)
     int *beams = xcalloc(nB, sizeof(int)), nNeed = 0;
     for (int i = 0; i < n; i++)
         if (keep[i] && floors[cells[i].b] == 0) { floors[cells[i].b] = -1; beams[nNeed++] = cells[i].b; }
-    #pragma omp parallel for schedule(dynamic) num_threads(p->nThreads)
+    #pragma omp parallel for schedule(dynamic) num_threads(team_size(p->nThreads, nNeed)) if(nNeed > 1)
     for (int j = 0; j < nNeed; j++)
         floors[beams[j]] = beam_noise_floor(cfg, s, beams[j], &p->scratch[thread_num()]);
     free(beams);
@@ -968,11 +981,11 @@ void processor_process(Processor *p, const PriData *pri, const ProcessorCallback
 
         /* fast time into the next CPI slot */
         load_segment(cfg, pc, pri, s);
-        beamform(cfg, pc, s);
+        beamform(cfg, pc, s, p->nThreads);
         p->timing.dbf_ms += elapsed_ms(&t0);
         const int slot = (s->last + 1) % s->nSlots;
         s->mfLast = (s->mfLast + 1) % cfg->nMtiTaps;
-        matched_filter(cfg, pc, s, s->mfLast);
+        matched_filter(cfg, pc, s, s->mfLast, p->nThreads);
         s->last = slot;
         s->staggerIdx[slot] = pri->staggerIndex >= 1 && pri->staggerIndex <= cfg->nStagger ? pri->staggerIndex : 1;
         s->az[slot] = pri->az_deg;

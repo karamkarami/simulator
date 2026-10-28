@@ -145,9 +145,12 @@ static int16_t sat16(double v)
     return (int16_t)(v > 32767 ? 32767 : v < -32768 ? -32768 : v);
 }
 
-/* A target of the long pulse: echo = transmitted waveform (from the matched
- * filter taps), steered to one elevation beam, moving with vr. Noise 16 LSB rms
- * per component like the simulator's DDC output. */
+/* A target of the long pulse: echo = transmitted waveform (the pulse of the
+ * configuration, or else from the matched filter taps; scaled to the energy
+ * of the unit-norm taps), steered to one elevation beam, moving with vr. With
+ * a mismatch filter the echo starts mfShift samples after the start of the
+ * target cell (its range axis). Noise 16 LSB rms per component like the
+ * simulator's DDC output. */
 static int test_end_to_end(const char *configPath, int mfDirect, double threshold_dB, Detection *plotOut)
 {
     RadarConfig cfg;
@@ -162,10 +165,19 @@ static int test_end_to_end(const char *configPath, int mfDirect, double threshol
     printf("config: %d channels, %d beams, %d DDC samples, CPI %d, nfft %d, %s PRF, %s matched filter\n",
            cfg.nCh, cfg.nBeams, cfg.nDdc, cfg.cpiLength, cfg.nfft, cfg.staggered ? "staggered" : "fixed",
            mfDirect ? "direct" : "automatic");
+    for (int i = 0; i < N_PULSES; i++)
+        printf("  %s pulse: %s, %s filter, %d taps, %d range cells\n", i == PULSE_SHORT ? "short" : "long",
+               cfg.pulse[i].waveform == WAVE_PHASE_CODE ? "phase code" : "LFM",
+               cfg.pulse[i].compression == COMPRESSION_MISMATCH ? "mismatch" : "matched", cfg.pulse[i].nTaps,
+               cfg.pulse[i].nRange);
 
     const PulseConfig *pc = &cfg.pulse[PULSE_LONG];
     const int beam = cfg.nBeams > 4 ? cfg.nBeams / 3 : 0;
     const int r0 = pc->nRange / 2;                      /* range cell of the target */
+    const int nEcho = pc->nPulse ? pc->nPulse : pc->nTaps;
+    double pulseNorm = 0.0;
+    for (int m = 0; m < pc->nPulse; m++) pulseNorm += pc->pulseRe[m] * pc->pulseRe[m] + pc->pulseIm[m] * pc->pulseIm[m];
+    pulseNorm = pulseNorm > 0.0 ? sqrt(pulseNorm) : 1.0;
     const double vr = 7.3;                              /* m/s, inside the unambiguous interval */
     const double pri_s = 1e-3, amp = 30.0;              /* amplitude per element (LSB)          */
     const int nPulses = cfg.cpiLength + 60, nWith = cfg.cpiLength + 30;
@@ -207,13 +219,14 @@ static int test_end_to_end(const char *configPath, int mfDirect, double threshol
         for (size_t i = 0; i < 2 * (size_t)cfg.nCh * cfg.nDdc; i++) pri.iq[i] = sat16(16.0 * gauss());
         if (k < nWith) {
             const double ph = -4 * PI * vr * pri.time_s / pc->lambda_m;   /* baseband phase -4*pi*R/lambda */
-            const int first = pc->ddcFirst + r0;
+            const int first = pc->ddcFirst + r0 + pc->mfShift;
             for (int ch = 0; ch < cfg.nCh; ch++) {
                 const double cr = amp * (steerRe[ch] * cos(ph) - steerIm[ch] * sin(ph));
                 const double ci = amp * (steerRe[ch] * sin(ph) + steerIm[ch] * cos(ph));
-                for (int m = 0; m < pc->nTaps; m++) {
-                    /* waveform s[m] = conj(h[nTaps-1-m]) / |h|max */
-                    const double sr = pc->tapsRe[pc->nTaps - 1 - m], si = -pc->tapsIm[pc->nTaps - 1 - m];
+                for (int m = 0; m < nEcho; m++) {
+                    /* waveform s[m]: the pulse, or conj(h[nTaps-1-m]) */
+                    const double sr = pc->nPulse ? pc->pulseRe[m] / pulseNorm : pc->tapsRe[pc->nTaps - 1 - m];
+                    const double si = pc->nPulse ? pc->pulseIm[m] / pulseNorm : -pc->tapsIm[pc->nTaps - 1 - m];
                     int16_t *v = pri.iq + 2 * ((size_t)ch * cfg.nDdc + first + m);
                     v[0] = sat16(v[0] + cr * sr - ci * si);
                     v[1] = sat16(v[1] + cr * si + ci * sr);

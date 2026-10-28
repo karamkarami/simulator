@@ -1,7 +1,7 @@
-function ok = test_snr_budget(prfMode, pulseName, waveType, nElements, ddcRate_Hz)
+function ok = test_snr_budget(prfMode, pulseName, waveType, nElements, ddcRate_Hz, compression)
 %TEST_SNR_BUDGET  Compare the expected SNR of every processing block with a measurement.
 %
-%   ok = TEST_SNR_BUDGET(prfMode, pulseName, waveType, nElements, ddcRate_Hz) places one target in the middle
+%   ok = TEST_SNR_BUDGET(prfMode, pulseName, waveType, nElements, ddcRate_Hz, compression) places one target in the middle
 %   of the coverage of sub-pulse pulseName ('short' or 'long'), sweeps the
 %   antenna over it for one CPI and runs the processing chain twice:
 %     - signal only (no thermal noise, no leakage, no ADC noise, no
@@ -11,13 +11,16 @@ function ok = test_snr_budget(prfMode, pulseName, waveType, nElements, ddcRate_H
 %   blocks is compared with snr_budget.m. prfMode is 'fixed' or 'staggered',
 %   waveType is 'lfm' (default) or 'phasecode', nElements is the number of
 %   receive elements (default 48; 1 = no beamforming), ddcRate_Hz the DDC
-%   output rate (default 2e6; 4e6 = the 4 MHz stage 2).
+%   output rate (default 2e6; 4e6 = the 4 MHz stage 2), compression the
+%   pulse compression filter of a phase code ('matched' (default) or
+%   'mismatch').
 
 if nargin < 1, prfMode = 'fixed'; end
 if nargin < 2, pulseName = 'long'; end
 if nargin < 3, waveType = 'lfm'; end
 if nargin < 4, nElements = 48; end
 if nargin < 5, ddcRate_Hz = 2e6; end
+if nargin < 6, compression = 'matched'; end
 root = fileparts(fileparts(mfilename('fullpath')));
 addpath(root, fullfile(root, 'src'));
 rng(7);
@@ -27,6 +30,7 @@ cfg.prf.mode = prfMode;
 cfg.wave.(pulseName).type = waveType;
 cfg.ant.nElements = nElements;
 cfg.ddc.outputRate_Hz = ddcRate_Hz;
+cfg.wave.(pulseName).compression = compression;
 cfg.rx.maxRange_m = 50e3;
 cfg.clutter.enable = false;
 sys = setup_radar(cfg);
@@ -87,7 +91,8 @@ m.doppler = pk / mean(pN(beam, :, kd));
 blocks = {'adc', 'ddc', 'dbf', 'mf', 'mti', 'doppler'};
 tol    = [0.5, 0.5, 0.5, 1.0, 1.0, 1.5];               % [dB]
 fprintf('\nSNR budget check: %s PRF, %s pulse (%s), %d element(s), DDC %g MHz, R = %.1f km, el = %.1f deg, vr = %.0f m/s, beam %d\n', ...
-    prfMode, pulseName, waveType, nElements, ddcRate_Hz/1e6, R0/1e3, el, vr, beam);
+    prfMode, pulseName, [waveType ternary(strcmp(compression, 'mismatch'), ', mismatch filter', '')], nElements, ...
+    ddcRate_Hz/1e6, R0/1e3, el, vr, beam);
 fprintf('%-8s %10s %10s %8s\n', 'Block', 'Expected', 'Measured', 'Diff');
 ok = true;
 for i = 1:numel(blocks)

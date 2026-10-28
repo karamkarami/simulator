@@ -100,10 +100,33 @@ sys.ddc.noiseBw_Hz = fs * sum(sys.ddc.hEq.^2);                % complex noise ba
 % receive window. While a pulse is transmitted the receiver sees the
 % transmitter leakage (these samples are not used by the processing).
 names = {'short', 'long'};
+codes = [];                                                   % phase codes and mismatch filters
+if any(strcmpi({cfg.wave.short.type, cfg.wave.long.type}, 'phasecode'))
+    nChips = [round(cfg.wave.short.width_s / cfg.wave.short.chip_s), round(cfg.wave.long.width_s / cfg.wave.long.chip_s)];
+    codes = load_input(cfg, 'phaseCode', struct('shortChips', nChips(1), 'longChips', nChips(2)));
+end
 for i = 1:2
     wv = cfg.wave.(names{i});
     wv.name     = names{i};
     wv.lambda_m = sys.lambda;                                 % both sub-pulses are on fc
+    wv.compression = lower(wv.compression);
+    if strcmpi(wv.type, 'phasecode')
+        wv.code = codes.([names{i} 'Code'])(:);
+        if numel(wv.code) ~= round(wv.width_s / wv.chip_s)
+            error('The %s code of %s has %d chips, but width_s/chip_s = %d.', names{i}, cfg.files.phaseCode, ...
+                  numel(wv.code), round(wv.width_s / wv.chip_s));
+        end
+        if strcmp(wv.compression, 'mismatch')
+            wv.mismatch = codes.([names{i} 'Mismatch'])(:);
+            wv.mismatchRate_Hz = 1 / wv.chip_s;                % one coefficient per chip (default)
+            if isfield(codes, [names{i} 'MismatchRate_Hz'])
+                wv.mismatchRate_Hz = codes.([names{i} 'MismatchRate_Hz']);
+            end
+        end
+    end
+    % Pulse compression filter (unit noise gain) and the samples by which its
+    % peak comes earlier than that of the matched filter
+    [wv.mfTaps, wv.mfShift] = compression_filter(wv, cfg, sys);
     sys.wave.(names{i}) = wv;
 end
 ws = sys.wave.short;
@@ -115,7 +138,9 @@ filterSpan    = (L1-1)/fs + (L2-1)/fs1;                       % input span of on
 sys.rxStart_s = 0;                                            % the record starts with the PRI
 % (the CFAR tests the range cells up to the end of the window: its range
 % window is shifted inwards at the edges, so no extra cells are needed)
-rxEnd = wl.tTx_s + wl.width_s + 2*cfg.rx.maxRange_m/c + filterSpan + 2/sys.fsOut;
+% a mismatch filter also needs the samples after the end of the echo
+mfTail = max(0, numel(wl.mfTaps) - round(wl.width_s*sys.fsOut) - wl.mfShift) / sys.fsOut;
+rxEnd = wl.tTx_s + wl.width_s + 2*cfg.rx.maxRange_m/c + mfTail + filterSpan + 2/sys.fsOut;
 if rxEnd > min(sys.pri)
     error(['Receive window (%.1f us) does not fit in the shortest PRI (%.1f us): reduce ', ...
            'cfg.rx.maxRange_m or start the long pulse earlier.'], rxEnd*1e6, min(sys.pri)*1e6);
@@ -137,7 +162,7 @@ k = (0:sys.nDdc-1)';
 firstAdc = k*D2*D1 + 1;
 lastAdc  = (k*D2 + L2 - 1)*D1 + L1;
 
-%% Receive interval, DDC segment, matched filter and delay / range axes of every sub-pulse
+%% Receive interval, DDC segment and delay / range axes of every sub-pulse
 rxInterval.short = [ws.tTx_s + ws.width_s, wl.tTx_s];         % [start end) of the receive interval
 rxInterval.long  = [wl.tTx_s + wl.width_s, inf];
 for i = 1:2
@@ -145,26 +170,19 @@ for i = 1:2
     % DDC samples whose whole input window lies inside the receive interval of this sub-pulse
     iv = rxInterval.(names{i});
     wv.ddcIdx = find(sys.tAdc(firstAdc) >= iv(1) & sys.tAdc(lastAdc) < iv(2)).';
-    % Matched filter (Taylor window for LFM), unit noise gain
-    Lp  = round(wv.width_s * sys.fsOut);                      % matched filter length [samples]
-    if numel(wv.ddcIdx) < Lp + 2*(sys.cfar.guardRange + sys.cfar.trainRange) + 1
-        error(['The %s-pulse receive interval is too short for its matched filter and the CFAR ', ...
+    L = numel(wv.mfTaps);                                     % compression filter length [samples]
+    if numel(wv.ddcIdx) < L + 2*(sys.cfar.guardRange + sys.cfar.trainRange) + 1
+        error(['The %s-pulse receive interval is too short for its compression filter and the CFAR ', ...
                'window: move the long pulse later or increase cfg.rx.maxRange_m.'], wv.name);
     end
-    ref = waveform_envelope(wv, ((0:Lp-1)' + 0.5) / sys.fsOut);  % mid-sample times (not on chip edges)
-    if strcmpi(wv.type, 'lfm')
-        win = taylor_window(Lp, cfg.proc.taylorNbar, cfg.proc.taylorSll_dB);
-    else
-        win = ones(Lp, 1);
-    end
-    h = conj(flipud(ref .* win));
-    wv.mfTaps = (h / norm(h)).';                              % row vector
-    % Output k of the valid convolution correlates the reference with the
-    % segment starting at sample k. The reference holds the pulse at the
-    % mid-sample times, so output k peaks for an echo that starts half a
-    % sample before tDdc(k).
-    wv.nRange  = numel(wv.ddcIdx) - Lp + 1;
-    wv.delay_s = sys.tDdc(wv.ddcIdx(1:wv.nRange)).' - 0.5/sys.fsOut - wv.tTx_s;   % delay axis [s]
+    % Output k of the valid convolution of the matched filter correlates the
+    % reference with the segment starting at sample k. The reference holds
+    % the pulse at the mid-sample times, so output k peaks for an echo that
+    % starts half a sample before tDdc(k). The peak of a mismatch filter
+    % comes mfShift samples earlier: output k belongs to the echo starting at
+    % sample k + mfShift.
+    wv.nRange  = numel(wv.ddcIdx) - L + 1;
+    wv.delay_s = sys.tDdc(wv.ddcIdx((1:wv.nRange) + wv.mfShift)).' - 0.5/sys.fsOut - wv.tTx_s;   % delay axis [s]
     wv.range_m = c * wv.delay_s / 2;                              % range axis [m]
     sys.wave.(names{i}) = wv;
 end
@@ -178,7 +196,7 @@ nKeep = find(ws.range_m < handover_m, 1, 'last') + oR;        % + cells only use
 if nKeep < ws.nRange
     Lp = numel(ws.mfTaps);
     ws.nRange  = nKeep;
-    ws.ddcIdx  = ws.ddcIdx(1:nKeep + Lp - 1);                 % the matched filter then gives nKeep cells
+    ws.ddcIdx  = ws.ddcIdx(1:nKeep + Lp - 1);                 % the compression filter then gives nKeep cells
     ws.delay_s = ws.delay_s(1:nKeep);
     ws.range_m = ws.range_m(1:nKeep);
     sys.wave.short = ws;
@@ -314,6 +332,64 @@ end
 
 %% Tracking
 sys.track = track_setup(cfg, sys);
+end
+
+function [taps, shift] = compression_filter(wv, cfg, sys)
+% Pulse compression filter of a sub-pulse at the DDC rate (row vector, unit
+% noise gain) and the number of samples by which its peak comes earlier than
+% that of the matched filter.
+%   matched  : conj(flip(reference)), the reference sampled at the mid-sample
+%              times (Taylor window for LFM); shift 0
+%   mismatch : phase code only: every coefficient of wv.mismatch (rate
+%              wv.mismatchRate_Hz, by default one per chip) is held for the
+%              DDC samples of its period (with one per chip: a chip-matched
+%              sum followed by the chip-rate filter). shift: from the peaks of
+%              both filters for the pulse after the DDC filters (the filter
+%              may have been designed on that pulse or on the ideal chips)
+fsOut = sys.fsOut;
+Lp  = round(wv.width_s * fsOut);                              % pulse length [samples]
+ref = waveform_envelope(wv, ((0:Lp-1)' + 0.5) / fsOut);       % mid-sample times (not on chip edges)
+win = ones(Lp, 1);
+if strcmpi(wv.type, 'lfm')
+    win = taylor_window(Lp, cfg.proc.taylorNbar, cfg.proc.taylorSll_dB);
+end
+hMatched = conj(flipud(ref .* win));
+switch wv.compression
+    case 'matched'
+        h = hMatched;
+        shift = 0;
+    case 'mismatch'
+        if ~strcmpi(wv.type, 'phasecode')
+            error('cfg.wave.%s.compression = ''mismatch'' needs a phase code (type ''phasecode'').', wv.name);
+        end
+        spc = fsOut / wv.mismatchRate_Hz;                     % DDC samples per filter coefficient
+        if abs(spc - round(spc)) > 1e-9 || spc < 0.5
+            error(['The %s-pulse mismatch filter (%g MHz) does not fit the DDC output rate (%g MHz): ' ...
+                   'the rate must be a whole multiple of the filter rate.'], wv.name, ...
+                  wv.mismatchRate_Hz/1e6, fsOut/1e6);
+        end
+        h = kron(wv.mismatch(:), ones(round(spc), 1));
+        % valid output index of the peak = echo start + peak of the full
+        % convolution - (filter length - 1), for both filters
+        y = ddc_pulse(sys, wv);                               % the pulse after the DDC filters
+        qMatched = peak_position(conv(y, hMatched));
+        q = peak_position(conv(y, h));
+        shift = round((numel(h) - 1 - q) - (Lp - 1 - qMatched));
+    otherwise
+        error('cfg.wave.%s.compression must be ''matched'' or ''mismatch''.', wv.name);
+end
+taps = (h / norm(h)).';
+end
+
+function q = peak_position(y)
+% Position (0-based, with parabolic interpolation) of the largest |y|.
+a = abs(y(:));
+[~, k] = max(a);
+q = k - 1;
+if k > 1 && k < numel(a)
+    d = a(k-1) - 2*a(k) + a(k+1);
+    if d < 0, q = q + 0.5*(a(k-1) - a(k+1)) / d; end
+end
 end
 
 function w = cfar_window(cfg)

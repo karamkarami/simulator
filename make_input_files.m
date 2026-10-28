@@ -1,7 +1,7 @@
 function make_input_files(cfg, which)
 %MAKE_INPUT_FILES  Create the default input .mat files of the simulator.
 %
-%   MAKE_INPUT_FILES(cfg) writes the five input files named in radar_config.m:
+%   MAKE_INPUT_FILES(cfg) writes the six input files named in radar_config.m:
 %     antenna_pattern.mat : element spacing, azimuth pattern, elevation element
 %                           pattern, transmit elevation pattern, peak gains
 %     ddc_filters.mat     : low-pass FIR filters of the two DDC stages (h1, h2) for
@@ -11,8 +11,11 @@ function make_input_files(cfg, which)
 %     dbf_matrix.mat      : elevation DBF matrix W [nBeams x cfg.ant.nElements]
 %                           and beam elevations
 %     stagger_prf.mat     : staggered PRI vector and the matching MTI weights
+%     phase_code.mat      : phase codes of the short and the long sub-pulse
+%                           (P4, width_s/chip_s chips) and their mismatch
+%                           filters (one coefficient per chip)
 %   MAKE_INPUT_FILES(cfg, which) writes only one of them: which = 'antenna',
-%   'ddc', 'ddc4MHz', 'dbf' or 'stagger'.
+%   'ddc', 'ddc4MHz', 'dbf', 'stagger' or 'phaseCode'.
 %
 %   Every default file stores in 'madeFor' the configuration values it was
 %   built for. setup_radar.m rebuilds a default file when they no longer match
@@ -109,6 +112,36 @@ if doAll || strcmpi(which, 'stagger')
         mtiCoeffs(k, :) = 2 * [T2, -(T1 + T2), T1] / (T1 + T2);
     end
     save(cfg.files.stagger, 'priVector_s', 'mtiCoeffs', '-v7');
+end
+
+%% 5) Phase codes (P4) and their mismatch filters
+% shortCode, longCode [nChips x 1]: complex chip values, the first chip is
+% sent first. shortMismatch, longMismatch [nChips + 2*pad x 1]: mismatch
+% filter with one coefficient per chip, as a convolution filter
+% (output = conv(code, filter)); its main peak is in the middle of the full
+% convolution. pad = min(5, nChips/2) chips on each side keeps the range
+% handover between the sub-pulses (with a longer filter the short pulse
+% ends before the long pulse starts) and the receive window of the
+% staggered PRF; more padding gives little here (25 chips: PSL -25.9 dB with
+% 5, -26.0 dB with 10). The filter minimises the peak sidelobe for a unit
+% main peak (mismatch_filter.m). A filter with
+% another sample rate (e.g. designed at the DDC output rate on the received
+% pulse) can be given with <pulse>MismatchRate_Hz (setup_radar.m).
+if doAll || strcmpi(which, 'phaseCode')
+    names = {'short', 'long'};
+    madeFor = struct();
+    for i = 1:2
+        wv = cfg.wave.(names{i});
+        N = round(wv.width_s / wv.chip_s);
+        m = (0:N-1)';
+        code = exp(1j*(pi*m.^2/N - pi*m));            % P4 polyphase code
+        pad = min(5, floor(N/2));
+        out.([names{i} 'Code']) = code;
+        out.([names{i} 'Mismatch']) = mismatch_filter(code, pad);
+        madeFor.([names{i} 'Chips']) = N;
+    end
+    out.madeFor = madeFor;
+    save(cfg.files.phaseCode, '-struct', 'out', '-v7');
 end
 
 fprintf('Default input file(s) "%s" written to %s\n', which, folder);

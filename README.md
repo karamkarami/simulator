@@ -29,7 +29,8 @@ optional Qt PPI and serial output (see `radar_receiver/README.md`).
         |                             (-> radar_receiver/, the same processing in C)
         v  split in time: short-pulse samples | long-pulse samples
  DBF (21 x 48 matrix, off for 1 element)                   -> [21 beams x nSamples] per sub-pulse
- Matched filter (valid convolution, Taylor for LFM)        -> [21 beams x nRange]   (range/delay axes)
+ Pulse compression (valid convolution): matched filter (Taylor for LFM) or, for a phase code,
+         the mismatch filter of inputs/phase_code.mat      -> [21 beams x nRange]   (range/delay axes)
  CPI buffer (circular, the pulses of one CPI)              -> [21 x nRange x 114], short and long
  MTI  fixed PRF: 3-pulse canceller | staggered: weights from file
  Doppler fixed: Hamming + FFT 128 (next power of 2 of 114) | staggered: de-interleave, Hamming, FFT 32, NCI
@@ -90,7 +91,8 @@ file was built for other values (for example after you change
 | `replay_ddc_udp.m` | sends recorded DDC files (`ddc_<n>.mat`) over UDP, unchanged, with the original PRI timing |
 | `generate_ddc_files.m` | simulates every PRI only up to the DDC output and saves the DDC files, the PRIs in parallel (`parfor`) |
 | `make_input_files.m` | default input .mat files |
-| `src/setup_radar.m` | derives the PRI timeline, NCO, DDC segments, matched filters, axes, CPI length, FFT length, CFAR factor ... |
+| `src/setup_radar.m` | derives the PRI timeline, NCO, DDC segments, pulse compression filters (matched / mismatch), axes, CPI length, FFT length, CFAR factor ... |
+| `src/mismatch_filter.m`, `ddc_pulse.m` | mismatch filter with the smallest peak sidelobe for a code or a sampled pulse; the pulse after the DDC filters |
 | `src/generate_rx_signal.m`, `clutter_init.m`, `clutter_signal.m`, `adc_sample.m` | signal generation |
 | `src/target_rcs.m`, `draw_target_rcs.m` | Swerling 1 target RCS (a new value every scan) |
 | `src/save_pulse_file.m`, `save_ddc_file.m`, `pulse_header.m` | raw ADC data / DDC output of a PRI to a .mat file, its header |
@@ -120,6 +122,7 @@ file was built for other values (for example after you change
 | `ddc_filters_4MHz.mat` | DDC output 4 MHz (`cfg.ddc.outputRate_Hz = 4e6`): the same `h1`, `h2` with 66 taps passing +-1 MHz and stopping above 2 MHz (the Nyquist frequency of 4 MHz) |
 | `dbf_matrix.mat` | `W` [21 x nElements] (beam = W * x), `beamEl_deg` |
 | `stagger_prf.mat` | `priVector_s` [K x 1], `mtiCoeffs` [K x L] (row k = weights of an MTI output whose first pulse has stagger position k; one row = fixed weights) |
+| `phase_code.mat` | phase codes and mismatch filters of both sub-pulses (used when `cfg.wave.<pulse>.type = 'phasecode'`): `shortCode`, `longCode` [nChips x 1] complex chip values, first chip sent first (default P4, 25 and 150 chips of 1 us); `shortMismatch`, `longMismatch`: mismatch filter as a convolution filter (output = conv(code, filter)), by default one coefficient per chip (default: 10 coefficients longer than the code, smallest peak sidelobe); optional `shortMismatchRate_Hz`, `longMismatchRate_Hz`: sample rate of the filter, when it is not one coefficient per chip (e.g. the DDC output rate) |
 
 The default files also hold `madeFor`, the configuration values they were
 built for. User files simply leave it out.
@@ -133,8 +136,9 @@ built for. User files simply leave it out.
 | 200 - 350 us | long pulse transmitted (`cfg.wave.long.tTx_s`); Tx leakage in the receiver |
 | 350 - 896 us | long-pulse receive interval, up to `cfg.rx.maxRange_m` (80 km) |
 
-The transmit times are parameters. Both sub-pulses use LFM (1 MHz) or a P4
-phase code (1 us chips) on the same 30 MHz IF and are separated only in
+The transmit times are parameters. Both sub-pulses use LFM (1 MHz) or a
+phase code (1 us chips, P4 by default, from `inputs/phase_code.mat`) on the
+same 30 MHz IF and are separated only in
 time. The ADC records one continuous block from the start of the PRI to the
 end of the long window, Tx leakage included. The DDC processes the whole
 block, and its output is then split: a DDC sample belongs to a sub-pulse
@@ -228,10 +232,43 @@ there, at the same beam and Doppler, behind very strong far targets.
   spaced in sine space with a Taylor taper. With 1 element the DBF block is
   skipped, the single channel goes straight to the matched filter, and
   plots carry no elevation (NaN).
-* **Axes:** the delay and range of every matched-filter output cell are
+* **Pulse compression** (`cfg.wave.<pulse>.compression`): LFM uses its
+  matched filter with a Taylor window. A phase code uses its matched filter
+  (`'matched'`, the conjugate reversed code) or the **mismatch filter** of
+  `cfg.files.phaseCode` (`'mismatch'`): a filter longer than the code that
+  lowers the range sidelobes for a small SNR loss. Each coefficient is held
+  for the DDC samples of one chip (by default one coefficient per chip:
+  chip-matched sum, then the chip-rate filter), so one file serves the 2
+  and the 4 MHz DDC output. The filter peaks earlier than the matched
+  filter (`wv.mfShift` samples, found from the pulse after the DDC filters),
+  which the range axis takes into account; its tail after the echo extends
+  the receive window, and the range of each sub-pulse starts and ends a
+  little farther inwards (default filters: 0.75 km). With the default P4
+  codes and filters (`tests/test_phase_code.m`, target through the whole
+  chain): peak sidelobe -21.1 -> -24.5 dB (short pulse) and -28.6 -> -33.1
+  dB (long) at 2 MHz, about 4 dB better at 4 MHz, for 0.8 and 0.5 dB SNR
+  loss. The 2 MHz DDC (pass band +-0.5 MHz) rounds the 1 us chips, which
+  limits a filter designed on ideal chips. A filter designed at the DDC rate
+  on the pulse after the DDC, over several sampling phases, does better
+  (long pulse: -43 dB):
+
+  ```matlab
+  cfg = radar_config;  cfg.wave.long.type = 'phasecode';  cfg.wave.long.compression = 'mismatch';
+  sys = setup_radar(cfg);
+  f = rmfield(load(cfg.files.phaseCode), 'madeFor');          % a user file: no 'madeFor'
+  f.longMismatch = mismatch_filter(ddc_pulse(sys, sys.wave.long, 0:0.25:0.75), 10, 3);
+  f.longMismatchRate_Hz = sys.fsOut;                           % one coefficient per DDC sample
+  save('inputs/my_phase_code.mat', '-struct', 'f');
+  cfg.files.phaseCode = fullfile(pwd, 'inputs', 'my_phase_code.mat');
+  ```
+  Such a filter belongs to one DDC output rate. The C receiver gets the
+  filter taps and range axes from `export_receiver_config.m` and needs no
+  other setting.
+* **Axes:** the delay and range of every pulse-compression output cell are
   computed in `setup_radar.m` (`wv.delay_s`, `wv.range_m`). They follow from
-  the ADC sample times, the valid convolutions of the DDC and matched
-  filters, and the transmit time of the sub-pulse.
+  the ADC sample times, the valid convolutions of the DDC and pulse
+  compression filters (and the earlier peak of a mismatch filter), and the
+  transmit time of the sub-pulse.
   `plot_range_profile(rp, wv, 'range'|'delay'|'index')` plots against any
   of them. Set `cfg.display.rangeProfilePulse = <pulse number>` to plot it
   during a run.
@@ -503,8 +540,9 @@ more) or, with `cfg.sim.swerling = 0`, for a steady target (Albersheim).
 Where a closed form would be approximate, the budget runs the real
 processing functions on a noise-free target:
 * the matched-filter loss: the pulse, with its Doppler shift, goes through
-  the DDC filters and the matched filter. This covers the Taylor window,
-  the DDC filtering of phase-code chips, and the Doppler mismatch.
+  the DDC filters and the pulse compression filter. This covers the Taylor
+  window, the loss of a mismatch filter, the DDC filtering of phase-code
+  chips, and the Doppler mismatch.
 * the slow-time gain: the MTI and Doppler functions run on the target and
   on white noise. This covers the MTI response, the Hamming loss, Doppler
   straddle and the azimuth beam shape over the CPI.
@@ -517,7 +555,8 @@ budget.
 
 | Test | What it checks |
 |---|---|
-| `test_snr_budget(mode, pulse, type, nElements, ddcRate)` | measured vs. expected SNR after each block (LFM or P4, 1 or 48 elements, 2 or 4 MHz DDC output) |
+| `test_snr_budget(mode, pulse, type, nElements, ddcRate, compression)` | measured vs. expected SNR after each block (LFM or P4 with its matched or mismatch filter, 1 or 48 elements, 2 or 4 MHz DDC output) |
+| `test_phase_code` | phase codes from the file, matched and mismatch filters: a target through the whole chain lands on its range cell with both (2 and 4 MHz), the mismatch filter has lower sidelobes and less than 1.5 dB loss; a user filter at the DDC rate; `run_radar_sim` with mismatch filters gives the right plot; the C core test passes with the exported mismatch configuration |
 | `test_udp_stream` | the DDC output of a PRI sent over UDP to localhost is received bit-exact, with its header |
 | `test_ddc_replay` | a short run saves only the DDC files (no raw data); `replay_ddc_udp` sends them to localhost bit-exact, with the PRI timing (median delay below 10 % of the PRI); when built, the C sender `radar_stream_send` sends them (saved with `-v6` and `-v7`) bit-exact as well |
 | `test_generate_ddc` | `generate_ddc_files`: without noise its DDC files equal those of `run_radar_sim` bit by bit (2 and 4 MHz, header included); with noise a pulse gives the same file whatever other pulses are generated (order and number of workers do not matter) |

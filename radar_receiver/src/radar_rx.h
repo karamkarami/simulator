@@ -30,20 +30,30 @@ enum { PULSE_SHORT = 0, PULSE_LONG = 1, N_PULSES = 2 };
 enum { MF_AUTO = 0, MF_DIRECT = 1, MF_FFT = 2 };
 enum { CFAR_2D = 0, CFAR_RANGE = 1, CFAR_DOPPLER = 2 };
 enum { TRACK_CV = 0, TRACK_CA = 1 };
+enum { WAVE_LFM = 0, WAVE_PHASE_CODE = 1 };
+enum { COMPRESSION_MATCHED = 0, COMPRESSION_MISMATCH = 1 };
 const char *cfar_method_name(int method);   /* "2-D", "1-D range", "1-D Doppler" */
 
 typedef struct {
     int     ddcFirst;      /* first DDC sample of this sub-pulse (0-based)            */
     int     ddcCount;      /* DDC samples of this sub-pulse (= nRange + nTaps - 1)    */
-    int     nTaps;         /* matched filter length                                   */
+    int     nTaps;         /* pulse compression filter length                         */
     int     nRange;        /* range cells                                             */
-    float  *tapsRe;        /* matched filter taps [nTaps]: y[r] = sum_j h[j]*x[r+nTaps-1-j] */
+    float  *tapsRe;        /* compression filter taps [nTaps]: y[r] = sum_j h[j]*x[r+nTaps-1-j]
+                              (matched filter, or the mismatch filter of a phase code;
+                              range_m/delay_s already hold the earlier peak of the latter) */
     float  *tapsIm;
     double *range_m;       /* range axis [nRange]                                     */
     double *delay_s;       /* delay axis [nRange]                                     */
     double  lambda_m;      /* wavelength used for the radial velocity                 */
     int     testFirst;     /* range cells tested by the CFAR: testFirst ... testFirst+testCount-1 */
     int     testCount;     /* (the others are only training cells; default: all)      */
+    int     waveform;      /* WAVE_LFM or WAVE_PHASE_CODE (information; default LFM)   */
+    int     compression;   /* COMPRESSION_MATCHED or COMPRESSION_MISMATCH (information)  */
+    int     nChips;        /* phase code: chips (0 for LFM)                           */
+    int     mfShift;       /* samples by which the mismatch filter peaks earlier (0)   */
+    int     nPulse;        /* the transmitted pulse at the DDC rate (for tests; 0 if   */
+    float  *pulseRe, *pulseIm;   /* the file does not have it)                       */
 } PulseConfig;
 
 typedef struct {

@@ -29,6 +29,7 @@ cfg.files.ddc     = fullfile(root, 'inputs', 'ddc_filters.mat');     % low-pass 
 cfg.files.ddc4MHz = fullfile(root, 'inputs', 'ddc_filters_4MHz.mat'); % the same for the 4 MHz output
 cfg.files.dbf     = fullfile(root, 'inputs', 'dbf_matrix.mat');      % elevation beamforming matrix
 cfg.files.stagger = fullfile(root, 'inputs', 'stagger_prf.mat');     % staggered PRIs + MTI weights
+cfg.files.phaseCode = fullfile(root, 'inputs', 'phase_code.mat');    % phase codes + mismatch filters of both sub-pulses
 
 %% Radar site and antenna
 cfg.fc            = 3e9;  % center frequency [Hz]
@@ -66,16 +67,24 @@ cfg.adc.fIF_Hz           = 30e6;   % IF carrier of the received signal (receiver
 % sub-pulses are on the same 30 MHz IF and are separated in time. The long
 % pulse is blind up to c*150us/2 = 22.5 km; with tTx = 200 us the short
 % pulse covers 4.2 ... 23.7 km and hands over to the long pulse.
-cfg.wave.short.type         = 'lfm';    % 'lfm' or 'phasecode' (P4 polyphase code)
+% Pulse compression: LFM with the Taylor-windowed matched filter; a phase
+% code (chips from cfg.files.phaseCode, default P4) with its matched filter
+% or with the mismatch filter of the same file (lower range sidelobes for a
+% small SNR loss; the filter is longer than the pulse, so the first and last
+% range cells of each receive interval move inwards and the receive window
+% gets longer).
+cfg.wave.short.type         = 'lfm';    % 'lfm' or 'phasecode' (code from cfg.files.phaseCode)
 cfg.wave.short.width_s      = 25e-6;    % pulse width [s]
 cfg.wave.short.bandwidth_Hz = 1e6;      % LFM sweep bandwidth [Hz]
-cfg.wave.short.chip_s       = 1e-6;     % phase-code chip length [s]
+cfg.wave.short.chip_s       = 1e-6;     % phase-code chip length [s] (width_s/chip_s chips)
+cfg.wave.short.compression  = 'matched'; % phase code: 'matched' or 'mismatch' filter (LFM: 'matched')
 cfg.wave.short.tTx_s        = 0;        % transmit time inside the PRI [s]
 
 cfg.wave.long.type          = 'lfm';
 cfg.wave.long.width_s       = 150e-6;
 cfg.wave.long.bandwidth_Hz  = 1e6;
 cfg.wave.long.chip_s        = 1e-6;
+cfg.wave.long.compression   = 'matched';
 cfg.wave.long.tTx_s         = 200e-6;
 
 %% PRF

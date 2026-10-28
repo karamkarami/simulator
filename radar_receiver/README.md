@@ -12,7 +12,8 @@ at 921600 baud.
         |  input thread: reassembly of each PRI (udp_input.c) -> queue of PRIs (input_thread.c)
         v  split in time: short-pulse samples | long-pulse samples
  DBF (21 x 48 matrix, off for 1 element)
- Matched filter (valid convolution; FFT fast convolution when it is faster)
+ Pulse compression: matched filter, or the mismatch filter of a phase code
+         (valid convolution; FFT fast convolution when it is faster)
  CPI ring buffer (the pulses of one CPI) -> MTI ring (MTI output of each pulse computed once)
  Doppler: fixed PRF Hamming + FFT 128 | staggered: de-interleave, Hamming, FFT 32, NCI;
           division by the noise gain of every bin
@@ -25,11 +26,24 @@ at 921600 baud.
 
 The algorithms are the same as in the MATLAB simulator (`../src/*.m`, see
 `../README.md`). The C receiver reads every number that MATLAB derives
-(DBF matrix, matched filters, range axes, CPI length, MTI weights, Doppler
-window and noise gains, CFAR method, window, threshold factor and tested
-range cells, extraction and tracker settings) from a
+(DBF matrix, pulse compression filters, range axes, CPI length, MTI
+weights, Doppler window and noise gains, CFAR method, window, threshold
+factor and tested range cells, extraction and tracker settings) from a
 configuration file that `export_receiver_config.m` writes. Both programs
 therefore always use the same values.
+
+**Phase codes and mismatch filters** (`cfg.wave.<pulse>.type =
+'phasecode'`, `cfg.wave.<pulse>.compression = 'matched' | 'mismatch'`,
+codes and filters in `../inputs/phase_code.mat`): the exported taps are the
+matched or the mismatch filter at the DDC rate, and the exported range axis
+already holds the earlier peak of the longer mismatch filter. The receiver
+filters with whatever taps the file has (direct or FFT, as for LFM), so it
+needs no setting of its own; it prints the waveform and the filter of each
+sub-pulse at the start, e.g. `long pulse: phase code of 150 chips, mismatch
+filter of 320 taps (23.65 ... 80.61 km)`. The file also holds the pulse
+itself at the DDC rate (`<pulse>_pulse`), which `test_core` uses as the
+echo. `config/radar_config_phasecode.bin` is such a configuration (both
+sub-pulses with mismatch filters) for the `core_phasecode` test.
 
 ## Build
 
@@ -359,6 +373,7 @@ Timing:
 |---|---|
 | `tracker` (`tests/test_tracker.c`) | two crossing targets over 6 scans, 3-D and 2-D: two confirmed tracks that stay on their targets; GNN with two targets 200 m apart: each track stays on its own target; with plots, a configuration and the track log from `../tests/test_tracker.m` (CV and CA, 2-D and 3-D), every C track update equals MATLAB's (same plot, state within 1e-6) |
 | `core` (`tests/test_core.c`) | batched FFT against a direct DFT; plot extractor; a moving target through the whole chain with the exported configuration (one plot at the right range, velocity and beam); direct and fast-convolution matched filters give the same plot; the same target with the CFAR threshold raised to 45 dB at run time gives no detection; `cfar_pfa()` against the closed form (one look) and the Pfa 1e-8 of the configured threshold |
+| `core_phasecode` | the same core test with `config/radar_config_phasecode.bin` (both sub-pulses P4 phase codes with mismatch filters): the echo is the real code, the plot lies on the target cell |
 | `udp_input` | reassembly with shuffled, duplicate, missing and foreign datagrams; timeouts; record and replay; fuzzing |
 | `ddc_files` (`tests/test_ddc_files.c`) | MAT-file reader with files written as MATLAB writes them (data in smaller storage types, small elements, skipped char field, compressed `-v7` with zlib); folder listing; the datagrams of a DDC file are accepted by `udp_input.c` and give back the same PRI; corrupted, truncated, `-v7.3` and big-endian files are refused |
 | `serial` | frame encoding and CRC; real output to a pseudo-terminal (Linux): exact bytes, 200-detection split, non-blocking drops, close |

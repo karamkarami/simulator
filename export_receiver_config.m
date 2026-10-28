@@ -3,10 +3,12 @@ function export_receiver_config(cfg, fileName)
 %
 %   EXPORT_RECEIVER_CONFIG(cfg, fileName) runs setup_radar(cfg) and writes
 %   everything the C receiver needs to process the DDC output that the
-%   simulator streams over UDP (DBF matrix, matched filters, range axes, CPI
-%   length, MTI weights, Doppler window and noise gains, CFAR method, window,
-%   factor and tested range cells, plot extraction and tracker settings). Export again whenever cfg changes, before starting
-%   the C receiver. Default file: radar_receiver/config/radar_config.bin.
+%   simulator streams over UDP (DBF matrix, pulse compression filters:
+%   matched or, for a phase code, mismatch; range axes, CPI length, MTI
+%   weights, Doppler window and noise gains, CFAR method, window, factor and
+%   tested range cells, plot extraction and tracker settings). Export again
+%   whenever cfg changes, before starting the C receiver. Default file:
+%   radar_receiver/config/radar_config.bin.
 %
 %   File format (little-endian): 8 bytes 'RADRXCFG', uint32 version (1),
 %   uint32 number of records, then per record: char name[32] (zero padded),
@@ -47,6 +49,13 @@ for i = 1:2
     r{end+1} = {[names{i} '_lambda_m'], wv.lambda_m};
     r{end+1} = {[names{i} '_testFirst'], wv.testIdx(1) - 1};    % CFAR-tested range cells (0-based)
     r{end+1} = {[names{i} '_testCount'], max(0, wv.testIdx(2) - wv.testIdx(1) + 1)};
+    isCode = strcmpi(wv.type, 'phasecode');                   % pulse compression (the taps above are
+    r{end+1} = {[names{i} '_waveform'], double(isCode)};      % the matched or the mismatch filter)
+    r{end+1} = {[names{i} '_compression'], double(strcmp(wv.compression, 'mismatch'))};
+    r{end+1} = {[names{i} '_nChips'], isCode * round(wv.width_s / wv.chip_s)};
+    r{end+1} = {[names{i} '_mfShift'], wv.mfShift};
+    r{end+1} = {[names{i} '_pulse'], complex(waveform_envelope(wv, ((0:round(wv.width_s*sys.fsOut)-1) + 0.5) / sys.fsOut))};
+                                                              % the pulse at the DDC rate (C tests)
 end
 r{end+1} = {'cpiLength', sys.cpi.length};
 r{end+1} = {'nStagger', sys.nStagger};

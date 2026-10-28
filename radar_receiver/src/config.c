@@ -45,6 +45,14 @@ static const Record *find(RecordSet *rs, const char *name)
     return NULL;
 }
 
+/* A record that older files may not have: NULL if it is missing. */
+static const Record *find_optional(const RecordSet *rs, const char *name)
+{
+    for (int i = 0; i < rs->n; i++)
+        if (strcmp(rs->rec[i].name, name) == 0) return &rs->rec[i];
+    return NULL;
+}
+
 /* A scalar that older files may not have: 'fallback' if it is missing. */
 static double get_optional(RecordSet *rs, const char *name, double fallback)
 {
@@ -204,6 +212,23 @@ int radar_config_load(const char *path, RadarConfig *cfg, char *err, size_t errL
             snprintf(key, sizeof key, "%s_testFirst", names[p]); pc->testFirst = (int)get_optional(&rs, key, 0);
             snprintf(key, sizeof key, "%s_testCount", names[p]);
             pc->testCount = (int)get_optional(&rs, key, pc->nRange);
+            /* pulse compression (older files: LFM, matched filter) */
+            snprintf(key, sizeof key, "%s_waveform", names[p]);    pc->waveform = (int)get_optional(&rs, key, WAVE_LFM);
+            snprintf(key, sizeof key, "%s_compression", names[p]);
+            pc->compression = (int)get_optional(&rs, key, COMPRESSION_MATCHED);
+            snprintf(key, sizeof key, "%s_nChips", names[p]);      pc->nChips = (int)get_optional(&rs, key, 0);
+            snprintf(key, sizeof key, "%s_mfShift", names[p]);     pc->mfShift = (int)get_optional(&rs, key, 0);
+            snprintf(key, sizeof key, "%s_pulse", names[p]);
+            const Record *pulse = find_optional(&rs, key);
+            if (pulse) {
+                pc->nPulse = (int)(pulse->rows * pulse->cols);
+                get_complex(&rs, key, 1, pc->nPulse, 0, &pc->pulseRe, &pc->pulseIm);
+            }
+            if (!rs.failed && ((pc->waveform != WAVE_LFM && pc->waveform != WAVE_PHASE_CODE) ||
+                               (pc->compression != COMPRESSION_MATCHED && pc->compression != COMPRESSION_MISMATCH) ||
+                               (pc->compression == COMPRESSION_MISMATCH && pc->waveform != WAVE_PHASE_CODE) ||
+                               pc->mfShift < 0 || pc->mfShift >= pc->nTaps))
+                set_error(&rs, "invalid pulse compression of the %s pulse", names[p]);
             if (!rs.failed && (pc->ddcCount != pc->nRange + pc->nTaps - 1 ||
                                pc->ddcFirst < 0 || pc->ddcFirst + pc->ddcCount > cfg->nDdc))
                 set_error(&rs, "inconsistent DDC segment of the %s pulse", names[p]);
@@ -315,6 +340,7 @@ void radar_config_free(RadarConfig *cfg)
     for (int p = 0; p < N_PULSES; p++) {
         PulseConfig *pc = &cfg->pulse[p];
         free(pc->tapsRe);  free(pc->tapsIm);  free(pc->range_m);  free(pc->delay_s);
+        free(pc->pulseRe);  free(pc->pulseIm);
     }
     free(cfg->mtiCoeffs);  free(cfg->dopWindow);  free(cfg->noiseGain);  free(cfg->dopFreq_Hz);
     memset(cfg, 0, sizeof(*cfg));

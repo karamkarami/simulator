@@ -419,6 +419,16 @@ int main(int argc, char **argv)
             "CPI %d pulses, FFT %d x %d row(s), update every %d pulse(s), plots need %d update(s)\n", app.cfg.nCh,
             app.cfg.nBeams, app.cfg.nDdc, app.cfg.pulse[0].nRange, app.cfg.pulse[1].nRange, app.cfg.cpiLength,
             app.cfg.nfft, app.cfg.nRows, app.cfg.updateEvery, app.cfg.minHits);
+    for (int i = 0; i < N_PULSES; i++) {
+        const PulseConfig *pc = &app.cfg.pulse[i];
+        if (pc->waveform == WAVE_PHASE_CODE)
+            fprintf(stderr, "%s pulse: phase code of %d chips, %s filter of %d taps (%.2f ... %.2f km)\n", pulse_name(i),
+                    pc->nChips, pc->compression == COMPRESSION_MISMATCH ? "mismatch" : "matched", pc->nTaps,
+                    pc->range_m[0] / 1e3, pc->range_m[pc->nRange - 1] / 1e3);
+        else
+            fprintf(stderr, "%s pulse: LFM, matched filter of %d taps (%.2f ... %.2f km)\n", pulse_name(i), pc->nTaps,
+                    pc->range_m[0] / 1e3, pc->range_m[pc->nRange - 1] / 1e3);
+    }
     fprintf(stderr, "CFAR %s (window: range %d+%d, Doppler %d+%d guard+training cells per side), ", cfar_method_name(app.cfg.cfarMethod),
             app.cfg.guardRange, app.cfg.trainRange, app.cfg.guardDoppler, app.cfg.trainDoppler);
     if (app.cfg.trackEnable)

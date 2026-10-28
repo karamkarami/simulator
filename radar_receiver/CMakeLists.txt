@@ -179,6 +179,8 @@ if(RADAR_BUILD_TESTS)
     add_executable(test_core tests/test_core.c)
     target_link_libraries(test_core PRIVATE radar_core)
     add_test(NAME core COMMAND test_core ${CMAKE_CURRENT_SOURCE_DIR}/config/radar_config.bin)
+    # phase codes with mismatch filters (export_receiver_config.m, see README)
+    add_test(NAME core_phasecode COMMAND test_core ${CMAKE_CURRENT_SOURCE_DIR}/config/radar_config_phasecode.bin)
 
     add_executable(test_tracker tests/test_tracker.c)
     target_link_libraries(test_tracker PRIVATE radar_core)

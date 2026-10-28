@@ -19,6 +19,8 @@ end
 
 names{end+1}  = 'SNR budget (fixed PRF, long pulse, P4 phase code)';
 passed(end+1) = test_snr_budget('fixed', 'long', 'phasecode');
+names{end+1}  = 'SNR budget (fixed PRF, long pulse, P4 phase code, mismatch filter)';
+passed(end+1) = test_snr_budget('fixed', 'long', 'phasecode', 48, 2e6, 'mismatch');
 names{end+1}  = 'SNR budget (single element, no beamforming)';
 passed(end+1) = test_snr_budget('fixed', 'short', 'lfm', 1);
 for pulse = {'short', 'long'}
@@ -34,6 +36,9 @@ passed(end+1) = test_ddc_replay();
 
 names{end+1}  = 'DDC file generation with parfor (generate_ddc_files)';
 passed(end+1) = test_generate_ddc();
+
+names{end+1}  = 'Phase codes: matched and mismatch filters (and the C core test)';
+passed(end+1) = test_phase_code();
 
 names{end+1}  = 'CFAR methods (2-D, range, Doppler), edges, range interval';
 passed(end+1) = test_cfar();

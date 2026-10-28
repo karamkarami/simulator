@@ -61,9 +61,9 @@ cfgS.rx.addThermalNoise = false;  cfgS.rx.addLeakage = false;  cfgS.adc.addAdcNo
 cfgS.adc.quantize = false;        cfgS.ddc.fixedPoint = false;
 sysS = sys;  sysS.cfg = cfgS;
 [rpS, xS] = run_cpi(sysS, tgt, tp, azAnt, wv);
-[rpN, xN] = run_cpi(sys, [], tp, azAnt, wv);
+[rpN, xN, noise] = run_cpi(sys, [], tp, azAnt, wv);
 
-%% Measure the SNR after every block (centre pulse of the CPI)
+%% Measure the SNR after every block (signal: centre pulse of the CPI; noise: all pulses)
 tau = 2*R0/c;
 inEcho = @(t) t >= wv.tTx_s + tau + 0.25*wv.width_s & t <= wv.tTx_s + tau + 0.75*wv.width_s;
 
@@ -71,11 +71,12 @@ tSeg = sys.tDdc(wv.ddcIdx);                          % times of the DDC samples 
 rxNow = sys.tAdc >= sys.wave.short.tTx_s + sys.wave.short.width_s & ...     % receiving, not transmitting
         (sys.tAdc < sys.wave.long.tTx_s | sys.tAdc >= sys.wave.long.tTx_s + sys.wave.long.width_s + 1e-6);
 m.adc = mean(double(xS.adc(inEcho(sys.tAdc), 1)).^2) / var(double(xN.adc(rxNow, 1)));
-m.ddc = mean(abs(xS.ddc(inEcho(sys.tDdc), 1)).^2) / mean(abs(xN.ddc(wv.ddcIdx, 1)).^2);
+m.ddc = mean(abs(xS.ddc(inEcho(sys.tDdc), 1)).^2) / noise.ddc;
 beam  = budget.beam;
-m.dbf = mean(abs(xS.dbf(beam, inEcho(tSeg))).^2) / mean(abs(xN.dbf(beam, :)).^2);
+m.dbf = mean(abs(xS.dbf(beam, inEcho(tSeg))).^2) / noise.dbf(beam);
 [pk, r] = max(abs(xS.mf(beam, :)).^2);
-m.mf  = pk / mean(abs(xN.mf(beam, :)).^2);
+noiseMf = abs(rpN(beam, :, :)).^2;
+m.mf  = pk / mean(noiseMf(:));
 
 yS = mti_filter(rpS, sys.mtiCoeffs, st);
 yN = mti_filter(rpN, sys.mtiCoeffs, st);
@@ -105,9 +106,14 @@ end
 fprintf('Result: %s\n', ternary(ok, 'PASS', 'FAIL'));
 end
 
-function [rpCpi, last] = run_cpi(sys, targets, tp, azAnt, wv)
-% Processing chain up to the matched filter for every pulse of one CPI.
+function [rpCpi, last, noise] = run_cpi(sys, targets, tp, azAnt, wv)
+% Processing chain up to the matched filter for every pulse of one CPI. last
+% holds the outputs of the centre pulse; noise the mean power over all pulses
+% of the DDC samples of this sub-pulse (element 1) and of every beam (the
+% noise of a single pulse scatters by a few tenths of a dB).
 n = numel(tp);
+noise.ddc = 0;
+noise.dbf = 0;
 rpCpi = complex(zeros(sys.nBeams, wv.nRange, n, 'single'));
 k0 = ceil(n/2);
 for k = 1:n
@@ -121,6 +127,8 @@ for k = 1:n
     end
     rp = matched_filter(bm, wv);
     rpCpi(:, :, k) = rp;
+    noise.ddc = noise.ddc + mean(abs(bb(wv.ddcIdx, 1)).^2) / n;
+    noise.dbf = noise.dbf + mean(abs(bm).^2, 2) / n;
     if k == k0                                       % keep the centre pulse of every block
         last.adc = x;  last.ddc = bb;  last.dbf = bm;  last.mf = rp;
     end

@@ -290,7 +290,12 @@ over localhost) it dropped no PRIs and plotted every target, with
 `--update-every` 1, 4 and 8. With every-pulse updates, about three quarters
 of the updates were skipped automatically. A desktop CPU with 8 or more cores is
 correspondingly faster. The 80 km default configuration has about twice as
-many long-pulse range cells.
+many long-pulse range cells. Another 4-vCPU VM (Xeon at 2.8 GHz, AVX-512)
+was about 1.6 times slower (fixed PRF, 3 threads: 6.0 ms per PRI, 1.35 ms
+every 8 pulses; the same with the receiver before the latest fixes). In the
+real-time test with `--threads 2` it still dropped no PRIs and plotted every
+target: with `--update-every 8` about half of the updates were skipped (fixed
+PRF; a third with the staggered PRF), with every-pulse updates nine tenths.
 
 **Real time.** Doppler processing and CFAR on every new pulse, as in MATLAB,
 take longer than a 1 ms PRI on a small PC. The receiver handles this in two

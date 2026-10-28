@@ -578,23 +578,36 @@ budget.
 | `test_tracker` | EKF tracker on synthetic plots of the six targets over 5 scans with false plots, 3-D and 2-D, CV and CA: one confirmed track per target, close to it, no false track; GNN with two targets 200 m apart (nearest neighbour would merge them); CA against CV on a target accelerating at 4 m/s^2; when built, the C tracker gives the same track updates |
 | `test_c_receiver(mode, ..., cfarMethod)` | the six-target scenario streamed over UDP to the C receiver (`radar_receiver/`): its plots and track updates must match MATLAB; the recorded stream is replayed to check repeatability and speed |
 
-Latest results (Octave 8.4): all SNR budget checks agree within 0.7 dB.
-The six-target tests find all 6 targets with no false plot, for both the
-fixed and the staggered PRF. In `test_c_receiver` the C receiver gives the
-same 6 plots as MATLAB (same cells, range, azimuth, elevation, velocity, SNR
-and number of detections) for both PRF modes. After the CFAR changes
-(methods, shifted range window, no extra CFAR cells in the receive window):
-the 2-D CFAR still finds all 6 targets with no false plot (fixed PRF), and
-the C receiver gives exactly the same plots and track updates as MATLAB with
-the 2-D (six targets, fixed PRF; two targets, staggered PRF), the 1-D range
-and the 1-D Doppler CFAR (two targets). With 3 scans of two targets both
-tracks are confirmed: speed within 4 m/s, heading within 0.3 deg, height
-within 25 m of the truth.
+Latest results (Octave 8.4 on a 4-vCPU VM, every test of `run_all_tests`
+passed): the SNR budget checks agree within 0.45 dB (ADC, DDC and DBF within
+0.25 dB). The six-target tests find all 6 targets with no false plot, for
+both the fixed and the staggered PRF. In `test_c_receiver` the C receiver
+gives the same 6 plots as MATLAB (same cells, range, azimuth, elevation,
+velocity, SNR and number of detections) and the same track updates for both
+PRF modes. It also matches MATLAB exactly (two or three of the targets each)
+with unusual configurations: staggered PRF with the 4 MHz DDC output, the
+1-D range CFAR and the CA tracker; phase codes with mismatch filters, the
+1-D Doppler CFAR and 2-D tracking; a single element with Doppler/CFAR every
+4 pulses and the exponential clutter spectrum; restricted CFAR range
+intervals; the default 80 km receive window. A six-target run takes about
+0.85 s per PRI (2400 PRIs in 35 minutes, raw files included). The polyphase
+DDC halved the run time (one target with clutter, 397 PRIs: 1.65 s per PRI
+before, 0.82 s after, same plot). After the CFAR changes (methods, shifted
+range window, no extra CFAR cells in the receive window): the 2-D CFAR still
+finds all 6 targets with no false plot (fixed PRF), and the C receiver gives
+exactly the same plots and track updates as MATLAB with the 2-D (six
+targets, fixed PRF; two targets, staggered PRF), the 1-D range and the 1-D
+Doppler CFAR (two targets). With 3 scans of two targets both tracks are
+confirmed: speed within 4 m/s, heading within 0.3 deg, height within 25 m of
+the truth.
 
 `tests/run_all_tests.m` runs all of them for the fixed and the staggered
-PRF. The six-target test simulates only the azimuth sectors around the
-targets, about 2400 PRIs. Its raw files are about 18 GB per PRF mode;
-`run_all_tests` deletes them after checking them.
+PRF (about 3 hours in Octave on a 4-vCPU VM). The six-target test simulates
+only the azimuth sectors around the targets, about 2400 PRIs. Its raw files
+are about 18 GB per PRF mode; `run_all_tests` deletes them after checking
+them. Octave without a display (`octave-cli` has no graphics toolkit) runs
+the simulator without the PPI and skips the interactive PPI test; for the
+PPI use a virtual display: `xvfb-run octave --no-gui --eval run_all_tests`.
 
 ## Assumptions and limits
 

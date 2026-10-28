@@ -1,10 +1,10 @@
 % RUN_ALL_TESTS  Run every test of the radar simulator and print a summary.
-%   The six-target tests take about 30 minutes each in Octave. Each writes
-%   about 18 GB of raw data (output/test_<mode>/raw_pulses), checks it and
-%   deletes it again (call test_six_targets(mode, true) to keep the files).
-%   When the C receiver is built (radar_receiver/build/radar_receiver, Linux
-%   or macOS), test_c_receiver compares it with the MATLAB processing (about
-%   30 minutes per PRF mode).
+%   The six-target tests take about 35 minutes each in Octave 8.4 on a
+%   4-vCPU VM. Each writes about 18 GB of raw data (output/test_<mode>/raw_pulses),
+%   checks it and deletes it again (call test_six_targets(mode, true) to keep
+%   the files). When the C receiver is built (radar_receiver/build/radar_receiver,
+%   Linux or macOS), test_c_receiver compares it with the MATLAB processing
+%   (about 40 minutes per PRF mode). All tests together take about 3 hours.
 %   The PPI tests need graphics: in Octave without a display run
 %   xvfb-run octave --no-gui --eval run_all_tests (octave-cli has no
 %   graphics toolkit: the interactive PPI test is skipped, the other tests

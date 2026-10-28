@@ -11,6 +11,11 @@ function ok = test_ppi_interactive()
 
 root = fileparts(fileparts(mfilename('fullpath')));
 addpath(root, fullfile(root, 'src'));
+if exist('OCTAVE_VERSION', 'builtin') && isempty(available_graphics_toolkits())
+    fprintf('Interactive PPI test: SKIPPED (no graphics toolkit: run octave with a display, e.g. xvfb-run octave)\n');
+    ok = true;
+    return
+end
 cfg = radar_config();
 cfg.display.visible = false;
 cfg.targets = make_target('T1', 1, 20e3, 60, 1000, 100, 0);

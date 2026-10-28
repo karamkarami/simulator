@@ -20,6 +20,10 @@ iq = [reshape(int16(I), 1, []); reshape(int16(Q), 1, [])];
 bytes = typecast(iq(:).', 'uint8');
 perPacket = 4*floor(payloadBytes/4);                 % whole complex samples
 nPackets = ceil(numel(bytes)/perPacket);
+if perPacket < 4 || nPackets > 65535
+    error(['udp_make_packets: %d payload bytes per datagram give %d datagrams per PRI (at most 65535): ' ...
+           'use a larger payload.'], payloadBytes, nPackets);
+end
 % header fields that are the same in every packet of the PRI
 headA = [typecast(uint32(hex2dec('52444443')), 'uint8'), ...
          typecast(uint32([hdr.pulseNumber, hdr.scanNumber]), 'uint8'), ...

@@ -188,11 +188,16 @@ for i = 1:2
 end
 % Handover: the short pulse is tested up to where the long pulse starts (its
 % first range cell, tested thanks to the shifted CFAR window), so a target is
-% not reported twice. The short pulse keeps oR more cells as training cells.
+% not reported twice. The short pulse keeps oR more cells as training cells
+% (and at least one whole CFAR range window).
 oR = sys.cfar.guardRange + sys.cfar.trainRange;
 handover_m = sys.wave.long.range_m(1);
 ws = sys.wave.short;
-nKeep = find(ws.range_m < handover_m, 1, 'last') + oR;        % + cells only used as CFAR training
+if ws.range_m(end) + abs(diff(ws.range_m(1:2))) < handover_m
+    warning('Gap in the range coverage: short pulse up to %.1f km, long pulse from %.1f km.', ...
+        ws.range_m(end)/1e3, handover_m/1e3);
+end
+nKeep = max(find(ws.range_m < handover_m, 1, 'last') + oR, 2*oR + 1);   % + cells only used as CFAR training
 if nKeep < ws.nRange
     Lp = numel(ws.mfTaps);
     ws.nRange  = nKeep;
@@ -200,9 +205,6 @@ if nKeep < ws.nRange
     ws.delay_s = ws.delay_s(1:nKeep);
     ws.range_m = ws.range_m(1:nKeep);
     sys.wave.short = ws;
-else
-    warning('Gap in the range coverage: short pulse up to %.1f km, long pulse from %.1f km.', ...
-        ws.range_m(end)/1e3, handover_m/1e3);
 end
 sys.handover_m = handover_m;
 
@@ -275,6 +277,10 @@ elseif isempty(nfft)
     nfft = 2^nextpow2(sys.cpi.length);                        % 114 pulses -> 128
 end
 rowLen = min(rowLen, nfft);                                   % a shorter FFT keeps the newest samples
+if rowLen < 2
+    error('The CPI of %d pulses is too short for the MTI and the Doppler processing (cfg.proc.cpiLength).', ...
+          sys.cpi.length);
+end
 sys.cpi.nRows  = nRows;
 sys.cpi.rowLen = rowLen;
 w = hamming_window(rowLen);
@@ -309,6 +315,10 @@ end
 sys.dop.notchBins = round(cfg.cfar.notchWidth * 2 * nfft / rowLen);
 zeroBin = floor(nfft/2) + 1;
 tested = abs((1:nfft) - zeroBin) > sys.dop.notchBins;
+if ~any(tested)
+    error('The MTI notch (cfg.cfar.notchWidth = %g: +-%d bins) covers every Doppler bin (FFT length %d).', ...
+          cfg.cfar.notchWidth, sys.dop.notchBins, nfft);
+end
 sys.dop.nLooks = min(nLooks(tested));
 % Median / mean of the noise power (used to estimate the noise floor of a beam)
 L = sys.dop.nLooks;

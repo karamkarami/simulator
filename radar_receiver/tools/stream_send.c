@@ -271,6 +271,11 @@ static int next_file(Source *s, Pri *p, char *err, size_t errLen)
     if (s->next >= s->nFiles) return 0;
     if (ddc_load(s->files[s->next++], &s->ddc, err, errLen)) return -1;
     const int n = ddc_datagram_count(&s->ddc, s->payload, &bytes);
+    if (n > 65535) {                                  /* the packet index and count are 16-bit */
+        snprintf(err, errLen, "%d datagrams per PRI with --payload %d (at most 65535): use a larger payload",
+                 n, s->payload);
+        return -1;
+    }
     if (pri_reserve(p, bytes, n)) {
         snprintf(err, errLen, "out of memory");
         return -1;

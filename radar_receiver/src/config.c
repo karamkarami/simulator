@@ -130,6 +130,12 @@ static int read_records(FILE *f, RecordSet *rs)
 {
     char magic[8];
     uint32_t head[2];
+    long fileSize = -1;                            /* bounds the sizes stored in the file */
+    if (fseek(f, 0, SEEK_END) == 0) fileSize = ftell(f);
+    if (fileSize < 0 || fseek(f, 0, SEEK_SET) != 0) {
+        set_error(rs, "cannot read the configuration file");
+        return -1;
+    }
     if (fread(magic, 1, 8, f) != 8 || memcmp(magic, "RADRXCFG", 8) != 0 ||
         fread(head, sizeof(uint32_t), 2, f) != 2 || head[0] != 1) {
         set_error(rs, "not a receiver configuration file (version 1)");
@@ -153,6 +159,12 @@ static int read_records(FILE *f, RecordSet *rs)
         r->isComplex = dims[0];
         r->rows = dims[1];
         r->cols = dims[2];
+        /* the sizes must fit into the rest of the file (so the byte count below cannot overflow) */
+        const uint64_t perValue = sizeof(double) * (r->isComplex ? 2 : 1), left = (uint64_t)(fileSize - ftell(f));
+        if (r->rows != 0 && r->cols > left / perValue / r->rows) {
+            set_error(rs, "truncated configuration file (record '%s')", r->name);
+            return -1;
+        }
         size_t count = (size_t)r->rows * r->cols * (r->isComplex ? 2 : 1);
         r->data = malloc(sizeof(double) * (count > 0 ? count : 1));
         if (!r->data || fread(r->data, sizeof(double), count, f) != count) {

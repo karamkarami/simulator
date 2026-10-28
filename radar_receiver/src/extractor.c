@@ -42,6 +42,7 @@ void extractor_update(Extractor *e, const Detection *dets, int n, int flush,
     /* groups that exist before this update and were not updated get a miss */
     int nOld = e->n;
     char *updated = calloc((size_t)nOld + n + 1, 1);
+    if (!updated) abort();                    /* out of memory (as the rest of the processing) */
 
     for (int i = 0; i < n; i++) {
         const Detection *d = &dets[i];
@@ -50,6 +51,7 @@ void extractor_update(Extractor *e, const Detection *dets, int n, int flush,
             if (e->n == e->capacity) {
                 e->capacity = e->capacity ? 2 * e->capacity : 16;
                 e->groups = realloc(e->groups, sizeof(PlotGroup) * e->capacity);
+                if (!e->groups) abort();
             }
             PlotGroup *g = &e->groups[e->n];
             g->beam = d->beam;  g->rIdx = d->rIdx;  g->dIdx = d->dIdx;

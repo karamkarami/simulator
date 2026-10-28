@@ -70,10 +70,16 @@ end
 udp = [];
 if cfg.udp.enable
     udp = udp_sender_open(cfg.udp);
+    closeUdp = onCleanup(@() udp_sender_close(udp));   %#ok<NASGU> closes it at the end, also after an error
 end
 ppi = [];
 detLog = [];
-if cfg.display.enable
+showPpi = cfg.display.enable;
+if showPpi && exist('OCTAVE_VERSION', 'builtin') && isempty(available_graphics_toolkits())
+    warning('run_radar_sim: no graphics toolkit (e.g. octave-cli): the PPI display is switched off.');
+    showPpi = false;
+end
+if showPpi
     ppi = ppi_init(sys);
     detLog = detection_log_init(cfg.display.maxDetections);   % CFAR detections for the PPI
 end
@@ -223,13 +229,10 @@ lastActive = find(sched.active, 1, 'last');
 if sys.track.enable && ~isempty(lastActive)
     tracker = track_update(tracker, endPlots, sched.time_s(lastActive), true);
 end
-if ~isempty(ppi)
+if ~isempty(ppi) && ishandle(ppi.fig)               % (the user may have closed the window)
     ppi_update(ppi, sys, sched.az_deg(end), sched.time_s(end), sched.scan(end), plots, detLog.M(1:detLog.n, :), ...
                track_report(tracker), blockUs / max(nProcessed, 1));
     print(ppi.fig, fullfile(cfg.io.outFolder, 'ppi.png'), '-dpng');
-end
-if ~isempty(udp)
-    udp_sender_close(udp);
 end
 
 results.plots      = plots;

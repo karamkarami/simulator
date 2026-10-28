@@ -394,6 +394,20 @@ static int worker(void *arg)
     return 0;
 }
 
+/* Creates a CSV file with its header line; NULL (and a warning) if it cannot
+ * be created, NULL without a warning when no file is wanted ("" or NULL). */
+static FILE *open_csv(const char *path, const char *header)
+{
+    if (!path || !path[0]) return NULL;
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        fprintf(stderr, "warning: cannot create %s, it is not written\n", path);
+        return NULL;
+    }
+    fprintf(f, "%s\n", header);
+    return f;
+}
+
 int main(int argc, char **argv)
 {
     App app;
@@ -436,22 +450,12 @@ int main(int argc, char **argv)
                 app.cfg.trackModel == TRACK_CA ? "constant-acceleration" : "constant-velocity");
     else fprintf(stderr, "tracking off\n");
 
-    if (app.opt.plotsCsv && app.opt.plotsCsv[0]) {
-        app.plotsFile = fopen(app.opt.plotsCsv, "w");
-        if (app.plotsFile)
-            fprintf(app.plotsFile, "time_s,az_deg,range_m,el_deg,vr_mps,snr_dB,pulse,hits,beam,rangeCell,dopplerBin,pulseNumber\n");
-    }
-    if (app.opt.tracksCsv && app.opt.tracksCsv[0]) {
-        app.trackFile = fopen(app.opt.tracksCsv, "w");
-        if (app.trackFile)
-            fprintf(app.trackFile, "id,confirmed,deleted,time_s,x_m,y_m,z_m,vx_mps,vy_mps,vz_mps,hits,misses,"
-                    "ax_mps2,ay_mps2,az_mps2\n");
-    }
-    if (app.opt.detectionsCsv && app.opt.detectionsCsv[0]) {
-        app.detFile = fopen(app.opt.detectionsCsv, "w");
-        if (app.detFile)
-            fprintf(app.detFile, "pulseNumber,pulse,time_s,az_deg,range_m,el_deg,vr_mps,snr_dB,beam,rangeCell,dopplerBin\n");
-    }
+    app.plotsFile = open_csv(app.opt.plotsCsv,
+                             "time_s,az_deg,range_m,el_deg,vr_mps,snr_dB,pulse,hits,beam,rangeCell,dopplerBin,pulseNumber");
+    app.trackFile = open_csv(app.opt.tracksCsv, "id,confirmed,deleted,time_s,x_m,y_m,z_m,vx_mps,vy_mps,vz_mps,"
+                                                "hits,misses,ax_mps2,ay_mps2,az_mps2");
+    app.detFile = open_csv(app.opt.detectionsCsv,
+                           "pulseNumber,pulse,time_s,az_deg,range_m,el_deg,vr_mps,snr_dB,beam,rangeCell,dopplerBin");
     if (app.opt.serialDevice) {
         app.serial = serial_open(app.opt.serialDevice, app.opt.baud, err, sizeof err);
         if (!app.serial) {

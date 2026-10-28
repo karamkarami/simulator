@@ -221,7 +221,10 @@ there, at the same beam and Doppler, behind very strong far targets.
   matched filter is the same. Both are valid convolutions in the time
   domain: the filter slides over the signal and is evaluated only at the
   kept output samples (`fir_decimate_valid.m`, equal to
-  `conv(x,h,'valid')` followed by `y(1:D:end)`; no FFT). The filter
+  `conv(x,h,'valid')` followed by `y(1:D:end)`; no FFT). It is computed in
+  polyphase form: one matrix product applies blocks of D filter taps to
+  blocks of D input samples, which is several times faster than a loop
+  over the taps and gives exactly the same integers. The filter
   coefficients are integers with 13 fractional bits. Each stage shifts its
   accumulator right by 13 bits (`cfg.ddc.shift`, unit gain), rounds and
   saturates it to int16. The DDC output is therefore signed 16-bit, with
@@ -321,6 +324,13 @@ there, at the same beam and Doppler, behind very strong far targets.
   method gave one false plot at 4.2 km (clutter residue at -2.3 m/s) that
   the `'2d'` and `'doppler'` methods do not give. Raise
   `cfg.cfar.short.minRange_m` (e.g. to 5 km) or the threshold there.
+  The 1-D Doppler window has no range extent. The long pulse of a strong
+  target inside its blind range (22.5 km) is still received in part
+  (eclipsed) at the start of the long-pulse window, where its compressed
+  response spreads over several km in the target's Doppler bin: with the
+  `'doppler'` method the near target T5 (7.7 km, SNR 62 dB) gave 4 false
+  long-pulse plots at 23 - 26 km (25 with phase codes and mismatch
+  filters), which the `'2d'` method does not give.
 * **Tracking (optional, `cfg.track`):** an extended Kalman filter on the
   plots. State relative to the antenna (East, North, up), `cfg.track.model`:
   `'cv'` (default) position and velocity, nearly constant velocity with
@@ -555,7 +565,7 @@ budget.
 
 | Test | What it checks |
 |---|---|
-| `test_snr_budget(mode, pulse, type, nElements, ddcRate, compression)` | measured vs. expected SNR after each block (LFM or P4 with its matched or mismatch filter, 1 or 48 elements, 2 or 4 MHz DDC output) |
+| `test_snr_budget(mode, pulse, type, nElements, ddcRate, compression)` | measured vs. expected SNR after each block (LFM or P4 with its matched or mismatch filter, 1 or 48 elements, 2 or 4 MHz DDC output); the noise power of every block is the mean over the pulses of the CPI |
 | `test_phase_code` | phase codes from the file, matched and mismatch filters: a target through the whole chain lands on its range cell with both (2 and 4 MHz), the mismatch filter has lower sidelobes and less than 1.5 dB loss; a user filter at the DDC rate; `run_radar_sim` with mismatch filters gives the right plot; the C core test passes with the exported mismatch configuration |
 | `test_udp_stream` | the DDC output of a PRI sent over UDP to localhost is received bit-exact, with its header |
 | `test_ddc_replay` | a short run saves only the DDC files (no raw data); `replay_ddc_udp` sends them to localhost bit-exact, with the PRI timing (median delay below 10 % of the PRI); when built, the C sender `radar_stream_send` sends them (saved with `-v6` and `-v7`) bit-exact as well |
@@ -563,7 +573,8 @@ budget.
 | `test_short_pulse_ghost` | a strong target at 65 km is detected, and its short-pulse echo in the long window gives no ghost plot |
 | `test_six_targets(mode, clutterOn, keepRaw)` | 6 targets (0.5 - 10 m^2 mean RCS, Swerling 1, 8 - 48 km, up to 290 m/s, around the radar) are detected with the right range, azimuth, elevation and ambiguous velocity, with at most 2 false plots; one raw file per PRI, named by the pulse number |
 | `test_ppi_interactive` | PPI interaction: data tips, zoom around the cursor, pan, keys, filters, pinned tips, pause, clear, PNG; detection display (modes, arcs, data tips, filters); CFAR threshold field (Apply, hand-over through `ppi_update`, invalid input, Default, Pfa); tracks (triangles, data tip, checkbox); block processing times |
-| `test_cfar` | the three CFAR methods on exponential noise: false alarm rate 1e-3 in the interior and at the range edges (shifted window), targets in the first and last range cell detected, only the tested range interval is tested |
+| `test_setup` | configuration edge cases without a simulation: the simulated sectors (`[0 360]` = whole circle, across North, several sectors), settings that cannot work stop with a message naming them (MTI notch over all Doppler bins, CPI too short, unknown CFAR method, DDC rate, PRF mode), a short pulse that hands over within its first CFAR window keeps one whole window (and the C receiver accepts the exported configuration) |
+| `test_cfar` | the three CFAR methods on exponential noise: false alarm rate 1e-3 in the interior and at the range edges (shifted window), targets in the first and last range cell detected, only the tested range interval is tested, the noise estimate equals the direct sums over the (shifted) window, also when the whole tested interval lies within the edge cells |
 | `test_tracker` | EKF tracker on synthetic plots of the six targets over 5 scans with false plots, 3-D and 2-D, CV and CA: one confirmed track per target, close to it, no false track; GNN with two targets 200 m apart (nearest neighbour would merge them); CA against CV on a target accelerating at 4 m/s^2; when built, the C tracker gives the same track updates |
 | `test_c_receiver(mode, ..., cfarMethod)` | the six-target scenario streamed over UDP to the C receiver (`radar_receiver/`): its plots and track updates must match MATLAB; the recorded stream is replayed to check repeatability and speed |
 

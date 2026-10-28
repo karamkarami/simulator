@@ -18,7 +18,8 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
 
-set(CMAKE_PREFIX_PATH "C:/Qt/6.12.0/mingw_64")
+# Default Qt location on Windows; appended, so -DCMAKE_PREFIX_PATH=<Qt> still wins
+list(APPEND CMAKE_PREFIX_PATH "C:/Qt/6.12.0/mingw_64")
 
 # Compiler flags. No -ffast-math: the elevation of a plot is NaN without
 # beamforming and the processing relies on IEEE behaviour.
@@ -76,6 +77,9 @@ if(RADAR_OPENMP)
     else()
         message(WARNING "OpenMP not found: the receiver runs single-threaded")
     endif()
+endif()
+if(NOT OpenMP_C_FOUND AND NOT MSVC)
+    target_compile_options(radar_core PRIVATE -Wno-unknown-pragmas)   # the omp pragmas are ignored
 endif()
 find_package(Threads REQUIRED)
 target_link_libraries(radar_core PUBLIC Threads::Threads)
@@ -181,6 +185,18 @@ if(RADAR_BUILD_TESTS)
     add_test(NAME core COMMAND test_core ${CMAKE_CURRENT_SOURCE_DIR}/config/radar_config.bin)
     # phase codes with mismatch filters (export_receiver_config.m, see README)
     add_test(NAME core_phasecode COMMAND test_core ${CMAKE_CURRENT_SOURCE_DIR}/config/radar_config_phasecode.bin)
+
+    # the CFAR against direct sums (white-box: the test includes processor.c)
+    add_executable(test_cfar tests/test_cfar.c src/config.c src/fft.c src/extractor.c src/tracker.c src/platform.c)
+    target_include_directories(test_cfar PRIVATE src)
+    target_link_libraries(test_cfar PRIVATE Threads::Threads)
+    if(OpenMP_C_FOUND)
+        target_link_libraries(test_cfar PRIVATE OpenMP::OpenMP_C)
+    endif()
+    if(NOT WIN32)
+        target_link_libraries(test_cfar PRIVATE m)
+    endif()
+    add_test(NAME cfar COMMAND test_cfar ${CMAKE_CURRENT_SOURCE_DIR}/config/radar_config.bin)
 
     add_executable(test_tracker tests/test_tracker.c)
     target_link_libraries(test_tracker PRIVATE radar_core)

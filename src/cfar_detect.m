@@ -23,8 +23,10 @@ isDet = false(nB, nR, nD);
 noise = zeros(nB, nR, nD, class(P));
 t = wv.testIdx;
 if t(2) < t(1), return; end
-lo = max(1, t(1) - oR);                            % range cells the tested cells need
-hi = min(nR, t(2) + oR);
+% range cells the windows of the tested cells need (also the shifted windows
+% of tested cells within oR cells of an edge)
+lo = max(1, min(t(1), nR - oR) - oR);
+hi = min(nR, max(t(2), oR + 1) + oR);
 Q = P(:, lo:hi, :);
 sumOuter = box_sum(Q, oR, oD);                     % centred sums (zero padded in range)
 sumGuard = box_sum(Q, gR, gD);
@@ -36,7 +38,7 @@ est = (sumOuter(:, rc - lo + 1, :) - sumGuard(:, r - lo + 1, :)) ./ reshape(nTra
 isDet(:, r, :) = P(:, r, :) > c.alpha * est;
 noise(:, r, :) = est;
 zeroBin = floor(nD/2) + 1;                         % zero Doppler after fftshift
-isDet(:, :, zeroBin-sys.dop.notchBins:zeroBin+sys.dop.notchBins) = false;
+isDet(:, :, max(1, zeroBin-sys.dop.notchBins):min(nD, zeroBin+sys.dop.notchBins)) = false;
 end
 
 function S = box_sum(P, hr, hd)

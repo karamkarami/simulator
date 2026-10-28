@@ -643,7 +643,10 @@ static void cfar(const Processor *p, PulseState *s, const PulseConfig *pc)
 
     memset(s->det, 0, (size_t)nfft * nCells);
     if (l < f) return;
-    const int lo = f - oR > 0 ? f - oR : 0, hi = l + oR < nR - 1 ? l + oR : nR - 1;
+    /* range cells the windows of the tested cells need (also the shifted windows
+     * of tested cells within oR cells of an edge): centres fc ... lc */
+    const int fc = f < nR - 1 - oR ? f : nR - 1 - oR, lc = l > oR ? l : oR;
+    const int lo = fc - oR > 0 ? fc - oR : 0, hi = lc + oR < nR - 1 ? lc + oR : nR - 1;
     const int n = hi - lo + 1;
     const double *restrict cntInv = s->cntInv;
 

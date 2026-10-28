@@ -63,7 +63,8 @@ sysS = sys;  sysS.cfg = cfgS;
 [rpS, xS] = run_cpi(sysS, tgt, tp, azAnt, wv);
 [rpN, xN, noise] = run_cpi(sys, [], tp, azAnt, wv);
 
-%% Measure the SNR after every block (signal: centre pulse of the CPI; noise: all pulses)
+%% Measure the SNR after every block (signal: centre pulse of the CPI; noise: all pulses,
+%  after the Doppler processing all Doppler bins outside the MTI notch)
 tau = 2*R0/c;
 inEcho = @(t) t >= wv.tTx_s + tau + 0.25*wv.width_s & t <= wv.tTx_s + tau + 0.75*wv.width_s;
 
@@ -85,8 +86,13 @@ noiseMti = abs(yN(beam, :, :)).^2;
 m.mti = mean(abs(yS(beam, r, mid)).^2) / mean(noiseMti(:));
 pS = doppler_process(yS, sys);
 pN = doppler_process(yN, sys);
-[pk, kd] = max(pS(beam, r, :));
-m.doppler = pk / mean(pN(beam, :, kd));
+pk = max(pS(beam, r, :));
+% doppler_process makes the noise floor flat: the noise of all bins outside the
+% MTI notch (the noise of the target bin alone scatters by about 1 dB)
+zeroBin = floor(sys.dop.nfft/2) + 1;
+outside = abs((1:sys.dop.nfft) - zeroBin) > sys.dop.notchBins;
+noiseDop = pN(beam, :, outside);
+m.doppler = pk / mean(noiseDop(:));
 
 %% Compare
 blocks = {'adc', 'ddc', 'dbf', 'mf', 'mti', 'doppler'};

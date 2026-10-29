@@ -4,10 +4,18 @@ function ok = test_ppi_interactive()
 %   through ppi_callbacks.m like the mouse, keyboard and panel would:
 %   hover data tips (plot and true target), wheel zoom around the cursor,
 %   pan, keys, show/hide of short- and long-pulse plots, SNR and age
-%   filters, clear, pinned data tips, labels, reset and PNG export.
+%   filters, clear, pinned data tips, labels, reset and PNG export; the
+%   display of the CFAR detections before the plot extractor (arcs, data
+%   tips, filters, key d) and the CFAR threshold field (request, hand-over
+%   to the processing through ppi_update, invalid input, default).
 
 root = fileparts(fileparts(mfilename('fullpath')));
 addpath(root, fullfile(root, 'src'));
+if exist('OCTAVE_VERSION', 'builtin') && isempty(available_graphics_toolkits())
+    fprintf('Interactive PPI test: SKIPPED (no graphics toolkit: run octave with a display, e.g. xvfb-run octave)\n');
+    ok = true;
+    return
+end
 cfg = radar_config();
 cfg.display.visible = false;
 cfg.targets = make_target('T1', 1, 20e3, 60, 1000, 100, 0);
@@ -94,6 +102,88 @@ ok = check(n == 1, 'click on a pinned plot removes its data tip') && ok;
 ppi_callbacks('cleartips', fig);
 S = getappdata(fig, 'ppi');
 ok = check(isempty(S.h.pins), 'remove all data tips') && ok;
+
+%% CFAR detections before the plot extractor (display modes)
+% two detections of one target in successive CPI updates (long pulse) and a short-pulse one
+dets = [11.0  95.0 30e3 5 3   28 2 5 150 30;
+        11.1  95.2 30e3 5 3   27 2 5 150 30;
+        11.5 300.0 15e3 2 -4  13 1 2  80 12];
+ppi_update(ppi, sys, 100, 12.0, 2, p, dets);
+S = getappdata(fig, 'ppi');
+ok = check(strcmp(get(S.h.detLong, 'Visible'), 'off') && numel(get(S.h.long, 'XData')) == 2, ...
+           'default mode: plots only, no detections') && ok;
+ppi_callbacks('option', fig, 'showMode', 'detections');
+xd = get(S.h.detLong, 'XData');
+ok = check(isempty(get(S.h.long, 'XData')) && isempty(get(S.h.short, 'XData')) && numel(xd) == 6 ...
+           && numel(get(S.h.detShort, 'XData')) == 3, 'detections mode: arcs only (3 points per arc)') && ok;
+yd = get(S.h.detLong, 'YData');
+arcLen = hypot(xd(2) - xd(1), yd(2) - yd(1));
+ok = check(abs(arcLen - 30*cosd(5)*S.detArc_deg*pi/180) < 1e-6, ...
+           'an arc spans the azimuth step of a CPI update') && ok;
+dxy = 15*cosd(2)*[sind(300) cosd(300)];
+txt = ppi_callbacks('hover', fig, dxy);
+ok = check(~isempty(strfind(txt, 'CFAR detection (short pulse)')) && ~isempty(strfind(txt, '15.000 km')) ...
+           && ~isempty(strfind(txt, 'Doppler bin 12')), 'hover over a detection shows its values') && ok;
+ok = check(isempty(strfind(ppi_callbacks('hover', fig, xy(1)), 'Plot')), 'plots have no data tip in detections mode') && ok;
+ppi_callbacks('option', fig, 'minSnr_dB', 20);
+ok = check(all(isnan(get(S.h.detShort, 'XData'))) || isempty(get(S.h.detShort, 'XData')), ...
+           'SNR filter also hides detections') && ok;
+ppi_callbacks('option', fig, 'minSnr_dB', 0);
+ppi_callbacks('key', fig, struct('Key', 'd', 'Character', 'd'));
+S = getappdata(fig, 'ppi');
+ok = check(strcmp(S.opt.showMode, 'both') && numel(get(S.h.long, 'XData')) == 2 && numel(get(S.h.detLong, 'XData')) == 6 ...
+           && get(S.h.ui.showMode, 'Value') == 3, 'key d: plots and detections') && ok;
+ok = check(~isempty(strfind(get(S.h.title, 'String'), 'detections 3')), 'title counts the detections') && ok;
+n = ppi_callbacks('pin', fig, dxy);
+ok = check(n == 1, 'a detection data tip can be pinned') && ok;
+ppi_callbacks('cleartips', fig);
+ppi_callbacks('option', fig, 'showMode', 'plots');
+
+%% CFAR threshold
+alpha0 = sys.cfar.alpha;
+dB0 = 10*log10(alpha0);
+ok = check(~isempty(strfind(get(S.h.ui.cfarInfo, 'String'), sprintf('2-D: %.2f dB', dB0))) ...
+           && ~isempty(strfind(get(S.h.ui.cfarInfo, 'String'), 'Pfa 1.0e-08')), ...
+           'the panel shows the threshold of cfg.cfar.pfa (1e-8)') && ok;
+ppi_callbacks('cfar', fig, 18);
+sys2 = ppi_update(ppi, sys, 101, 12.1, 2, p, dets);
+ok = check(abs(sys2.cfar.alpha - 10^1.8) < 1e-9 && ~isempty(strfind(get(S.h.ui.cfarInfo, 'String'), '2-D: 18.00 dB')), ...
+           'Apply: ppi_update hands the new threshold to the processing') && ok;
+sys3 = ppi_update(ppi, sys2, 102, 12.2, 2, p, dets);
+ok = check(sys3.cfar.alpha == sys2.cfar.alpha, 'the request is applied once') && ok;
+ppi_callbacks('cfar', fig, NaN);
+sys4 = ppi_update(ppi, sys3, 103, 12.3, 2, p, dets);
+ok = check(sys4.cfar.alpha == sys3.cfar.alpha && ~isempty(strfind(get(S.h.ui.cfarInfo, 'String'), 'enter 0 ... 50 dB')), ...
+           'an invalid value is refused') && ok;
+ppi_callbacks('cfar', fig, dB0);                           % Default button
+sys5 = ppi_update(ppi, sys4, 104, 12.4, 2, p, dets);
+ok = check(abs(sys5.cfar.alpha - alpha0) < 1e-9*alpha0, 'Default restores the threshold of cfg.cfar.pfa') && ok;
+ok = check(abs(cfar_pfa(alpha0, sys.cfar.nTrain, sys.dop.nLooks) - cfg.cfar.twoD.pfa) < 1e-3*cfg.cfar.twoD.pfa, ...
+           'cfar_pfa is the inverse of cfar_alpha') && ok;
+
+%% Tracks and block processing times
+tk = struct('id', {7, 8}, 'confirmed', {true, false}, 't_s', 11.9, 'pos_m', {[30e3*sind(95) 30e3*cosd(95) 2600], ...
+            [5e3 5e3 0]}, 'vel_mps', {[-100 50 0], [0 0 0]}, 'alt_m', {2606, NaN}, 'hits', {5, 1}, ...
+            'misses', 0, 'dim', 3);
+us = [120 340 56 980 760 15 4 30 500];               % blocks, console output, display
+ppi_update(ppi, sys, 105, 12.5, 2, p, dets, tk, us);
+S = getappdata(fig, 'ppi');
+ok = check(numel(get(S.h.track, 'XData')) == 1 && numel(get(S.h.trackTent, 'XData')) == 1, ...
+           'confirmed and tentative tracks drawn as triangles') && ok;
+c3 = xy(3);
+ok = check(abs(get(S.h.track, 'XData') - c3(1)) < 0.3, 'the triangle of track 7 surrounds the plot at 30 km') && ok;
+txt = ppi_callbacks('hover', fig, xy(3));
+ok = check(~isempty(strfind(txt, 'Track 7 (confirmed, 3-D EKF)')) && ~isempty(strfind(txt, 'Speed       111.8 m/s')) ...
+           && ~isempty(strfind(txt, 'Height      2606 m')), 'hover over a track (wins over its plot)') && ok;
+str = get(S.h.timing, 'String');
+ok = check(numel(str) == 11 && ~isempty(strfind(str{5}, '980.0')) && ~isempty(strfind(str{6}, 'CFAR 2-D')) ...
+           && ~isempty(strfind(str{9}, 'Console output')) && ~isempty(strfind(str{10}, 'Display (PPI)')) ...
+           && ~isempty(strfind(str{10}, '500.0')) && ~isempty(strfind(str{11}, '2805.0')), ...
+           'block, console and display times in the panel') && ok;
+ppi_callbacks('option', fig, 'showTracks', false);
+ok = check(all(isnan(get(S.h.track, 'XData'))) && isempty(strfind(ppi_callbacks('hover', fig, xy(3)), 'Track')), ...
+           'Tracks checkbox hides the tracks') && ok;
+ppi_callbacks('option', fig, 'showTracks', true);
 
 %% Pause, clear, save
 ppi_callbacks('pause', fig);

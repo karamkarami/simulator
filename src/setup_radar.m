@@ -13,10 +13,13 @@ sys.fs     = fs;
 sys.fIF    = cfg.adc.fIF_Hz;                                  % IF carrier at the ADC [Hz]
 sys.fLO    = cfg.fc - sys.fIF;                                % receiver local oscillator [Hz]
 
+sys.cfar = cfar_window(cfg);                                  % window of the selected CFAR method
+
 %% Input files (defaults are built when missing or when made for other cfg values)
 ant  = load_input(cfg, 'antenna', struct('fc', cfg.fc, 'spacing', cfg.ant.elementSpacing_lambda));
-ddcF = load_input(cfg, 'ddc', struct('fs_Hz', fs, 'decimation', cfg.ddc.decimation, ...
-                                     'coefFracBits', cfg.ddc.coefFracBits));
+[ddcDecim, ddcFile] = ddc_decimation(cfg);                    % 2 or 4 MHz output: its filter file
+ddcF = load_input(cfg, ddcFile, struct('fs_Hz', fs, 'decimation', ddcDecim, ...
+                                       'coefFracBits', cfg.ddc.coefFracBits));
 
 %% Antenna
 sys.ant = ant;
@@ -68,10 +71,21 @@ sys.nStagger  = numel(sys.pri);
 if size(sys.mtiCoeffs, 1) == 1
     sys.mtiCoeffs = repmat(sys.mtiCoeffs, sys.nStagger, 1);
 end
+% Clutter rejection: the MTI filter above, or a clutter map without a filter
+% (a single tap of 1: the Doppler processing gets the pulses themselves)
+switch lower(cfg.clutterRejection.method)
+    case 'mti'
+        sys.cmap.enabled = false;
+    case 'map'
+        sys.cmap.enabled = true;
+        sys.mtiCoeffs = ones(sys.nStagger, 1);
+    otherwise
+        error('cfg.clutterRejection.method must be ''mti'' or ''map''.');
+end
 
 %% DDC filters (signed 16-bit integers with coefFracBits fractional bits) and NCO
-D1 = cfg.ddc.decimation(1);
-D2 = cfg.ddc.decimation(2);
+D1 = ddcDecim(1);
+D2 = ddcDecim(2);
 sys.ddc.h1 = double(ddcF.h1(:));                              % integer coefficients
 sys.ddc.h2 = double(ddcF.h2(:));
 sys.ddc.shift = cfg.ddc.shift;
@@ -97,10 +111,33 @@ sys.ddc.noiseBw_Hz = fs * sum(sys.ddc.hEq.^2);                % complex noise ba
 % receive window. While a pulse is transmitted the receiver sees the
 % transmitter leakage (these samples are not used by the processing).
 names = {'short', 'long'};
+codes = [];                                                   % phase codes and mismatch filters
+if any(strcmpi({cfg.wave.short.type, cfg.wave.long.type}, 'phasecode'))
+    nChips = [round(cfg.wave.short.width_s / cfg.wave.short.chip_s), round(cfg.wave.long.width_s / cfg.wave.long.chip_s)];
+    codes = load_input(cfg, 'phaseCode', struct('shortChips', nChips(1), 'longChips', nChips(2)));
+end
 for i = 1:2
     wv = cfg.wave.(names{i});
     wv.name     = names{i};
     wv.lambda_m = sys.lambda;                                 % both sub-pulses are on fc
+    wv.compression = lower(wv.compression);
+    if strcmpi(wv.type, 'phasecode')
+        wv.code = codes.([names{i} 'Code'])(:);
+        if numel(wv.code) ~= round(wv.width_s / wv.chip_s)
+            error('The %s code of %s has %d chips, but width_s/chip_s = %d.', names{i}, cfg.files.phaseCode, ...
+                  numel(wv.code), round(wv.width_s / wv.chip_s));
+        end
+        if strcmp(wv.compression, 'mismatch')
+            wv.mismatch = codes.([names{i} 'Mismatch'])(:);
+            wv.mismatchRate_Hz = 1 / wv.chip_s;                % one coefficient per chip (default)
+            if isfield(codes, [names{i} 'MismatchRate_Hz'])
+                wv.mismatchRate_Hz = codes.([names{i} 'MismatchRate_Hz']);
+            end
+        end
+    end
+    % Pulse compression filter (unit noise gain) and the samples by which its
+    % peak comes earlier than that of the matched filter
+    [wv.mfTaps, wv.mfShift] = compression_filter(wv, cfg, sys);
     sys.wave.(names{i}) = wv;
 end
 ws = sys.wave.short;
@@ -109,9 +146,12 @@ if wl.tTx_s < ws.tTx_s + ws.width_s
     error('The long pulse must start after the end of the short pulse.');
 end
 filterSpan    = (L1-1)/fs + (L2-1)/fs1;                       % input span of one DDC output sample
-cfarSpan      = (cfg.cfar.guardRange + cfg.cfar.trainRange) / sys.fsOut;  % range cells the CFAR cannot test
 sys.rxStart_s = 0;                                            % the record starts with the PRI
-rxEnd = wl.tTx_s + wl.width_s + 2*cfg.rx.maxRange_m/c + filterSpan + cfarSpan + 2/sys.fsOut;
+% The record ends with the echo of the long pulse from cfg.rx.maxRange_m. It
+% (and so the DDC output) depends only on the PRI timeline, the instrumented
+% range and the DDC filters, not on the processing of the receiver
+% (compression filter, CFAR, clutter rejection).
+rxEnd = wl.tTx_s + wl.width_s + 2*cfg.rx.maxRange_m/c + filterSpan + 2/sys.fsOut;
 if rxEnd > min(sys.pri)
     error(['Receive window (%.1f us) does not fit in the shortest PRI (%.1f us): reduce ', ...
            'cfg.rx.maxRange_m or start the long pulse earlier.'], rxEnd*1e6, min(sys.pri)*1e6);
@@ -133,55 +173,80 @@ k = (0:sys.nDdc-1)';
 firstAdc = k*D2*D1 + 1;
 lastAdc  = (k*D2 + L2 - 1)*D1 + L1;
 
-%% Receive interval, DDC segment, matched filter and delay / range axes of every sub-pulse
+%% Receive interval and delay / range axes of every sub-pulse
+% rxIdx: the DDC samples whose whole input window lies inside the receive
+% interval of the sub-pulse. They follow from the timing alone; the header of
+% every PRI holds the first and last of them.
+% Range cell k holds the echo that starts at sample rxIdx(k): the cells of
+% the echoes that lie entirely inside the interval (the reference of the
+% matched filter holds the pulse at the mid-sample times, so the echo starts
+% half a sample before tDdc(rxIdx(k))).
 rxInterval.short = [ws.tTx_s + ws.width_s, wl.tTx_s];         % [start end) of the receive interval
 rxInterval.long  = [wl.tTx_s + wl.width_s, inf];
+oR = sys.cfar.guardRange + sys.cfar.trainRange;
 for i = 1:2
     wv = sys.wave.(names{i});
-    % DDC samples whose whole input window lies inside the receive interval of this sub-pulse
     iv = rxInterval.(names{i});
-    wv.ddcIdx = find(sys.tAdc(firstAdc) >= iv(1) & sys.tAdc(lastAdc) < iv(2)).';
-    % Matched filter (Taylor window for LFM), unit noise gain
-    Lp  = round(wv.width_s * sys.fsOut);                      % matched filter length [samples]
-    if numel(wv.ddcIdx) < Lp + 2*(cfg.cfar.guardRange + cfg.cfar.trainRange) + 1
-        error(['The %s-pulse receive interval is too short for its matched filter and the CFAR ', ...
-               'window: move the long pulse later or increase cfg.rx.maxRange_m.'], wv.name);
+    wv.rxIdx = find(sys.tAdc(firstAdc) >= iv(1) & sys.tAdc(lastAdc) < iv(2)).';
+    wv.nRange = numel(wv.rxIdx) - round(wv.width_s * sys.fsOut) + 1;
+    if wv.nRange < 2*oR + 1
+        error(['The %s-pulse receive interval is too short for the pulse and the CFAR window: move ', ...
+               'the long pulse later or increase cfg.rx.maxRange_m.'], wv.name);
     end
-    ref = waveform_envelope(wv, ((0:Lp-1)' + 0.5) / sys.fsOut);  % mid-sample times (not on chip edges)
-    if strcmpi(wv.type, 'lfm')
-        win = taylor_window(Lp, cfg.proc.taylorNbar, cfg.proc.taylorSll_dB);
-    else
-        win = ones(Lp, 1);
-    end
-    h = conj(flipud(ref .* win));
-    wv.mfTaps = (h / norm(h)).';                              % row vector
-    % Output k of the valid convolution correlates the reference with the
-    % segment starting at sample k. The reference holds the pulse at the
-    % mid-sample times, so output k peaks for an echo that starts half a
-    % sample before tDdc(k).
-    wv.nRange  = numel(wv.ddcIdx) - Lp + 1;
-    wv.delay_s = sys.tDdc(wv.ddcIdx(1:wv.nRange)).' - 0.5/sys.fsOut - wv.tTx_s;   % delay axis [s]
+    wv.delay_s = sys.tDdc(wv.rxIdx(1:wv.nRange)).' - 0.5/sys.fsOut - wv.tTx_s;   % delay axis [s]
     wv.range_m = c * wv.delay_s / 2;                              % range axis [m]
     sys.wave.(names{i}) = wv;
 end
-% Handover: the short pulse stops where the long pulse starts to be tested
-% (its first CFAR-tested range cell), so a target is not reported twice.
-oR = cfg.cfar.guardRange + cfg.cfar.trainRange;
-handover_m = sys.wave.long.range_m(oR + 1);
+% Handover: the short pulse is tested up to where the long pulse starts (its
+% first range cell, tested thanks to the shifted CFAR window), so a target is
+% not reported twice. The short pulse keeps oR more cells as training cells
+% (and at least one whole CFAR range window).
+handover_m = sys.wave.long.range_m(1);
 ws = sys.wave.short;
-nKeep = find(ws.range_m < handover_m, 1, 'last') + oR;        % + cells only used as CFAR training
-if nKeep < ws.nRange
-    Lp = numel(ws.mfTaps);
-    ws.nRange  = nKeep;
-    ws.ddcIdx  = ws.ddcIdx(1:nKeep + Lp - 1);                 % the matched filter then gives nKeep cells
-    ws.delay_s = ws.delay_s(1:nKeep);
-    ws.range_m = ws.range_m(1:nKeep);
-    sys.wave.short = ws;
-else
+if ws.range_m(end) + abs(diff(ws.range_m(1:2))) < handover_m
     warning('Gap in the range coverage: short pulse up to %.1f km, long pulse from %.1f km.', ...
         ws.range_m(end)/1e3, handover_m/1e3);
 end
+nKeep = max(find(ws.range_m < handover_m, 1, 'last') + oR, 2*oR + 1);   % + cells only used as CFAR training
+if nKeep < ws.nRange
+    ws.nRange  = nKeep;
+    ws.delay_s = ws.delay_s(1:nKeep);
+    ws.range_m = ws.range_m(1:nKeep);
+    sys.wave.short = ws;
+end
 sys.handover_m = handover_m;
+
+% DDC segment of every sub-pulse (ddcIdx) for its compression filter: the
+% output of cell k uses the L = numel(mfTaps) samples from rxIdx(k) - mfShift
+% on (a mismatch filter is longer than the pulse: mfShift of its samples come
+% before the echo). Samples outside the receive interval count as zeros:
+% wv.pad = [zeros before, zeros after] the segment. So every compression
+% filter gives the same range cells, up to both ends of the interval, and the
+% record does not depend on the filter.
+for i = 1:2
+    wv = sys.wave.(names{i});
+    need = wv.rxIdx(1) - wv.mfShift + (0:wv.nRange + numel(wv.mfTaps) - 2);
+    wv.ddcIdx = need(need >= wv.rxIdx(1) & need <= wv.rxIdx(end));
+    wv.pad = [nnz(need < wv.rxIdx(1)), nnz(need > wv.rxIdx(end))];
+    sys.wave.(names{i}) = wv;
+end
+
+% Range cells tested by the CFAR (both sub-pulses): cfg.cfar.<pulse>.min/maxRange_m
+% and, for the short pulse, the handover. testIdx = [first last] (1-based).
+for i = 1:2
+    wv = sys.wave.(names{i});
+    lim = cfg.cfar.(names{i});
+    ok = wv.range_m >= lim.minRange_m & wv.range_m <= lim.maxRange_m;
+    if i == 1, ok = ok & wv.range_m < handover_m; end
+    first = find(ok, 1, 'first');
+    last  = find(ok, 1, 'last');
+    if isempty(first)
+        warning('No %s-pulse range cell is tested: check cfg.cfar.%s.minRange_m / maxRange_m.', names{i}, names{i});
+        first = 1;  last = 0;
+    end
+    wv.testIdx = [first last];
+    sys.wave.(names{i}) = wv;
+end
 
 %% Digital beamforming (disabled with a single receive element)
 sys.dbf.enabled = sys.nCh > 1;
@@ -235,6 +300,10 @@ elseif isempty(nfft)
     nfft = 2^nextpow2(sys.cpi.length);                        % 114 pulses -> 128
 end
 rowLen = min(rowLen, nfft);                                   % a shorter FFT keeps the newest samples
+if rowLen < 2
+    error('The CPI of %d pulses is too short for the MTI and the Doppler processing (cfg.proc.cpiLength).', ...
+          sys.cpi.length);
+end
 sys.cpi.nRows  = nRows;
 sys.cpi.rowLen = rowLen;
 w = hamming_window(rowLen);
@@ -269,20 +338,151 @@ end
 sys.dop.notchBins = round(cfg.cfar.notchWidth * 2 * nfft / rowLen);
 zeroBin = floor(nfft/2) + 1;
 tested = abs((1:nfft) - zeroBin) > sys.dop.notchBins;
+if ~any(tested)
+    error('The MTI notch (cfg.cfar.notchWidth = %g: +-%d bins) covers every Doppler bin (FFT length %d).', ...
+          cfg.cfar.notchWidth, sys.dop.notchBins, nfft);
+end
 sys.dop.nLooks = min(nLooks(tested));
+if sys.cmap.enabled                                           % the band is tested against the map
+    cr = cfg.clutterRejection;
+    if ~(cr.mapWeight > 0 && cr.mapWeight <= 1) || ~(cr.mapAzCell_deg > 0 && cr.mapAzCell_deg <= 360)
+        error('cfg.clutterRejection: mapWeight must be in (0, 1] and mapAzCell_deg in (0, 360].');
+    end
+    sys.cmap.azCell_deg = cr.mapAzCell_deg;
+    sys.cmap.nAz    = ceil(360 / cr.mapAzCell_deg - 1e-9);       % azimuth cells of the map
+    sys.cmap.weight = cr.mapWeight;
+    sys.cmap.bins   = find(~tested);                          % Doppler bins of the band
+    sys.cmap.alpha  = clutter_map_alpha(cr.mapWeight, cr.mapPfa, cr.mapThreshold_dB);
+end
 % Median / mean of the noise power (used to estimate the noise floor of a beam)
 L = sys.dop.nLooks;
 sys.dop.medianToMean = fzero(@(x) gammainc(L*x, L) - 0.5, [0.1 2]);
 
-%% CFAR
-sys.cfar = cfg.cfar;
-nOuter = (2*(cfg.cfar.guardRange + cfg.cfar.trainRange) + 1) * (2*(cfg.cfar.guardDoppler + cfg.cfar.trainDoppler) + 1);
-nGuard = (2*cfg.cfar.guardRange + 1) * (2*cfg.cfar.guardDoppler + 1);
+%% CFAR threshold of the selected method
+c = sys.cfar;
+nOuter = (2*(c.guardRange + c.trainRange) + 1) * (2*(c.guardDoppler + c.trainDoppler) + 1);
+nGuard = (2*c.guardRange + 1) * (2*c.guardDoppler + 1);
 sys.cfar.nTrain = nOuter - nGuard;
-sys.cfar.alpha  = cfar_alpha(cfg.cfar.pfa, sys.cfar.nTrain, sys.dop.nLooks);
-if 2*(cfg.cfar.guardDoppler + cfg.cfar.trainDoppler) + 1 > nfft
-    error('CFAR Doppler window is larger than the FFT length.');
+if isempty(c.threshold_dB)
+    sys.cfar.alpha = cfar_alpha(c.pfa, sys.cfar.nTrain, sys.dop.nLooks);
+else
+    sys.cfar.alpha = 10^(c.threshold_dB/10);
 end
+sys.cfar.pfa = cfar_pfa(sys.cfar.alpha, sys.cfar.nTrain, sys.dop.nLooks);   % of the threshold in use
+if 2*(c.guardDoppler + c.trainDoppler) + 1 > nfft
+    error('CFAR Doppler window (%d bins) is larger than the FFT length (%d).', ...
+          2*(c.guardDoppler + c.trainDoppler) + 1, nfft);
+end
+
+%% Tracking
+sys.track = track_setup(cfg, sys);
+end
+
+function [taps, shift] = compression_filter(wv, cfg, sys)
+% Pulse compression filter of a sub-pulse at the DDC rate (row vector, unit
+% noise gain) and the number of samples by which its peak comes earlier than
+% that of the matched filter.
+%   matched  : conj(flip(reference)), the reference sampled at the mid-sample
+%              times (Taylor window for LFM); shift 0
+%   mismatch : phase code only: every coefficient of wv.mismatch (rate
+%              wv.mismatchRate_Hz, by default one per chip) is held for the
+%              DDC samples of its period (with one per chip: a chip-matched
+%              sum followed by the chip-rate filter). shift: from the peaks of
+%              both filters for the pulse after the DDC filters (the filter
+%              may have been designed on that pulse or on the ideal chips)
+fsOut = sys.fsOut;
+Lp  = round(wv.width_s * fsOut);                              % pulse length [samples]
+ref = waveform_envelope(wv, ((0:Lp-1)' + 0.5) / fsOut);       % mid-sample times (not on chip edges)
+win = ones(Lp, 1);
+if strcmpi(wv.type, 'lfm')
+    win = taylor_window(Lp, cfg.proc.taylorNbar, cfg.proc.taylorSll_dB);
+end
+hMatched = conj(flipud(ref .* win));
+switch wv.compression
+    case 'matched'
+        h = hMatched;
+        shift = 0;
+    case 'mismatch'
+        if ~strcmpi(wv.type, 'phasecode')
+            error('cfg.wave.%s.compression = ''mismatch'' needs a phase code (type ''phasecode'').', wv.name);
+        end
+        spc = fsOut / wv.mismatchRate_Hz;                     % DDC samples per filter coefficient
+        if abs(spc - round(spc)) > 1e-9 || spc < 0.5
+            error(['The %s-pulse mismatch filter (%g MHz) does not fit the DDC output rate (%g MHz): ' ...
+                   'the rate must be a whole multiple of the filter rate.'], wv.name, ...
+                  wv.mismatchRate_Hz/1e6, fsOut/1e6);
+        end
+        h = kron(wv.mismatch(:), ones(round(spc), 1));
+        % valid output index of the peak = echo start + peak of the full
+        % convolution - (filter length - 1), for both filters
+        y = ddc_pulse(sys, wv);                               % the pulse after the DDC filters
+        qMatched = peak_position(conv(y, hMatched));
+        q = peak_position(conv(y, h));
+        shift = round((numel(h) - 1 - q) - (Lp - 1 - qMatched));
+    otherwise
+        error('cfg.wave.%s.compression must be ''matched'' or ''mismatch''.', wv.name);
+end
+taps = (h / norm(h)).';
+end
+
+function q = peak_position(y)
+% Position (0-based, with parabolic interpolation) of the largest |y|.
+a = abs(y(:));
+[~, k] = max(a);
+q = k - 1;
+if k > 1 && k < numel(a)
+    d = a(k-1) - 2*a(k) + a(k+1);
+    if d < 0, q = q + 0.5*(a(k-1) - a(k+1)) / d; end
+end
+end
+
+function alpha = clutter_map_alpha(weight, pfa, threshold_dB)
+% Threshold factor of the clutter-map test after n = 1, 2, ... averaged scans
+% (the last value holds for all later scans). The map is a weighted sum of the
+% mean powers of n scans (weights c: the plain mean while n < 1/weight, then
+% exponential averaging). For independent exponentially distributed powers
+% P(power > alpha*map) = prod(1 ./ (1 + alpha*c)), which is set to pfa.
+nMax = min(ceil(5 / weight), 1000);                           % then the oldest scans weigh < exp(-5)
+if ~isempty(threshold_dB)
+    alpha = repmat(10^(threshold_dB/10), 1, nMax);
+    return
+end
+alpha = zeros(1, nMax);
+c = [];
+for n = 1:nMax
+    w = max(weight, 1/n);
+    c = [(1 - w)*c, w];
+    f = @(a) sum(log1p(a*c)) + log(pfa);
+    hi = 1;
+    while f(hi) < 0, hi = 2*hi; end
+    alpha(n) = fzero(f, [0 hi]);
+end
+end
+
+function w = cfar_window(cfg)
+% Window and threshold settings of the selected CFAR method, as a range x Doppler window.
+c = cfg.cfar;
+w.method = lower(c.method);
+w.notchWidth = c.notchWidth;
+switch w.method
+    case '2d'
+        m = c.twoD;
+        w.guardRange = m.guardRange;    w.trainRange = m.trainRange;
+        w.guardDoppler = m.guardDoppler;  w.trainDoppler = m.trainDoppler;
+        w.label = '2-D';
+    case 'range'
+        m = c.range;
+        w.guardRange = m.guard;  w.trainRange = m.train;  w.guardDoppler = 0;  w.trainDoppler = 0;
+        w.label = '1-D range';
+    case 'doppler'
+        m = c.doppler;
+        w.guardRange = 0;  w.trainRange = 0;  w.guardDoppler = m.guard;  w.trainDoppler = m.train;
+        w.label = '1-D Doppler';
+    otherwise
+        error('cfg.cfar.method must be ''2d'', ''range'' or ''doppler''.');
+end
+w.pfa = m.pfa;
+w.threshold_dB = m.threshold_dB;
 end
 
 function bw = beamwidth_3dB(az_deg, gain_dB)

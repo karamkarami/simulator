@@ -23,6 +23,9 @@ if ~isempty(sectors)
     s.active(:) = false;
     for i = 1:size(sectors, 1)
         width = mod(sectors(i, 2) - sectors(i, 1), 360);
+        if width == 0 && sectors(i, 2) ~= sectors(i, 1)
+            width = 360;                                         % e.g. [0 360]: the whole circle
+        end
         s.active = s.active | mod(s.az_deg - sectors(i, 1), 360) <= width;
     end
 end

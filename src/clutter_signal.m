@@ -4,13 +4,17 @@ function xc = clutter_signal(clut, sys, az_deg, t_s)
 %   both sub-pulses during the receive window [nAdc x 1] for the antenna
 %   azimuth az_deg at time t_s. The two-way azimuth pattern weights the
 %   clutter cells (this also creates the scanning modulation); every cell
-%   rotates with its internal-motion Doppler. Element i receives
+%   rotates with its internal-motion Doppler (plus a stationary part with
+%   the exponential spectrum model, see clutter_init.m). Element i receives
 %   real(xc * sys.clutterSteer(i)).
 
 azRel = wrap180(clut.az_deg - az_deg);
 sel   = abs(azRel) <= sys.ant.azSpan_deg;
 gAz   = pattern_gain(sys.ant.az_deg, sys.ant.azGain_dB, azRel(sel));     % one-way power = two-way amplitude
 refl  = gAz.' * (clut.rho(sel, :) .* exp(1j*2*pi*clut.fd_Hz(sel, :)*t_s)); % [1 x nRange]
+if ~isempty(clut.dc)                                                     % stationary part (exponential model)
+    refl = refl + gAz.' * clut.dc(sel, :);
+end
 
 xc = zeros(sys.nAdc, 1);
 names = {'short', 'long'};

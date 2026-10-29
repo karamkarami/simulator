@@ -3,10 +3,19 @@ function export_receiver_config(cfg, fileName)
 %
 %   EXPORT_RECEIVER_CONFIG(cfg, fileName) runs setup_radar(cfg) and writes
 %   everything the C receiver needs to process the DDC output that the
-%   simulator streams over UDP (DBF matrix, matched filters, range axes, CPI
-%   length, MTI weights, Doppler window and noise gains, CFAR factor, plot
-%   extraction settings). Export again whenever cfg changes, before starting
-%   the C receiver. Default file: radar_receiver/config/radar_config.bin.
+%   simulator streams over UDP (DBF matrix, pulse compression filters:
+%   matched or, for a phase code, mismatch; the DDC segments and range axes
+%   of both sub-pulses, CPI length, MTI weights or clutter map, Doppler
+%   window and noise gains, CFAR method, window, factor and tested range
+%   cells, plot extraction and tracker settings). Export again whenever cfg
+%   changes, before starting the C receiver. Default file:
+%   radar_receiver/config/radar_config.bin.
+%   The receiver accepts the DDC stream of a simulator run with other
+%   processing settings (compression filter, CFAR, clutter rejection,
+%   tracking, ...): the stream only has to come from the same radar (elements,
+%   DDC rate, PRI timeline and PRF mode) and hold at least the DDC samples
+%   that this configuration needs (cfg.rx.maxRange_m of the sender at least
+%   that of the receiver).
 %
 %   File format (little-endian): 8 bytes 'RADRXCFG', uint32 version (1),
 %   uint32 number of records, then per record: char name[32] (zero padded),
@@ -32,19 +41,32 @@ r{end+1} = {'height_m', sys.ant.height_m};
 r{end+1} = {'rate_dps', sys.ant.rate_dps};
 r{end+1} = {'azBeamwidth_deg', sys.ant.azBeamwidth_deg};
 r{end+1} = {'maxRange_m', cfg.rx.maxRange_m};
-r{end+1} = {'nDdc', sys.nDdc};
+r{end+1} = {'nDdc', sys.nDdc};                       % DDC samples of the PRI (a stream may have more)
 r{end+1} = {'fsOut_Hz', sys.fsOut};
+r{end+1} = {'ddcT0_s', sys.tDdc(1)};                 % time of the first DDC sample in the PRI
 names = {'short', 'long'};
 for i = 1:2
     wv = sys.wave.(names{i});
-    r{end+1} = {[names{i} '_ddcFirst'], wv.ddcIdx(1) - 1};      % 0-based
+    r{end+1} = {[names{i} '_rxFirst'], wv.rxIdx(1) - 1};        % receive interval starts here (0-based)
+    r{end+1} = {[names{i} '_ddcFirst'], wv.ddcIdx(1) - 1};      % DDC segment of the compression filter
     r{end+1} = {[names{i} '_ddcCount'], numel(wv.ddcIdx)};
+    r{end+1} = {[names{i} '_padFront'], wv.pad(1)};             % zeros before and after the segment
+    r{end+1} = {[names{i} '_padBack'], wv.pad(2)};
     r{end+1} = {[names{i} '_nTaps'], numel(wv.mfTaps)};
     r{end+1} = {[names{i} '_nRange'], wv.nRange};
     r{end+1} = {[names{i} '_taps'], complex(wv.mfTaps)};
     r{end+1} = {[names{i} '_range_m'], wv.range_m};
     r{end+1} = {[names{i} '_delay_s'], wv.delay_s};
     r{end+1} = {[names{i} '_lambda_m'], wv.lambda_m};
+    r{end+1} = {[names{i} '_testFirst'], wv.testIdx(1) - 1};    % CFAR-tested range cells (0-based)
+    r{end+1} = {[names{i} '_testCount'], max(0, wv.testIdx(2) - wv.testIdx(1) + 1)};
+    isCode = strcmpi(wv.type, 'phasecode');                   % pulse compression (the taps above are
+    r{end+1} = {[names{i} '_waveform'], double(isCode)};      % the matched or the mismatch filter)
+    r{end+1} = {[names{i} '_compression'], double(strcmp(wv.compression, 'mismatch'))};
+    r{end+1} = {[names{i} '_nChips'], isCode * round(wv.width_s / wv.chip_s)};
+    r{end+1} = {[names{i} '_mfShift'], wv.mfShift};
+    r{end+1} = {[names{i} '_pulse'], complex(waveform_envelope(wv, ((0:round(wv.width_s*sys.fsOut)-1) + 0.5) / sys.fsOut))};
+                                                              % the pulse at the DDC rate (C tests)
 end
 r{end+1} = {'cpiLength', sys.cpi.length};
 r{end+1} = {'nStagger', sys.nStagger};
@@ -57,13 +79,21 @@ r{end+1} = {'dopWindow', sys.dop.window};
 r{end+1} = {'noiseGain', reshape(sys.dop.noiseGain, 1, [])};
 r{end+1} = {'dopFreq_Hz', sys.dop.f_Hz};
 r{end+1} = {'notchBins', sys.dop.notchBins};
+r{end+1} = {'clutterMap', double(sys.cmap.enabled)};    % 0: MTI (band not tested), 1: clutter map of the band
+if sys.cmap.enabled                                  % (mtiCoeffs above are then a single tap of 1)
+    r{end+1} = {'mapAzCell_deg', sys.cmap.azCell_deg};
+    r{end+1} = {'mapWeight', sys.cmap.weight};
+    r{end+1} = {'mapAlpha', sys.cmap.alpha};         % threshold factor after 1, 2, ... averaged scans
+end
 r{end+1} = {'medianToMean', sys.dop.medianToMean};
-r{end+1} = {'guardRange', cfg.cfar.guardRange};
-r{end+1} = {'trainRange', cfg.cfar.trainRange};
-r{end+1} = {'guardDoppler', cfg.cfar.guardDoppler};
-r{end+1} = {'trainDoppler', cfg.cfar.trainDoppler};
+r{end+1} = {'cfarMethod', find(strcmp(sys.cfar.method, {'2d', 'range', 'doppler'})) - 1};   % 0 2-D, 1 range, 2 Doppler
+r{end+1} = {'guardRange', sys.cfar.guardRange};      % window of the selected method (0 = none in that dimension)
+r{end+1} = {'trainRange', sys.cfar.trainRange};
+r{end+1} = {'guardDoppler', sys.cfar.guardDoppler};
+r{end+1} = {'trainDoppler', sys.cfar.trainDoppler};
 r{end+1} = {'nTrain', sys.cfar.nTrain};
 r{end+1} = {'alpha', sys.cfar.alpha};
+r{end+1} = {'nLooks', sys.dop.nLooks};               % optional in the receiver (Pfa of the threshold)
 r{end+1} = {'sidelobeMargin_dB', cfg.prune.sidelobeMargin_dB};
 r{end+1} = {'minHits', max(1, ceil(cfg.extract.minExtent_deg / ...
                        (sys.ant.rate_dps * mean(sys.pri) * cfg.proc.updateEvery)))};
@@ -71,6 +101,21 @@ r{end+1} = {'maxMiss', cfg.extract.maxMiss};
 r{end+1} = {'updateEvery', cfg.proc.updateEvery};
 r{end+1} = {'minExtent_deg', cfg.extract.minExtent_deg};
 r{end+1} = {'meanPri_s', mean(sys.pri)};
+tk = sys.track;                                      % EKF tracker (track_setup.m)
+r{end+1} = {'trackEnable', double(tk.enable)};
+r{end+1} = {'trackDim', tk.dim};
+r{end+1} = {'trackSigma', [sqrt(diag(tk.R)).', zeros(1, 3 - tk.dim)]};   % range [m], az, el [rad]
+r{end+1} = {'trackModel', double(strcmp(tk.model, 'ca'))};                 % 0 constant velocity, 1 constant acceleration
+r{end+1} = {'trackQ', [tk.q, zeros(1, 3 - tk.dim)]};                      % per axis [m^2/s^3] (CV), [m^2/s^5] (CA)
+r{end+1} = {'trackSigmaV0', tk.sigmaV0};
+r{end+1} = {'trackSigmaA0', tk.sigmaA0};
+r{end+1} = {'trackBatchGap_s', tk.batchGap_s};                            % GNN batch
+r{end+1} = {'trackBatchMax_s', tk.batchMax_s};
+r{end+1} = {'trackGate', tk.gate};
+r{end+1} = {'trackConfirmHits', tk.confirmHits};
+r{end+1} = {'trackMaxMissTentative', tk.maxMissTentative};
+r{end+1} = {'trackMaxMiss', tk.maxMiss};
+r{end+1} = {'scanTime_s', tk.scanTime_s};
 
 folder = fileparts(fileName);
 if ~isempty(folder) && ~exist(folder, 'dir'), mkdir(folder); end

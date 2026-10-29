@@ -10,17 +10,28 @@ function out = ppi_callbacks(action, fig, varargin)
 %     'hover', [x y]              data tip of the object nearest to [x y] km
 %                                 (out = its text, '' if nothing is close)
 %     'pin', [x y]                pin (or remove) the data tip of the nearest object
-%     'key', evt                  + - arrows r c space
-%     'option', name, value       showShort, showLong, showTruth, showRings,
-%                                 showLabels, showAntenna, minSnr_dB, history
+%     'key', evt                  + - arrows r c d space
+%     'option', name, value       showMode ('plots', 'detections' or 'both'),
+%                                 showShort, showLong, showTruth, showRings,
+%                                 showLabels, showAntenna, showTracks,
+%                                 minSnr_dB, history
+%     'timing'                    write the block processing times into the panel
 %     'reset' 'clear' 'cleartips' 'pause'   buttons of the panel
-%     'save' [, fileName]         save the PPI as a PNG file
+%     'save' [, fileName]         save a screenshot of the PPI as a PNG file
+%                                 (without fileName: file dialog; out = file)
+%     'cfar', dB                  request a new CFAR threshold (Apply button);
+%                                 the processing takes it at its next display update
+%     'takeCfar'                  out = the requested threshold [dB] ([] if none),
+%                                 and clears the request (used by ppi_update.m)
+%     'cfarApplied', dB           show the threshold the processing uses
 out = [];
 if ~ishandle(fig), return; end
 S = getappdata(fig, 'ppi');
 switch action
     case 'redraw'
         S = redraw(S);
+    case 'timing'
+        show_timing(S);
     case 'scroll'
         evt = varargin{1};
         p = cursor_km(S);
@@ -68,7 +79,27 @@ switch action
         S = key(S, varargin{1});
     case 'option'
         S.opt.(varargin{1}) = varargin{2};
+        if strcmp(varargin{1}, 'showMode')
+            set(S.h.ui.showMode, 'Value', find(strcmp(varargin{2}, {'plots', 'detections', 'both'})));
+        end
         S = redraw(S);
+    case 'cfar'
+        dB = varargin{1};
+        if isscalar(dB) && isfinite(dB) && dB >= 0 && dB <= 50
+            S.opt.cfarRequest_dB = dB;
+            set(S.h.ui.cfar, 'String', sprintf('%.2f', dB));
+            set(S.h.ui.cfarInfo, 'String', sprintf('%.2f dB requested ...', dB));
+        else
+            set(S.h.ui.cfarInfo, 'String', 'enter 0 ... 50 dB');
+        end
+    case 'takeCfar'
+        out = S.opt.cfarRequest_dB;
+        S.opt.cfarRequest_dB = [];
+    case 'cfarApplied'
+        dB = varargin{1};
+        set(S.h.ui.cfar, 'String', sprintf('%.2f', dB));
+        set(S.h.ui.cfarInfo, 'String', sprintf('%s: %.2f dB (Pfa %.1e)', S.sys.cfar.label, dB, ...
+            cfar_pfa(10^(dB/10), S.sys.cfar.nTrain, S.sys.dop.nLooks)));
     case 'reset'
         S = set_limits(S, S.home(1:2), S.home(3:4));
     case 'clear'
@@ -85,7 +116,8 @@ switch action
         if ~isempty(varargin)
             file = varargin{1};
         else
-            [name, folder] = uiputfile('*.png', 'Save the PPI', 'ppi.png');
+            [name, folder] = uiputfile('*.png', 'Save a screenshot of the PPI', ...
+                                       sprintf('ppi_%s.png', datestr(now, 'yyyymmdd_HHMMSS')));
             if isequal(name, 0), return; end
             file = fullfile(folder, name);
         end
@@ -126,7 +158,9 @@ else
     set(h.tracks, 'Visible', 'off');
 end
 
-% Plots that pass the filters
+% Plots that pass the filters (shown unless only the detections are selected)
+showPlots = ~strcmp(o.showMode, 'detections');
+showDets  = ~strcmp(o.showMode, 'plots');
 plots = d.plots;
 nAll = numel(plots);
 x = zeros(1, nAll);  y = x;  show = false(1, nAll);  isShort = show;
@@ -143,6 +177,7 @@ if nAll > 0
     if o.history > 0
         show = show & (d.t_s - t) < o.history * 360 / sys.ant.rate_dps;
     end
+    show = show & showPlots;
 end
 s = show & isShort;  l = show & ~isShort;
 set(h.short, 'XData', x(s), 'YData', y(s));
@@ -150,6 +185,39 @@ set(h.long,  'XData', x(l), 'YData', y(l));
 set_datatip_rows(h.short, plots(s));
 set_datatip_rows(h.long,  plots(l));
 S.vis = struct('x', x(show), 'y', y(show), 'idx', find(show));
+
+% CFAR detections (before the plot extractor): an arc over the azimuth step of the CPI update
+D = d.dets;
+xd = zeros(1, 0);  yd = xd;  showD = false(0, 1);
+if showDets && ~isempty(D)
+    el = D(:, 4);
+    el(isnan(el)) = 0;
+    g = D(:, 3) .* cosd(el) / 1e3;
+    xd = (g .* sind(D(:, 2))).';
+    yd = (g .* cosd(D(:, 2))).';
+    showD = ((D(:, 7) == 1 & o.showShort) | (D(:, 7) == 2 & o.showLong)) & D(:, 6) >= o.minSnr_dB ...
+          & D(:, 1) > o.clearTime_s;
+    if o.history > 0
+        showD = showD & (d.t_s - D(:, 1)) < o.history * 360 / sys.ant.rate_dps;
+    end
+    half = max(S.detArc_deg, 1e-3) / 2;
+    hDet = [h.detShort h.detLong];
+    for pul = 1:2
+        k = find(showD & D(:, 7) == pul);
+        az = D(k, 2).';
+        gk = g(k).';
+        X = [gk .* sind(az - half); gk .* sind(az + half); NaN(1, numel(k))];
+        Y = [gk .* cosd(az - half); gk .* cosd(az + half); NaN(1, numel(k))];
+        set(hDet(pul), 'XData', X(:).', 'YData', Y(:).', 'Visible', 'on');
+    end
+else
+    set([h.detShort h.detLong], 'XData', NaN, 'YData', NaN, 'Visible', 'off');
+end
+S.visDet = struct('x', xd(showD), 'y', yd(showD), 'idx', find(showD).');
+
+% Tracks: hollow triangle at the last update (around its plot), velocity leader, number
+S = draw_tracks(S);
+show_timing(S);
 
 % Labels next to the plots
 delete(h.labels(ishandle(h.labels)));
@@ -161,8 +229,14 @@ if o.showLabels
             plots(k).vr_mps), 'Parent', S.ax, 'Color', [0.8 0.8 0.8], 'FontSize', 8, 'HitTest', 'off', 'Clipping', 'on');
     end
 end
-set(h.title, 'String', sprintf('Scan %d   t = %.2f s   az = %5.1f deg   plots %d / %d   zoom x%.1f', ...
-    d.scan, d.t_s, d.az_deg, sum(show), nAll, zoom_factor(S)));
+counts = '';
+if showPlots, counts = sprintf('plots %d / %d   ', sum(show), nAll); end
+if showDets, counts = [counts sprintf('detections %d   ', sum(showD))]; end
+if o.showTracks && ~isempty(d.tracks)
+    counts = [counts sprintf('tracks %d   ', sum([d.tracks.confirmed]))];
+end
+set(h.title, 'String', sprintf('Scan %d   t = %.2f s   az = %5.1f deg   %szoom x%.1f', ...
+    d.scan, d.t_s, d.az_deg, counts, zoom_factor(S)));
 end
 
 function set_datatip_rows(hLine, plots)
@@ -204,18 +278,29 @@ set(S.h.sel, 'XData', pos(1), 'YData', pos(2));
 end
 
 function [txt, pos] = nearest_text(S, p)
-% Text and position of the nearest plot or true target, '' if none is close.
+% Text and position of the nearest track, plot, detection or true target, '' if none is close.
+% A track (its triangle surrounds its plot) wins unless another object is 3 pixels closer.
 txt = '';  pos = [];
 if isempty(p), return; end
-tol = 8 * km_per_pixel(S, get(S.ax, 'XLim'), get(S.ax, 'YLim'));
-best = tol;
-for j = 1:numel(S.vis.x)                                  % plots
-    dist = hypot(S.vis.x(j) - p(1), S.vis.y(j) - p(2));
-    if dist <= best
-        best = dist;
-        pos = [S.vis.x(j) S.vis.y(j)];
-        txt = plot_text(S.data.plots(S.vis.idx(j)));
-    end
+kpx = km_per_pixel(S, get(S.ax, 'XLim'), get(S.ax, 'YLim'));
+best = 8 * kpx;
+[dist, j] = min(hypot(S.visTrk.x - p(1), S.visTrk.y - p(2)));   % tracks
+if ~isempty(dist) && dist <= best
+    best = max(dist - 3*kpx, 0);
+    pos = [S.visTrk.x(j) S.visTrk.y(j)];
+    txt = track_text(S.data.tracks(S.visTrk.idx(j)), S.sys.ant.height_m);
+end
+[dist, j] = min(hypot(S.vis.x - p(1), S.vis.y - p(2)));     % plots
+if ~isempty(dist) && dist <= best
+    best = dist;
+    pos = [S.vis.x(j) S.vis.y(j)];
+    txt = plot_text(S.data.plots(S.vis.idx(j)));
+end
+[dist, j] = min(hypot(S.visDet.x - p(1), S.visDet.y - p(2)));   % detections (plots first)
+if ~isempty(dist) && dist < best
+    best = dist;
+    pos = [S.visDet.x(j) S.visDet.y(j)];
+    txt = detection_text(S.data.dets(S.visDet.idx(j), :));
 end
 if S.opt.showTruth                                         % true targets
     xt = get(S.h.truth, 'XData');  yt = get(S.h.truth, 'YData');
@@ -236,6 +321,78 @@ txt = sprintf(['Plot (%s pulse)\nRange       %.3f km\nAzimuth     %.2f deg\nElev
                'Radial vel. %.2f m/s\nSNR         %.1f dB\nTime        %.3f s\nCPI hits    %d\n' ...
                'Beam %d, range cell %d, Doppler bin %d'], p.pulse, p.range_m/1e3, p.az_deg, el, ...
                p.vr_mps, p.snr_dB, p.time_s, p.hits, p.beam, p.rIdx, p.dIdx);
+end
+
+function txt = detection_text(r)
+% r = [time az range el vr snr pulse beam rIdx dIdx] (detection_log_init.m)
+names = {'short', 'long'};
+if isnan(r(4)), el = '- (no DBF)'; else, el = sprintf('%.2f deg', r(4)); end
+txt = sprintf(['CFAR detection (%s pulse)\nRange       %.3f km\nAzimuth     %.2f deg\nElevation   %s\n' ...
+               'Radial vel. %.2f m/s\nSNR         %.1f dB\nTime        %.3f s\n' ...
+               'Beam %d, range cell %d, Doppler bin %d'], names{r(7)}, r(3)/1e3, r(2), el, r(5), r(6), r(1), ...
+               r(8), r(9), r(10));
+end
+
+function txt = track_text(tk, height_m)
+% Data tip of a track.
+states = {'tentative', 'confirmed'};
+p = tk.pos_m;  v = tk.vel_mps;
+R = norm(p(1:tk.dim));
+txt = sprintf(['Track %d (%s, %d-D EKF)\nRange       %.3f km\nAzimuth     %.2f deg\n'], tk.id, ...
+              states{1 + tk.confirmed}, tk.dim, R/1e3, mod(atan2(p(1), p(2))*180/pi, 360));
+if tk.dim == 3
+    txt = [txt sprintf('Height      %.0f m\nClimb       %.1f m/s\n', p(3) + height_m, v(3))];
+end
+txt = [txt sprintf('Speed       %.1f m/s\nHeading     %.1f deg\n', norm(v(1:2)), mod(atan2(v(1), v(2))*180/pi, 360))];
+if isfield(tk, 'acc_mps2') && any(tk.acc_mps2 ~= 0)                     % constant-acceleration model
+    txt = [txt sprintf('Accel.      %.2f m/s^2\n', norm(tk.acc_mps2(1:2)))];
+end
+txt = [txt sprintf('Updates     %d (missed scans %d)\nLast update %.3f s', tk.hits, tk.misses, tk.t_s)];
+end
+
+function S = draw_tracks(S)
+% Confirmed (magenta) and tentative (gray) tracks at their last update, with leaders and numbers.
+h = S.h;  d = S.data;
+delete(h.trackIds(ishandle(h.trackIds)));
+S.h.trackIds = [];
+tk = d.tracks;
+if ~S.opt.showTracks || isempty(tk)
+    set([h.track h.trackTent h.trackLead], 'XData', NaN, 'YData', NaN);
+    S.visTrk = struct('x', [], 'y', [], 'idx', []);
+    return
+end
+P = reshape([tk.pos_m], 3, []) / 1e3;                     % [km]
+V = reshape([tk.vel_mps], 3, []) / 1e3;
+conf = logical([tk.confirmed]);
+set(h.track, 'XData', P(1, conf), 'YData', P(2, conf));
+set(h.trackTent, 'XData', P(1, ~conf), 'YData', P(2, ~conf));
+L = S.sys.cfg.display.trackLeader_s;
+X = [P(1, conf); P(1, conf) + L*V(1, conf); NaN(1, sum(conf))];
+Y = [P(2, conf); P(2, conf) + L*V(2, conf); NaN(1, sum(conf))];
+set(h.trackLead, 'XData', X(:).', 'YData', Y(:).');
+for i = find(conf)
+    S.h.trackIds(end+1) = text(P(1, i), P(2, i), sprintf('   T%d', tk(i).id), 'Parent', S.ax, ...
+        'Color', [1 0.35 1], 'FontSize', 8, 'VerticalAlignment', 'top', 'HitTest', 'off', 'Clipping', 'on');
+end
+S.visTrk = struct('x', P(1, :), 'y', P(2, :), 'idx', 1:numel(tk));
+end
+
+function show_timing(S)
+% Mean time per PRI of every block, of the console output and of the display in the panel.
+us = S.data.timing_us;
+if isempty(us), return; end
+names = {'DBF', 'Matched filter', 'MTI (clutter)', 'Doppler FFT+NCI', ['CFAR ' S.sys.cfar.label], ...
+         'Plot extractor', sprintf('Tracking %d-D %s', S.sys.track.dim, upper(S.sys.track.model)), ...
+         'Console output', 'Display (PPI)'};
+if ~S.sys.track.enable, names{7} = 'Tracking (off)'; end
+n = min(numel(us), numel(names));
+rows = cell(1, n + 2);
+rows{1} = 'Mean time per PRI [us]';
+for i = 1:n
+    rows{i+1} = sprintf('%-17s%9.1f', names{i}, us(i));
+end
+rows{n+2} = sprintf('%-17s%9.1f', 'Total', sum(us(1:n)));
+set(S.h.timing, 'String', rows);
 end
 
 function txt = truth_text(S, i)
@@ -286,6 +443,11 @@ switch evt.Key
     case 'downarrow',  S = set_limits(S, xl, yl - step);
     case {'r', 'home'}, S = set_limits(S, S.home(1:2), S.home(3:4));
     case 'c',           S = clear_pins(S);
+    case 'd'                                                % next display mode
+        modes = {'plots', 'detections', 'both'};
+        S.opt.showMode = modes{mod(find(strcmp(S.opt.showMode, modes)), 3) + 1};
+        set(S.h.ui.showMode, 'Value', find(strcmp(S.opt.showMode, modes)));
+        S = redraw(S);
     case 'space'
         S.opt.paused = ~S.opt.paused;
         labels = {'Pause display', 'Resume display'};

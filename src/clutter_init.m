@@ -4,6 +4,15 @@ function clut = clutter_init(sys)
 %   with complex Gaussian (Rayleigh amplitude) reflectivity of constant sigma0,
 %   a random internal-motion Doppler per cell, and precomputes what
 %   clutter_signal.m needs to synthesise the clutter echo of every PRI.
+%   Internal clutter motion (cfg.clutter.spectrum):
+%     'gaussian'    every cell moves with a radial velocity drawn from
+%                   N(0, icmStd_mps^2): a Gaussian clutter spectrum
+%     'exponential' Billingsley's land clutter model: every cell has a
+%                   stationary (DC) part with r/(1+r) of its power and a
+%                   moving (AC) part with 1/(1+r), whose radial velocity is
+%                   drawn from the exponential (Laplace) density
+%                   beta/2*exp(-beta*|v|). beta and r follow from the wind
+%                   speed unless cfg.clutter.expBeta_spm / dcToAc are given.
 
 cfg = sys.cfg;
 cc  = cfg.clutter;
@@ -30,8 +39,24 @@ gEl    = pattern_gain(sys.ant.elRel_deg, sys.ant.txElGain_dB, elRel) ...
 area   = clut.range_m * deg2rad(cc.azStep_deg) * dR;      % cell area [m^2]
 power  = sys.radarConst * 10^(cc.sigma0_dB/10) * area ./ clut.range_m.^4 * gEl;  % [W]
 ampRms = sqrt(2*power);                                   % rms IF amplitude at the receiver input [sqrt(W)]
-clut.rho = ampRms .* (randn(nAz, nR) + 1j*randn(nAz, nR)) / sqrt(2);
-clut.fd_Hz = 2*cc.icmStd_mps/sys.lambda * randn(nAz, nR); % internal clutter motion
+rho = ampRms .* (randn(nAz, nR) + 1j*randn(nAz, nR)) / sqrt(2);
+switch lower(cc.spectrum)                                 % internal clutter motion
+    case 'gaussian'
+        v = cc.icmStd_mps * randn(nAz, nR);
+        clut.dc  = [];                                    % no separate stationary part
+        clut.rho = rho;
+    case 'exponential'
+        [beta, r] = billingsley(cc, cfg.fc);
+        u = rand(nAz, nR) - 0.5;
+        v = -sign(u) .* log(1 - 2*abs(u)) / beta;         % Laplace: density beta/2*exp(-beta*|v|)
+        clut.dc  = rho * sqrt(r/(1 + r));                 % stationary part
+        clut.rho = rho * sqrt(1/(1 + r));                 % moving part
+        clut.beta_spm = beta;
+        clut.dcToAc = r;
+    otherwise
+        error('cfg.clutter.spectrum must be ''gaussian'' or ''exponential''.');
+end
+clut.fd_Hz = 2*v/sys.lambda;
 
 % IF transmit waveforms at the ADC rate and their FFTs (for the fast convolution)
 names = {'short', 'long'};
@@ -47,4 +72,13 @@ for i = 1:2
     % ADC sample (0-based, relative to the window start) where an echo of zero delay starts
     clut.(names{i}).start0 = round((wv.tTx_s - sys.rxStart_s) * fs);
 end
+end
+
+function [beta, r] = billingsley(cc, fc)
+% Exponential spectrum parameters of Billingsley's model (wind speed in mph, f in GHz).
+w = max(cc.windSpeed_mps / 0.44704, 0.1);
+beta = cc.expBeta_spm;
+if isempty(beta), beta = 1 / (0.1*log10(w) + 0.068); end
+r = cc.dcToAc;
+if isempty(r), r = 489.8 * w^-1.55 * (fc/1e9)^-1.21; end
 end

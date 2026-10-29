@@ -6,6 +6,7 @@ function [I, Q] = ddc(adcData, sys)
 %     mixer   : I line x .* cos(2*pi*fIF*t), Q line x .* (-sin(2*pi*fIF*t))
 %     stage 1 : low-pass filter h1 (valid time-domain convolution), decimation by 10
 %     stage 2 : low-pass filter h2 (valid time-domain convolution), decimation by 6
+%               (2 MHz output) or 3 (4 MHz output, cfg.ddc.outputRate_Hz)
 %   The filter coefficients are signed 16-bit integers with 13 fractional bits.
 %   The accumulator of every stage is shifted right by cfg.ddc.shift bits
 %   (13 = unit gain), rounded and saturated to signed 16 bit.

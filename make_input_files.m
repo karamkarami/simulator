@@ -1,16 +1,21 @@
 function make_input_files(cfg, which)
 %MAKE_INPUT_FILES  Create the default input .mat files of the simulator.
 %
-%   MAKE_INPUT_FILES(cfg) writes the four input files named in radar_config.m:
+%   MAKE_INPUT_FILES(cfg) writes the six input files named in radar_config.m:
 %     antenna_pattern.mat : element spacing, azimuth pattern, elevation element
 %                           pattern, transmit elevation pattern, peak gains
-%     ddc_filters.mat     : low-pass FIR filters of the two DDC stages (h1, h2),
-%                           signed 16-bit integers with 13 fractional bits
+%     ddc_filters.mat     : low-pass FIR filters of the two DDC stages (h1, h2) for
+%                           the 2 MHz output, signed 16-bit integers with 13
+%                           fractional bits
+%     ddc_filters_4MHz.mat: the same for the 4 MHz output (other h2)
 %     dbf_matrix.mat      : elevation DBF matrix W [nBeams x cfg.ant.nElements]
 %                           and beam elevations
 %     stagger_prf.mat     : staggered PRI vector and the matching MTI weights
+%     phase_code.mat      : phase codes of the short and the long sub-pulse
+%                           (P4, width_s/chip_s chips) and their mismatch
+%                           filters (one coefficient per chip)
 %   MAKE_INPUT_FILES(cfg, which) writes only one of them: which = 'antenna',
-%   'ddc', 'dbf' or 'stagger'.
+%   'ddc', 'ddc4MHz', 'dbf', 'stagger' or 'phaseCode'.
 %
 %   Every default file stores in 'madeFor' the configuration values it was
 %   built for. setup_radar.m rebuilds a default file when they no longer match
@@ -58,15 +63,22 @@ if doAll || strcmpi(which, 'antenna')
 end
 
 %% 2) DDC low-pass filters (windowed sinc, Blackman window, unit DC gain)
-% After the 30 MHz mixer the signal occupies +-0.5 MHz around 0 Hz.
-if doAll || strcmpi(which, 'ddc')
-    fs  = cfg.adc.fs_Hz;
-    fs1 = fs / cfg.ddc.decimation(1);
-    q   = 2^cfg.ddc.coefFracBits;         % fixed point: signed 16 bit, 13 fractional bits
-    h1  = int16(round(q * lowpass_fir(70, 5.8e6 / fs)));    % stage 1: pass +-1 MHz, stop above 10.5 MHz
-    h2  = int16(round(q * lowpass_fir(66, 1.0e6 / fs1)));   % stage 2: pass +-0.5 MHz, stop above 1.5 MHz
-    madeFor = struct('fs_Hz', fs, 'decimation', cfg.ddc.decimation, 'coefFracBits', cfg.ddc.coefFracBits); %#ok<NASGU>
-    save(cfg.files.ddc, 'h1', 'h2', 'madeFor', '-v7');
+% After the 30 MHz mixer the signal occupies +-0.5 MHz around 0 Hz. Stage 1
+% is the same for both output rates; stage 2 is a wider filter for 4 MHz.
+fs = cfg.adc.fs_Hz;
+q  = 2^cfg.ddc.coefFracBits;              % fixed point: signed 16 bit, 13 fractional bits
+for rate = [2e6 4e6]
+    [D, key] = ddc_decimation(cfg, rate);
+    if ~(doAll || strcmpi(which, key)), continue; end
+    fs1 = fs / D(1);
+    h1  = int16(round(q * lowpass_fir(70, 5.8e6 / fs)));     % stage 1: pass +-1 MHz, stop above 10.5 MHz
+    if rate == 2e6
+        h2 = int16(round(q * lowpass_fir(66, 1.0e6 / fs1)));  % stage 2: pass +-0.5 MHz, stop above 1.5 MHz
+    else
+        h2 = int16(round(q * lowpass_fir(66, 1.5e6 / fs1)));  % stage 2: pass +-1 MHz, stop above 2 MHz
+    end
+    madeFor = struct('fs_Hz', fs, 'decimation', D, 'coefFracBits', cfg.ddc.coefFracBits); %#ok<NASGU>
+    save(cfg.files.(key), 'h1', 'h2', 'madeFor', '-v7');
 end
 
 %% 3) Elevation DBF matrix: 21 beams equally spaced in u = sin(angle from broadside)
@@ -100,6 +112,35 @@ if doAll || strcmpi(which, 'stagger')
         mtiCoeffs(k, :) = 2 * [T2, -(T1 + T2), T1] / (T1 + T2);
     end
     save(cfg.files.stagger, 'priVector_s', 'mtiCoeffs', '-v7');
+end
+
+%% 5) Phase codes (P4) and their mismatch filters
+% shortCode, longCode [nChips x 1]: complex chip values, the first chip is
+% sent first. shortMismatch, longMismatch [nChips + 2*pad x 1]: mismatch
+% filter with one coefficient per chip, as a convolution filter
+% (output = conv(code, filter)); its main peak is in the middle of the full
+% convolution. pad = min(5, nChips/2) chips on each side: more padding gives
+% little here (25 chips: PSL -25.9 dB with 5, -26.0 dB with 10), and any
+% length works (the samples outside the receive interval count as zeros, see
+% setup_radar.m). The filter minimises the peak sidelobe for a unit main
+% peak (mismatch_filter.m). A filter with
+% another sample rate (e.g. designed at the DDC output rate on the received
+% pulse) can be given with <pulse>MismatchRate_Hz (setup_radar.m).
+if doAll || strcmpi(which, 'phaseCode')
+    names = {'short', 'long'};
+    madeFor = struct();
+    for i = 1:2
+        wv = cfg.wave.(names{i});
+        N = round(wv.width_s / wv.chip_s);
+        m = (0:N-1)';
+        code = exp(1j*(pi*m.^2/N - pi*m));            % P4 polyphase code
+        pad = min(5, floor(N/2));
+        out.([names{i} 'Code']) = code;
+        out.([names{i} 'Mismatch']) = mismatch_filter(code, pad);
+        madeFor.([names{i} 'Chips']) = N;
+    end
+    out.madeFor = madeFor;
+    save(cfg.files.phaseCode, '-struct', 'out', '-v7');
 end
 
 fprintf('Default input file(s) "%s" written to %s\n', which, folder);

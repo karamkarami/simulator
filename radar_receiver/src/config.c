@@ -45,6 +45,23 @@ static const Record *find(RecordSet *rs, const char *name)
     return NULL;
 }
 
+/* A record that older files may not have: NULL if it is missing. */
+static const Record *find_optional(const RecordSet *rs, const char *name)
+{
+    for (int i = 0; i < rs->n; i++)
+        if (strcmp(rs->rec[i].name, name) == 0) return &rs->rec[i];
+    return NULL;
+}
+
+/* A scalar that older files may not have: 'fallback' if it is missing. */
+static double get_optional(RecordSet *rs, const char *name, double fallback)
+{
+    for (int i = 0; i < rs->n; i++)
+        if (strcmp(rs->rec[i].name, name) == 0)
+            return rs->rec[i].rows * rs->rec[i].cols >= 1 ? rs->rec[i].data[0] : fallback;
+    return fallback;
+}
+
 static double get_scalar(RecordSet *rs, const char *name)
 {
     const Record *r = find(rs, name);
@@ -113,6 +130,12 @@ static int read_records(FILE *f, RecordSet *rs)
 {
     char magic[8];
     uint32_t head[2];
+    long fileSize = -1;                            /* bounds the sizes stored in the file */
+    if (fseek(f, 0, SEEK_END) == 0) fileSize = ftell(f);
+    if (fileSize < 0 || fseek(f, 0, SEEK_SET) != 0) {
+        set_error(rs, "cannot read the configuration file");
+        return -1;
+    }
     if (fread(magic, 1, 8, f) != 8 || memcmp(magic, "RADRXCFG", 8) != 0 ||
         fread(head, sizeof(uint32_t), 2, f) != 2 || head[0] != 1) {
         set_error(rs, "not a receiver configuration file (version 1)");
@@ -136,6 +159,12 @@ static int read_records(FILE *f, RecordSet *rs)
         r->isComplex = dims[0];
         r->rows = dims[1];
         r->cols = dims[2];
+        /* the sizes must fit into the rest of the file (so the byte count below cannot overflow) */
+        const uint64_t perValue = sizeof(double) * (r->isComplex ? 2 : 1), left = (uint64_t)(fileSize - ftell(f));
+        if (r->rows != 0 && r->cols > left / perValue / r->rows) {
+            set_error(rs, "truncated configuration file (record '%s')", r->name);
+            return -1;
+        }
         size_t count = (size_t)r->rows * r->cols * (r->isComplex ? 2 : 1);
         r->data = malloc(sizeof(double) * (count > 0 ? count : 1));
         if (!r->data || fread(r->data, sizeof(double), count, f) != count) {
@@ -178,6 +207,7 @@ int radar_config_load(const char *path, RadarConfig *cfg, char *err, size_t errL
         cfg->maxRange_m      = get_scalar(&rs, "maxRange_m");
         cfg->nDdc            = get_int(&rs, "nDdc");
         cfg->fsOut_Hz        = get_scalar(&rs, "fsOut_Hz");
+        cfg->ddcT0_s         = get_optional(&rs, "ddcT0_s", NAN);
 
         static const char *names[N_PULSES] = { "short", "long" };
         for (int p = 0; p < N_PULSES; p++) {
@@ -185,6 +215,10 @@ int radar_config_load(const char *path, RadarConfig *cfg, char *err, size_t errL
             char key[48];
             snprintf(key, sizeof key, "%s_ddcFirst", names[p]);  pc->ddcFirst = get_int(&rs, key);
             snprintf(key, sizeof key, "%s_ddcCount", names[p]);  pc->ddcCount = get_int(&rs, key);
+            /* older files: the segment starts the receive interval, no zeros */
+            snprintf(key, sizeof key, "%s_rxFirst", names[p]);   pc->rxFirst = (int)get_optional(&rs, key, pc->ddcFirst);
+            snprintf(key, sizeof key, "%s_padFront", names[p]);  pc->padFront = (int)get_optional(&rs, key, 0);
+            snprintf(key, sizeof key, "%s_padBack", names[p]);   pc->padBack = (int)get_optional(&rs, key, 0);
             snprintf(key, sizeof key, "%s_nTaps", names[p]);     pc->nTaps    = get_int(&rs, key);
             snprintf(key, sizeof key, "%s_nRange", names[p]);    pc->nRange   = get_int(&rs, key);
             snprintf(key, sizeof key, "%s_taps", names[p]);
@@ -192,8 +226,30 @@ int radar_config_load(const char *path, RadarConfig *cfg, char *err, size_t errL
             snprintf(key, sizeof key, "%s_range_m", names[p]);  pc->range_m = get_doubles(&rs, key, pc->nRange, NULL);
             snprintf(key, sizeof key, "%s_delay_s", names[p]);  pc->delay_s = get_doubles(&rs, key, pc->nRange, NULL);
             snprintf(key, sizeof key, "%s_lambda_m", names[p]); pc->lambda_m = get_scalar(&rs, key);
-            if (!rs.failed && (pc->ddcCount != pc->nRange + pc->nTaps - 1 ||
-                               pc->ddcFirst < 0 || pc->ddcFirst + pc->ddcCount > cfg->nDdc))
+            snprintf(key, sizeof key, "%s_testFirst", names[p]); pc->testFirst = (int)get_optional(&rs, key, 0);
+            snprintf(key, sizeof key, "%s_testCount", names[p]);
+            pc->testCount = (int)get_optional(&rs, key, pc->nRange);
+            /* pulse compression (older files: LFM, matched filter) */
+            snprintf(key, sizeof key, "%s_waveform", names[p]);    pc->waveform = (int)get_optional(&rs, key, WAVE_LFM);
+            snprintf(key, sizeof key, "%s_compression", names[p]);
+            pc->compression = (int)get_optional(&rs, key, COMPRESSION_MATCHED);
+            snprintf(key, sizeof key, "%s_nChips", names[p]);      pc->nChips = (int)get_optional(&rs, key, 0);
+            snprintf(key, sizeof key, "%s_mfShift", names[p]);     pc->mfShift = (int)get_optional(&rs, key, 0);
+            snprintf(key, sizeof key, "%s_pulse", names[p]);
+            const Record *pulse = find_optional(&rs, key);
+            if (pulse) {
+                pc->nPulse = (int)(pulse->rows * pulse->cols);
+                get_complex(&rs, key, 1, pc->nPulse, 0, &pc->pulseRe, &pc->pulseIm);
+            }
+            if (!rs.failed && ((pc->waveform != WAVE_LFM && pc->waveform != WAVE_PHASE_CODE) ||
+                               (pc->compression != COMPRESSION_MATCHED && pc->compression != COMPRESSION_MISMATCH) ||
+                               (pc->compression == COMPRESSION_MISMATCH && pc->waveform != WAVE_PHASE_CODE) ||
+                               pc->mfShift < 0 || pc->mfShift >= pc->nTaps))
+                set_error(&rs, "invalid pulse compression of the %s pulse", names[p]);
+            if (!rs.failed && (pc->padFront < 0 || pc->padBack < 0 || pc->ddcCount < 1 ||
+                               pc->padFront + pc->ddcCount + pc->padBack != pc->nRange + pc->nTaps - 1 ||
+                               pc->rxFirst < 0 || pc->ddcFirst < pc->rxFirst ||
+                               pc->ddcFirst + pc->ddcCount > cfg->nDdc))
                 set_error(&rs, "inconsistent DDC segment of the %s pulse", names[p]);
         }
 
@@ -219,34 +275,83 @@ int radar_config_load(const char *path, RadarConfig *cfg, char *err, size_t errL
         cfg->noiseGain    = get_floats(&rs, "noiseGain", cfg->nfft);
         cfg->dopFreq_Hz   = get_doubles(&rs, "dopFreq_Hz", cfg->nfft, NULL);
         cfg->notchBins    = get_int(&rs, "notchBins");
+        cfg->clutterMap   = (int)get_optional(&rs, "clutterMap", 0);     /* older files: MTI */
+        if (cfg->clutterMap) {
+            cfg->mapAzCell_deg = get_scalar(&rs, "mapAzCell_deg");
+            cfg->mapWeight     = get_scalar(&rs, "mapWeight");
+            const Record *r = find(&rs, "mapAlpha");
+            if (r) {
+                cfg->mapNAlpha = (int)(r->rows * r->cols);
+                cfg->mapAlpha = get_doubles(&rs, "mapAlpha", cfg->mapNAlpha, NULL);
+            }
+            if (!rs.failed && (cfg->clutterMap != 1 || !(cfg->mapAzCell_deg > 0 && cfg->mapAzCell_deg <= 360) ||
+                               !(cfg->mapWeight > 0 && cfg->mapWeight <= 1) || cfg->mapNAlpha < 1 ||
+                               cfg->nMtiTaps != 1 || 2 * cfg->notchBins + 1 >= cfg->nfft))
+                set_error(&rs, "invalid clutter map settings in the configuration");
+        }
         cfg->medianToMean = get_scalar(&rs, "medianToMean");
         cfg->guardRange   = get_int(&rs, "guardRange");
         cfg->trainRange   = get_int(&rs, "trainRange");
         cfg->guardDoppler = get_int(&rs, "guardDoppler");
         cfg->trainDoppler = get_int(&rs, "trainDoppler");
         cfg->nTrain       = get_int(&rs, "nTrain");
+        cfg->cfarMethod   = (int)get_optional(&rs, "cfarMethod", CFAR_2D);
         cfg->alpha        = get_scalar(&rs, "alpha");
+        cfg->nLooks       = get_optional(&rs, "nLooks", 0.0);
         cfg->sidelobeMargin_dB = get_scalar(&rs, "sidelobeMargin_dB");
         cfg->minHits      = get_int(&rs, "minHits");
         cfg->maxMiss      = get_int(&rs, "maxMiss");
         cfg->updateEvery  = get_int(&rs, "updateEvery");
         cfg->minExtent_deg = get_scalar(&rs, "minExtent_deg");
         cfg->meanPri_s    = get_scalar(&rs, "meanPri_s");
+        cfg->trackEnable  = (int)get_optional(&rs, "trackEnable", 0);
+        if (cfg->trackEnable) {
+            cfg->trackDim = get_int(&rs, "trackDim");
+            double *v = get_doubles(&rs, "trackSigma", 3, NULL);
+            double *q = get_doubles(&rs, "trackQ", 3, NULL);
+            if (v) memcpy(cfg->trackSigma, v, sizeof cfg->trackSigma);
+            if (q) memcpy(cfg->trackQ, q, sizeof cfg->trackQ);
+            free(v);
+            free(q);
+            cfg->trackSigmaV0 = get_scalar(&rs, "trackSigmaV0");
+            /* older files: constant velocity, the batch associated at the next PRI */
+            cfg->trackModel = (int)get_optional(&rs, "trackModel", TRACK_CV);
+            cfg->trackSigmaA0 = get_optional(&rs, "trackSigmaA0", 0.0);
+            cfg->trackBatchGap_s = get_optional(&rs, "trackBatchGap_s", 0.0);
+            cfg->trackBatchMax_s = get_optional(&rs, "trackBatchMax_s", 0.0);
+            cfg->trackGate = get_scalar(&rs, "trackGate");
+            cfg->trackConfirmHits = get_int(&rs, "trackConfirmHits");
+            cfg->trackMaxMissTentative = get_int(&rs, "trackMaxMissTentative");
+            cfg->trackMaxMiss = get_int(&rs, "trackMaxMiss");
+            cfg->scanTime_s = get_scalar(&rs, "scanTime_s");
+            if (!rs.failed && ((cfg->trackDim != 2 && cfg->trackDim != 3) || !(cfg->trackGate > 0) ||
+                               !(cfg->scanTime_s > 0) || (cfg->trackModel != TRACK_CV && cfg->trackModel != TRACK_CA) ||
+                               !(cfg->trackBatchGap_s >= 0) || !(cfg->trackBatchMax_s >= 0)))
+                set_error(&rs, "invalid tracker settings in the configuration");
+        }
 
         if (!rs.failed && (cfg->updateEvery < 1 || cfg->minHits < 1 || cfg->maxMiss < 0 || cfg->cpiLength < 1 ||
                            cfg->nfft < 1 || cfg->nRows < 1 || cfg->rowLen < 1 || cfg->rowLen > cfg->nfft ||
                            cfg->nBeams < 1 || cfg->nCh < 1 || cfg->nStagger < 1 || cfg->nMtiTaps < 1 ||
                            !cfg->mtiCoeffs || cfg->notchBins < 0))
             set_error(&rs, "invalid sizes in the configuration");
-        for (int p = 0; p < N_PULSES && !rs.failed; p++)
-            if (cfg->pulse[p].nTaps < 1 || cfg->pulse[p].nRange < 1)
+        for (int p = 0; p < N_PULSES && !rs.failed; p++) {
+            const PulseConfig *pc = &cfg->pulse[p];
+            if (pc->nTaps < 1 || pc->nRange < 1)
                 set_error(&rs, "invalid matched filter or range axis in the configuration");
+            else if (pc->testFirst < 0 || pc->testCount < 0 || pc->testFirst + pc->testCount > pc->nRange)
+                set_error(&rs, "invalid CFAR range interval in the configuration");
+        }
+        if (!rs.failed && (cfg->cfarMethod < CFAR_2D || cfg->cfarMethod > CFAR_DOPPLER))
+            set_error(&rs, "invalid CFAR method in the configuration");
         if (!rs.failed) {                                  /* CFAR window */
             const int gR = cfg->guardRange, oR = gR + cfg->trainRange;
             const int gD = cfg->guardDoppler, oD = gD + cfg->trainDoppler;
             const int nTrain = (2 * oR + 1) * (2 * oD + 1) - (2 * gR + 1) * (2 * gD + 1);
+            int tooShort = 0;                              /* the shifted range window must fit */
+            for (int p = 0; p < N_PULSES; p++) tooShort |= 2 * oR + 1 > cfg->pulse[p].nRange;
             if (gR < 0 || gD < 0 || cfg->trainRange < 0 || cfg->trainDoppler < 0 || nTrain < 1 ||
-                nTrain != cfg->nTrain || 2 * oD + 1 > cfg->nfft || 2 * oR + 1 >= 64)
+                nTrain != cfg->nTrain || 2 * oD + 1 > cfg->nfft || 2 * oR + 1 >= 64 || tooShort)
                 set_error(&rs, "invalid CFAR window in the configuration");
         }
         if (!rs.failed && (cfg->nfft & (cfg->nfft - 1)) != 0)
@@ -268,7 +373,14 @@ void radar_config_free(RadarConfig *cfg)
     for (int p = 0; p < N_PULSES; p++) {
         PulseConfig *pc = &cfg->pulse[p];
         free(pc->tapsRe);  free(pc->tapsIm);  free(pc->range_m);  free(pc->delay_s);
+        free(pc->pulseRe);  free(pc->pulseIm);
     }
     free(cfg->mtiCoeffs);  free(cfg->dopWindow);  free(cfg->noiseGain);  free(cfg->dopFreq_Hz);
+    free(cfg->mapAlpha);
     memset(cfg, 0, sizeof(*cfg));
+}
+
+const char *cfar_method_name(int method)
+{
+    return method == CFAR_RANGE ? "1-D range" : method == CFAR_DOPPLER ? "1-D Doppler" : "2-D";
 }

@@ -12,28 +12,58 @@ at 921600 baud.
         |  input thread: reassembly of each PRI (udp_input.c) -> queue of PRIs (input_thread.c)
         v  split in time: short-pulse samples | long-pulse samples
  DBF (21 x 48 matrix, off for 1 element)
- Matched filter (valid convolution; FFT fast convolution when it is faster)
- CPI ring buffer (the pulses of one CPI) -> MTI ring (MTI output of each pulse computed once)
+ Pulse compression: matched filter, or the mismatch filter of a phase code
+         (valid convolution; FFT fast convolution when it is faster)
+ CPI ring buffer (the pulses of one CPI) -> MTI ring (MTI output of each pulse computed once;
+          with the clutter map the MTI is a single tap of 1)
  Doppler: fixed PRF Hamming + FFT 128 | staggered: de-interleave, Hamming, FFT 32, NCI;
           division by the noise gain of every bin
- 2-D CA-CFAR -> pruning (local peaks, sidelobe blanking) -> reports -> plot extraction
-        |                                   |                         |
+ CA-CFAR (2-D, 1-D range or 1-D Doppler window, tested range interval, shifted range window at the edges);
+          zero-Doppler band: not tested (MTI) or tested also against the clutter map
+   -> pruning (local peaks, sidelobe blanking) -> reports -> plot extraction -> EKF tracking (optional)
+        |                                   |                         |                |
         |                                   +-> serial (detections)   +-> CSV, console, Qt PPI,
-        |                                                                 serial (plots)
+        |                                                                 serial (plots) +-> CSV, Qt PPI
 ```
 
 The algorithms are the same as in the MATLAB simulator (`../src/*.m`, see
-`../README.md`). The C receiver reads every number that MATLAB derives
-(DBF matrix, matched filters, range axes, CPI length, MTI weights, Doppler
-window and noise gains, CFAR threshold factor, extraction settings) from a
+`../README.md`). With `cfg.clutterRejection.method = 'map'` in the exported
+configuration the receiver uses a clutter map of the zero-Doppler band
+instead of the MTI (as `clutter_map_*.m`): the mean band power of every cell
+per azimuth cell, updated once per scan by exponential averaging when the
+antenna leaves the cell; a band cell is a detection when it passes the CFAR
+and exceeds the exported threshold factor (by the number of averaged scans)
+times the map. The map lives in the receiver (about 160 MB for the default
+radar) and starts empty; Doppler/CFAR updates skipped under overload do not
+enter it. The C receiver reads every number that MATLAB derives
+(DBF matrix, pulse compression filters, range axes, CPI length, MTI
+weights, Doppler window and noise gains, CFAR method, window, threshold
+factor and tested range cells, extraction and tracker settings) from a
 configuration file that `export_receiver_config.m` writes. Both programs
 therefore always use the same values.
+
+**Phase codes and mismatch filters** (`cfg.wave.<pulse>.type =
+'phasecode'`, `cfg.wave.<pulse>.compression = 'matched' | 'mismatch'`,
+codes and filters in `../inputs/phase_code.mat`): the exported taps are the
+matched or the mismatch filter at the DDC rate. A mismatch filter is longer
+than the pulse: the receiver puts the exported number of zeros before and
+after the DDC samples of the sub-pulse (the samples outside its receive
+interval), so every filter gives the range cells of the matched filter, up
+to both ends of the interval, whatever its length (also three times the
+code). The receiver filters with whatever taps the file has (direct or FFT,
+as for LFM), so it needs no setting of its own; it prints the waveform and
+the filter of each sub-pulse at the start, e.g. `long pulse: phase code of
+150 chips, mismatch filter of 320 taps (22.90 ... 80.61 km)`. The file also holds the pulse
+itself at the DDC rate (`<pulse>_pulse`), which `test_core` uses as the
+echo. `config/radar_config_phasecode.bin` is such a configuration (both
+sub-pulses with mismatch filters) for the `core_phasecode` test.
 
 ## Build
 
 Requirements: a C11 compiler (GCC, Clang, or MSVC 2019 16.8 or newer), CMake 3.21 or newer,
-OpenMP (optional, for multi-threading), and Qt 5.12+ or Qt 6 Widgets
-(optional, for the PPI).
+OpenMP (optional, for multi-threading), Qt 5.12+ or Qt 6 Widgets
+(optional, for the PPI) and zlib (optional: `radar_stream_send` then also
+reads compressed `-v7` DDC files; `-v6` files need nothing).
 
 **CLion:** *File > Open* the `radar_receiver` folder; CLion loads
 `CMakeLists.txt`. Choose the **Release** profile (*Settings > Build,
@@ -96,6 +126,8 @@ plots of both programs.
 | `--replay FILE` | read the datagrams from a recorded FILE instead of the network (as fast as possible) |
 | `--ppi` | show the interactive PPI (Qt build, see below) |
 | `--ppi-snapshot FILE` | save the PPI as a PNG at the end and close it |
+| `--ppi-show MODE` | what the PPI shows at the start: `plots` (default, after the plot extractor), `detections` (CFAR detections before it) or `both` |
+| `--cfar-threshold DB` | CA-CFAR threshold factor 10 log10(alpha) in dB of the configured method (default: the configuration, i.e. the method's Pfa); can also be changed in the PPI |
 | `--serial DEVICE` | send the CFAR output to a serial port (`/dev/ttyUSB0`, `COM3`, ...) |
 | `--baud N` | serial baud rate (default 921600) |
 | `--serial-content X` | `detections` (default: the pruned CFAR detections of every CPI update) or `plots` |
@@ -104,6 +136,7 @@ plots of both programs.
 | `--update-every N` | run Doppler, CFAR and extraction every N pulses (default from the configuration: 1) |
 | `--plots-csv FILE` | plot list (default `plots.csv`; `''` = none) |
 | `--detections-csv FILE` | all pruned CFAR detections (default none) |
+| `--tracks-csv FILE` | every track update and deletion: id, confirmed, deleted, time, x, y, z, vx, vy, vz (East, North, up relative to the antenna), hits, misses, ax, ay, az (0 with the constant-velocity model) (default none) |
 | `--idle-timeout S` | stop when no PRI arrived for S seconds after the first one (default 0 = never) |
 | `--quiet` | do not print every plot |
 | `--queue N` | PRIs buffered between the input thread and the processing (default 64) |
@@ -121,9 +154,20 @@ order. It ignores duplicates and foreign datagrams, drops PRIs with missing
 packets (counted as incomplete), and follows the sender when it restarts.
 A jump in the pulse numbers (a PRI lost, or a skipped azimuth sector)
 restarts the CPI buffers and closes the open plots, as the MATLAB simulator
-does between simulated sectors. A PRI whose layout (channels, DDC samples,
-samples of each sub-pulse, DDC rate) differs from the configuration is
-ignored and counted: export the configuration again.
+does between simulated sectors.
+
+The DDC stream depends only on the radar (PRI timeline, instrumented range,
+DDC filters), not on the processing settings of the sender, and the receiver
+processes the stream of its radar whatever those settings are (compression
+filter, CFAR method and window, clutter rejection, tracking): a PRI must
+have the configured channels and DDC rate, a stagger position of the
+configured PRF, the same timing (the first DDC sample of both receive
+intervals in its header, and the time of its first DDC sample), and at least
+the DDC samples that the configuration needs. A
+longer record (a sender with a larger `cfg.rx.maxRange_m`) is fine: the
+receiver uses the samples it needs. Other PRIs are ignored and counted
+(`PRIs ignored` at the end): export the configuration from the settings of
+the sender's radar, with an instrumented range not larger than the sender's.
 
 The datagrams are read in a thread of their own, which puts the complete
 PRIs into a queue (`--queue`). The socket is therefore emptied also while a
@@ -161,20 +205,69 @@ file (`decode_serial.py /dev/ttyUSB0`, `decode_serial.py capture.bin --csv`).
 **PPI:** range rings, azimuth spokes (0 = North, clockwise) and the antenna
 line. Short-pulse plots are cyan and long-pulse plots yellow. They are drawn
 at ground range and, by default, removed when the antenna passes them again
-in the next scan. The PPI is interactive:
+in the next scan.
+
+The panel on the right of the window has:
+* **Display**: *Plots (after extractor)* as before; *Detections (before
+  extractor)*: the pruned CFAR detections of every CPI update, the input of
+  the plot extractor, each drawn as an arc over the azimuth step between CPI
+  updates (rotation rate x PRI x `--update-every`) at its ground range
+  (darker cyan / yellow), so a target appears as an arc about one beamwidth
+  long; or both. Key `D` switches too. The newest 60 000 detections are kept;
+  they disappear like the plots.
+* **Save screenshot (PNG) ...**: saves the PPI as it is now (without the
+  panel); the default file name has the date and time.
+* **Tracks (T)**: shows or hides the tracks of the EKF tracker: a hollow
+  triangle at the last update, so the plot (filled circle) lies inside it;
+  magenta with its number and a 30 s velocity leader when confirmed, gray
+  while tentative. Hover over it: number, state, range, azimuth, height and
+  climb (3-D), speed, heading, acceleration (constant-acceleration model),
+  updates. A deleted track disappears.
+* **CFAR threshold [dB]**: shows the method (`cfg.cfar.method`), the
+  threshold the processing uses and its false alarm probability
+  (`cfar_pfa()`, needs `nLooks` in the configuration file: export it again
+  with the current `export_receiver_config.m`). *Apply* sends the value in
+  the field to the processing thread, which uses it from the next CPI update
+  on and reports it back (also printed on the console); *Default* returns to
+  the value of the configuration.
+* **Mean time per PRI [us]** (bottom right, above the help): the mean
+  time per PRI since the start of every block of the processing thread:
+  DBF, matched filter, MTI (clutter filter), Doppler (FFT and non-coherent
+  integration), CFAR of the configured method with the pruning, plot
+  extractor, tracking, the console output (printing the plots, track
+  confirmations and messages; 0 with `--quiet`) and the display calls
+  (handing the antenna, plots, detections, tracks and times to the PPI),
+  and their total. Then *PPI drawing (GUI)*: the time the GUI thread spends
+  taking the data and drawing the PPI, per PRI; it runs on another core at
+  the same time, so it is not in the total. The worker posts its
+  accumulated times 4 times a second; the console and display times are
+  also printed at the end (`Output per PRI`).
+
+**Tracking** (`cfg.track.enable` in the configuration, `tracker.c`): the
+same EKF as `track_update.m` (2-D or 3-D, constant velocity or constant
+acceleration, global nearest neighbour association on batches of plots,
+see `../README.md`). Once per PRI it gets the plots of that PRI, associates
+a complete batch and deletes old tracks, as `run_radar_sim.m` does; a gap
+in the pulse numbers and the end of the data associate the open batch.
+Confirmations are printed on the console (unless `--quiet`), and the number
+of updates at the end.
+
+The PPI is interactive:
 
 | Action | Effect |
 |---|---|
 | mouse wheel | zoom in/out around the cursor (up to x500); rings adapt to the visible range |
 | left drag | pan |
 | double click, `R`, `Home` | reset the view |
-| hover over a plot | data tip: range, azimuth, elevation, radial velocity, SNR, time, sub-pulse, CPI hits, beam/cell/bin, pulse number |
-| click on a plot | pin its data tip on the display (click again to remove it) |
-| right click | options: short/long-pulse plots, plot labels, range rings, antenna trail, plots shown (until the antenna passes again / two scans / all until cleared), minimum SNR, reset view, clear plots, remove data tips, pause, save as PNG |
+| hover over a plot or detection | data tip: range, azimuth, elevation, radial velocity, SNR, time, sub-pulse, CPI hits (plots), beam/cell/bin, pulse number |
+| click on a plot or detection | pin its data tip on the display (click again to remove it) |
+| right click | options: show plots / detections / both, short/long pulse, plot labels, range rings, antenna trail, plots shown (until the antenna passes again / two scans / all until cleared), minimum SNR, reset view, clear display, remove data tips, pause, save a screenshot |
 | `+` `-`, arrows | zoom, pan |
 | `C` | remove the pinned data tips |
+| `D` | next display mode (plots / detections / both) |
 | space | pause/resume the display (the processing continues; the plots are shown on resume) |
-| `S` | save as PNG |
+| `S` | save a screenshot (PNG) |
+| `T` | show/hide the tracks |
 
 The status line shows the zoom and the range, azimuth and east/north
 position of the cursor.
@@ -195,7 +288,12 @@ The processing is written for x86 CPUs with AVX2:
   from partial sums, and Doppler sums are running sums. The noise floor
   median uses a histogram.
 * All stages are split over threads with OpenMP, and all buffers are
-  allocated once.
+  allocated once. A loop never gets more threads than it has work items
+  (beams, cell blocks): with a single element (no DBF) the loops over beams
+  (matched filter, CFAR) run in the processing thread. Otherwise every idle
+  thread has to be woken and reach the closing barrier; with the PPI and the
+  UDP input on the other cores that wait made the single-beam matched filter
+  take more than 1 ms per PRI instead of about 0.1 ms.
 
 Measured processing time per PRI (replay of the six-target streams of
 `tests/test_c_receiver.m`: 48 channels, 21 beams, both sub-pulses, 273 +
@@ -216,7 +314,12 @@ over localhost) it dropped no PRIs and plotted every target, with
 `--update-every` 1, 4 and 8. With every-pulse updates, about three quarters
 of the updates were skipped automatically. A desktop CPU with 8 or more cores is
 correspondingly faster. The 80 km default configuration has about twice as
-many long-pulse range cells.
+many long-pulse range cells. Another 4-vCPU VM (Xeon at 2.8 GHz, AVX-512)
+was about 1.6 times slower (fixed PRF, 3 threads: 6.0 ms per PRI, 1.35 ms
+every 8 pulses; the same with the receiver before the latest fixes). In the
+real-time test with `--threads 2` it still dropped no PRIs and plotted every
+target: with `--update-every 8` about half of the updates were skipped (fixed
+PRF; a third with the staggered PRF), with every-pulse updates nine tenths.
 
 **Real time.** Doppler processing and CFAR on every new pulse, as in MATLAB,
 take longer than a 1 ms PRI on a small PC. The receiver handles this in two
@@ -237,23 +340,73 @@ Without skipped updates the plots are exactly those of MATLAB. The stream of
 the default radar is 340 MB/s (2.7 Gbit/s). It needs 10 Gbit Ethernet and a
 receive buffer of at least 32 MB (see "Input: UDP packets").
 
-`radar_stream_send` sends a recorded stream (`--record`) at the real PRI
-rate (or `--speed X` times faster), so the receiver can be tested in real
-time without MATLAB:
+## Sending DDC files or a recording with the PRI timing (`radar_stream_send`)
+
+`radar_stream_send` sends recorded DDC data over UDP at the real PRI rate
+(or `--speed X` times faster), so the receiver can be tested in real time
+without MATLAB. The source is either
+
+* a folder of DDC files `ddc_<n>.mat`, written by the simulator with
+  `cfg.io.saveDdc = true` (one file per PRI: `I`, `Q`, `hdr`), or
+* a stream recorded with `radar_receiver --record FILE`.
+
+The data are not processed: every PRI of a DDC file is split into exactly
+the datagrams that the simulator sends live (`udp_make_packets.m`), with
+`--payload` bytes of samples per datagram; a recording is sent datagram by
+datagram as it was received.
 
 ```sh
+radar_stream_send ../output/ddc_pulses --host 192.168.1.20 --port 50000
+radar_stream_send ../output/ddc_pulses --payload 8192 --spread 0.8 --timing-csv timing.csv
 radar_receiver --config cfg.bin --port 50000 --record stream.rec   # while MATLAB streams
-radar_receiver --config cfg.bin --port 50001 --update-every 4 &
-radar_stream_send stream.rec --port 50001
+radar_stream_send stream.rec --port 50001 --loops 10
 ```
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--host H`, `--port N` | 127.0.0.1, 50000 | destination (IPv4) |
+| `--speed X` | 1 | replay speed (0 = as fast as possible) |
+| `--payload BYTES` | 1400 | DDC bytes per datagram (DDC files only; 1400 fits a 1500-byte MTU) |
+| `--spread F` | 0 | send the datagrams of a PRI evenly over the fraction F of the PRI instead of as one burst |
+| `--no-gaps` | | a skipped sector (gap in the pulse numbers) lasts one PRI instead of its real duration |
+| `--catch-up` | | after a late PRI, send the next ones at once until the original schedule is reached (default: keep the PRI spacing, no burst) |
+| `--loops N` | 1 | send the data N times; pulse numbers and times continue |
+| `--queue N` | 256 | PRIs read ahead (filled before the first PRI is sent) |
+| `--timing-csv FILE` | | scheduled and real send time and delay of every PRI |
+| `--quiet` | | only the summary |
+
+Timing:
+* The send time of every PRI is its PRI start time from the header
+  (`hdr.time_s`) divided by `--speed`, on one monotonic clock: errors do not
+  accumulate. The sender sleeps until 2 ms before the send time (20 ms on
+  Windows, where `Sleep` can wake a timer tick late) and busy-waits for the
+  rest. On this 4-vCPU VM, with nothing else running, the PRIs left with a
+  median delay of 0.1 us and the PRI intervals were within 13 ... 34 us
+  (99 %) of the 1 ms PRI, 1000 PRIs/s at 2.2 Gbit/s with 1400-byte payloads.
+  Late PRIs come from the operating system (the VM stalled the process for
+  up to a few ms now and then).
+* A reader thread reads and splits the files ahead into a queue of
+  `--queue` PRIs, so reading never delays a PRI (1 ms PRI: 256 PRIs =
+  0.26 s of data, 88 MB for 48 channels). Reading a 48-channel file takes
+  less than 0.5 ms.
+* At the end a summary gives the number of late PRIs, the largest and the
+  median delay and the error of the PRI intervals.
+* When the receiver runs on the same PC, leave a core for the sender
+  (`--threads`) and use `--update-every` so the receiver keeps up; on this
+  4-vCPU VM, with `--threads 2 --update-every 8`, all 397 PRIs of a
+  48-channel recording arrived complete and gave the MATLAB plot.
 
 ## Tests
 
 | Test | What it checks |
 |---|---|
-| `core` (`tests/test_core.c`) | batched FFT against a direct DFT; plot extractor; a moving target through the whole chain with the exported configuration (one plot at the right range, velocity and beam); direct and fast-convolution matched filters give the same plot |
+| `tracker` (`tests/test_tracker.c`) | two crossing targets over 6 scans, 3-D and 2-D: two confirmed tracks that stay on their targets; GNN with two targets 200 m apart: each track stays on its own target; with plots, a configuration and the track log from `../tests/test_tracker.m` (CV and CA, 2-D and 3-D), every C track update equals MATLAB's (same plot, state within 1e-6) |
+| `core` (`tests/test_core.c`) | batched FFT against a direct DFT; plot extractor; a moving target through the whole chain with the exported configuration (one plot at the right range, velocity and beam); direct and fast-convolution matched filters give the same plot; the same target with the CFAR threshold raised to 45 dB at run time gives no detection; `cfar_pfa()` against the closed form (one look) and the Pfa 1e-8 of the configured threshold; the PRIs of the configured radar are processed, also with a longer record, and PRIs with fewer DDC samples, another receive interval, time of the first DDC sample, DDC rate or stagger position are ignored |
+| `core_phasecode` | the same core test with `config/radar_config_phasecode.bin` (both sub-pulses P4 phase codes with mismatch filters): the echo is the real code, the plot lies on the target cell |
+| `cfar` (`tests/test_cfar.c`) | the CA-CFAR of `processor.c` against direct sums over the training cells: every decision, for the 2-D, 1-D range and 1-D Doppler windows and tested range intervals in the middle, at both range edges (also when the whole interval lies within the cells of the shifted windows) and over all cells |
 | `udp_input` | reassembly with shuffled, duplicate, missing and foreign datagrams; timeouts; record and replay; fuzzing |
+| `ddc_files` (`tests/test_ddc_files.c`) | MAT-file reader with files written as MATLAB writes them (data in smaller storage types, small elements, skipped char field, compressed `-v7` with zlib); folder listing; the datagrams of a DDC file are accepted by `udp_input.c` and give back the same PRI; corrupted, truncated, `-v7.3` and big-endian files are refused |
 | `serial` | frame encoding and CRC; real output to a pseudo-terminal (Linux): exact bytes, 200-detection split, non-blocking drops, close |
-| `ppi` | the Qt PPI runs off-screen with antenna updates and plots and saves a snapshot |
-| `ppi_interactive` | mouse, wheel and key events: data tips, cursor readout, zoom around the cursor, pan, pin/unpin, reset, filters, persistence options, pause, clear |
+| `ppi` | the Qt PPI runs off-screen with antenna updates, plots, detections and a CFAR threshold report and saves a snapshot |
+| `ppi_interactive` | mouse, wheel and key events: data tips, cursor readout, zoom around the cursor, pan, pin/unpin, reset, filters, persistence options, pause, clear; detections (display modes, arcs drawn, data tips, key D); window panel: display mode box, CFAR threshold Apply/Default and its report, screenshot, mean block times; tracks (triangle drawn around the plot, data tip, checkbox and key T, deletion) |
 | `../tests/test_c_receiver.m` (Octave/MATLAB) | the six-target scenario streamed over UDP to this receiver: the C plots must match the MATLAB plots; the recording is replayed to check that the result is repeatable and to measure the time |

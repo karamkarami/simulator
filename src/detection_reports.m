@@ -20,8 +20,8 @@ for i = 1:numel(dets.beam)
     if b > 1 && b < nB
         pdB = double(10*log10(P(b-1:b+1, dets.rIdx(i), dets.dIdx(i))));
         den = pdB(1) - 2*pdB(2) + pdB(3);
-        if den < 0
-            delta = 0.5*(pdB(1) - pdB(3))/den;
+        delta = 0.5*(pdB(1) - pdB(3))/den;
+        if den < 0 && isfinite(delta)                % (a zero power gives -Inf dB)
             u = interp1(1:nB, sys.dbf.beamU, b + delta);
         end
     end

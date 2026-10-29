@@ -3,8 +3,10 @@
  *
  * A worker posts antenna positions over 1.2 scans (1000 updates per second
  * of display time, faster than real time) and a few plots of both pulse
- * types, one of them without elevation (NaN), then returns. ppi_run renders
+ * types, one of them without elevation (NaN), with the CFAR detections that
+ * led to them, and reports a CFAR threshold, then returns. ppi_run renders
  * the PPI to a PNG file; the test checks that the file is a PNG and not tiny.
+ * The display shows the plots (default mode), the detections are stored.
  *
  * Expected picture (antenna start azimuth 30 deg, clockwise, ends at 102 deg
  * in scan 2): the plot at 45 deg of scan 1 has been swept over again and is
@@ -113,6 +115,23 @@ static int worker(void *arg)
         const double t = (azU - AZ0_DEG) / RATE_DPS;
         const uint32_t scan = (uint32_t)floor((azU - AZ0_DEG) / 360.0) + 1;
         ppi_post_antenna(fmod(azU, 360.0), t, scan);
+        if (k == 0) ppi_post_cfar_threshold(12.8, 1e-8, 12.8);
+        double request_dB;
+        if (ppi_take_cfar_request(&request_dB)) ++*posted;   /* nobody pressed Apply: must not happen */
+        for (int i = 0; i < N_PLOTS; ++i) {                  /* detections while the antenna passes */
+            const double d = azU - plot_unwrapped_az(&kPlots[i]);
+            if (d >= -2.0 && d < 2.0) {
+                Detection det;
+                memset(&det, 0, sizeof det);
+                det.time_s = t;
+                det.az_deg = fmod(azU, 360.0);
+                det.range_m = kPlots[i].range_m;
+                det.el_deg = kPlots[i].el_deg;
+                det.snr_dB = kPlots[i].snr_dB;
+                det.pulse = kPlots[i].pulse;
+                ppi_post_detections(&det, 1, STEP_DEG);
+            }
+        }
 
         for (int i = 0; i < N_PLOTS; ++i) {
             if (!done[i] && azU >= plot_unwrapped_az(&kPlots[i]) + CPI_DELAY_DEG) {
@@ -161,6 +180,8 @@ int main(int argc, char **argv)
     /* posting without a running display must be harmless */
     ppi_post_antenna(10.0, 0.0, 1);
     post_plot(&kPlots[0], 0.0, 0);
+    ppi_post_detections(NULL, 0, 0.1);
+    ppi_post_cfar_threshold(13.0, NAN, 13.0);
 
     printf(failures ? "FAIL\n" : "PASS\n");
     return failures ? 1 : 0;

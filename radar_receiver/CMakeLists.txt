@@ -18,6 +18,9 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
 
+# Default Qt location on Windows; appended, so -DCMAKE_PREFIX_PATH=<Qt> still wins
+list(APPEND CMAKE_PREFIX_PATH "C:/Qt/6.12.0/mingw_64")
+
 # Compiler flags. No -ffast-math: the elevation of a plot is NaN without
 # beamforming and the processing relies on IEEE behaviour.
 include(CheckCCompilerFlag)
@@ -50,6 +53,7 @@ add_library(radar_core STATIC
     src/config.c
     src/fft.c
     src/extractor.c
+    src/tracker.c
     src/processor.c
     src/udp_input.c
     src/serial_out.c
@@ -62,9 +66,20 @@ if(RADAR_OPENMP)
     find_package(OpenMP COMPONENTS C)
     if(OpenMP_C_FOUND)
         target_link_libraries(radar_core PUBLIC OpenMP::OpenMP_C)
+        # OpenMP::OpenMP_C only adds -fopenmp at link time when the C linker
+        # is used ($<LINK_LANGUAGE:C>). Programs that also link the Qt PPI use
+        # the C++ linker, so pass the flag for that case too; otherwise GCC /
+        # MinGW gives "undefined reference to GOMP_parallel, omp_get_num_threads".
+        if(NOT MSVC AND OpenMP_C_FLAGS)
+            target_link_options(radar_core INTERFACE
+                "$<$<LINK_LANGUAGE:CXX>:${OpenMP_C_FLAGS}>")
+        endif()
     else()
         message(WARNING "OpenMP not found: the receiver runs single-threaded")
     endif()
+endif()
+if(NOT OpenMP_C_FOUND AND NOT MSVC)
+    target_compile_options(radar_core PRIVATE -Wno-unknown-pragmas)   # the omp pragmas are ignored
 endif()
 find_package(Threads REQUIRED)
 target_link_libraries(radar_core PUBLIC Threads::Threads)
@@ -120,9 +135,26 @@ if(RADAR_QT_FOUND)
     set_target_properties(radar_receiver PROPERTIES LINKER_LANGUAGE CXX)
 endif()
 
-# Sends a recorded stream (--record) over UDP at the real PRI rate
+# Reading the DDC files of the simulator (ddc_<n>.mat). zlib (optional) is
+# needed only for compressed MAT-files (save -v7); -v6 files need nothing.
+add_library(radar_ddc_files STATIC tools/mat_file.c tools/ddc_files.c)
+target_include_directories(radar_ddc_files PUBLIC tools)
+find_package(ZLIB QUIET)
+if(ZLIB_FOUND)
+    target_compile_definitions(radar_ddc_files PRIVATE RADAR_HAVE_ZLIB)
+    target_link_libraries(radar_ddc_files PRIVATE ZLIB::ZLIB)
+    message(STATUS "DDC files: -v6 and compressed -v7 MAT-files (zlib)")
+else()
+    message(STATUS "zlib not found: the DDC files must be saved with -v6 (cfg.io.matFormat)")
+endif()
+if(NOT WIN32)
+    target_link_libraries(radar_ddc_files PUBLIC m)
+endif()
+
+# Sends the DDC files (ddc_<n>.mat) or a recorded stream (--record) over UDP
+# with the real PRI timing
 add_executable(radar_stream_send tools/stream_send.c)
-target_link_libraries(radar_stream_send PRIVATE radar_core)
+target_link_libraries(radar_stream_send PRIVATE radar_core radar_ddc_files)
 
 # Windows: copy the Qt DLLs and plugins next to a program that uses the PPI,
 # so it starts without Qt's bin folder on PATH.
@@ -151,6 +183,32 @@ if(RADAR_BUILD_TESTS)
     add_executable(test_core tests/test_core.c)
     target_link_libraries(test_core PRIVATE radar_core)
     add_test(NAME core COMMAND test_core ${CMAKE_CURRENT_SOURCE_DIR}/config/radar_config.bin)
+    # phase codes with mismatch filters (export_receiver_config.m, see README)
+    add_test(NAME core_phasecode COMMAND test_core ${CMAKE_CURRENT_SOURCE_DIR}/config/radar_config_phasecode.bin)
+
+    # the CFAR against direct sums (white-box: the test includes processor.c)
+    add_executable(test_cfar tests/test_cfar.c src/config.c src/fft.c src/extractor.c src/tracker.c src/platform.c)
+    target_include_directories(test_cfar PRIVATE src)
+    target_link_libraries(test_cfar PRIVATE Threads::Threads)
+    if(OpenMP_C_FOUND)
+        target_link_libraries(test_cfar PRIVATE OpenMP::OpenMP_C)
+    endif()
+    if(NOT WIN32)
+        target_link_libraries(test_cfar PRIVATE m)
+    endif()
+    add_test(NAME cfar COMMAND test_cfar ${CMAKE_CURRENT_SOURCE_DIR}/config/radar_config.bin)
+
+    add_executable(test_tracker tests/test_tracker.c)
+    target_link_libraries(test_tracker PRIVATE radar_core)
+    add_test(NAME tracker COMMAND test_tracker ${CMAKE_CURRENT_SOURCE_DIR}/config/radar_config.bin)
+
+    add_executable(test_ddc_files tests/test_ddc_files.c)
+    target_link_libraries(test_ddc_files PRIVATE radar_core radar_ddc_files)
+    if(ZLIB_FOUND)
+        target_compile_definitions(test_ddc_files PRIVATE RADAR_HAVE_ZLIB)   # writes compressed files
+        target_link_libraries(test_ddc_files PRIVATE ZLIB::ZLIB)
+    endif()
+    add_test(NAME ddc_files COMMAND test_ddc_files)
 
     add_executable(test_udp_input tests/test_udp_input.c)
     target_link_libraries(test_udp_input PRIVATE radar_core)

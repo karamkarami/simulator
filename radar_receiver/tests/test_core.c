@@ -145,10 +145,13 @@ static int16_t sat16(double v)
     return (int16_t)(v > 32767 ? 32767 : v < -32768 ? -32768 : v);
 }
 
-/* A target of the long pulse: echo = transmitted waveform (from the matched
- * filter taps), steered to one elevation beam, moving with vr. Noise 16 LSB rms
- * per component like the simulator's DDC output. */
-static int test_end_to_end(const char *configPath, int mfDirect, Detection *plotOut)
+/* A target of the long pulse: echo = transmitted waveform (the pulse of the
+ * configuration, or else from the matched filter taps; scaled to the energy
+ * of the unit-norm taps), steered to one elevation beam, moving with vr. With
+ * a mismatch filter the echo starts mfShift samples after the start of the
+ * filter input of the target cell. Noise 16 LSB rms per component like the
+ * simulator's DDC output. */
+static int test_end_to_end(const char *configPath, int mfDirect, double threshold_dB, Detection *plotOut)
 {
     RadarConfig cfg;
     char err[256];
@@ -162,10 +165,19 @@ static int test_end_to_end(const char *configPath, int mfDirect, Detection *plot
     printf("config: %d channels, %d beams, %d DDC samples, CPI %d, nfft %d, %s PRF, %s matched filter\n",
            cfg.nCh, cfg.nBeams, cfg.nDdc, cfg.cpiLength, cfg.nfft, cfg.staggered ? "staggered" : "fixed",
            mfDirect ? "direct" : "automatic");
+    for (int i = 0; i < N_PULSES; i++)
+        printf("  %s pulse: %s, %s filter, %d taps, %d range cells\n", i == PULSE_SHORT ? "short" : "long",
+               cfg.pulse[i].waveform == WAVE_PHASE_CODE ? "phase code" : "LFM",
+               cfg.pulse[i].compression == COMPRESSION_MISMATCH ? "mismatch" : "matched", cfg.pulse[i].nTaps,
+               cfg.pulse[i].nRange);
 
     const PulseConfig *pc = &cfg.pulse[PULSE_LONG];
     const int beam = cfg.nBeams > 4 ? cfg.nBeams / 3 : 0;
     const int r0 = pc->nRange / 2;                      /* range cell of the target */
+    const int nEcho = pc->nPulse ? pc->nPulse : pc->nTaps;
+    double pulseNorm = 0.0;
+    for (int m = 0; m < pc->nPulse; m++) pulseNorm += pc->pulseRe[m] * pc->pulseRe[m] + pc->pulseIm[m] * pc->pulseIm[m];
+    pulseNorm = pulseNorm > 0.0 ? sqrt(pulseNorm) : 1.0;
     const double vr = 7.3;                              /* m/s, inside the unambiguous interval */
     const double pri_s = 1e-3, amp = 30.0;              /* amplitude per element (LSB)          */
     const int nPulses = cfg.cpiLength + 60, nWith = cfg.cpiLength + 30;
@@ -175,10 +187,11 @@ static int test_end_to_end(const char *configPath, int mfDirect, Detection *plot
     pri.nCh = cfg.nCh;
     pri.nSamples = cfg.nDdc;
     pri.ddcFs_Hz = (float)cfg.fsOut_Hz;
-    pri.shortIdx[0] = (uint32_t)cfg.pulse[PULSE_SHORT].ddcFirst + 1;
+    pri.shortIdx[0] = (uint32_t)cfg.pulse[PULSE_SHORT].rxFirst + 1;          /* receive intervals */
     pri.shortIdx[1] = (uint32_t)(cfg.pulse[PULSE_SHORT].ddcFirst + cfg.pulse[PULSE_SHORT].ddcCount);
-    pri.longIdx[0] = (uint32_t)cfg.pulse[PULSE_LONG].ddcFirst + 1;
-    pri.longIdx[1] = (uint32_t)(cfg.pulse[PULSE_LONG].ddcFirst + cfg.pulse[PULSE_LONG].ddcCount);
+    pri.longIdx[0] = (uint32_t)cfg.pulse[PULSE_LONG].rxFirst + 1;
+    pri.longIdx[1] = (uint32_t)cfg.nDdc;
+    pri.ddcT0_s = (float)cfg.ddcT0_s;
     pri.iq = malloc(sizeof(int16_t) * 2 * (size_t)cfg.nCh * cfg.nDdc);
     double *steerRe = malloc(sizeof(double) * cfg.nCh), *steerIm = malloc(sizeof(double) * cfg.nCh);
     for (int ch = 0; ch < cfg.nCh; ch++) {               /* matched to the beam weights */
@@ -191,9 +204,11 @@ static int test_end_to_end(const char *configPath, int mfDirect, Detection *plot
 
     Processor *proc = processor_create(&cfg, 0);
     CHECK(proc != NULL, "processor_create");
+    CHECK(processor_cfar_alpha(proc) == cfg.alpha, "the CFAR threshold starts at the configuration value");
+    if (!isnan(threshold_dB)) processor_set_cfar_alpha(proc, pow(10.0, threshold_dB / 10.0));
     Sink sink;
     memset(&sink, 0, sizeof sink);
-    ProcessorCallbacks cb = { on_detections, on_plot, NULL, &sink };
+    ProcessorCallbacks cb = { on_detections, on_plot, NULL, &sink, NULL };
     srand(42);
     double tProc = 0;
     for (int k = 0; k < nPulses; k++) {
@@ -205,13 +220,16 @@ static int test_end_to_end(const char *configPath, int mfDirect, Detection *plot
         for (size_t i = 0; i < 2 * (size_t)cfg.nCh * cfg.nDdc; i++) pri.iq[i] = sat16(16.0 * gauss());
         if (k < nWith) {
             const double ph = -4 * PI * vr * pri.time_s / pc->lambda_m;   /* baseband phase -4*pi*R/lambda */
-            const int first = pc->ddcFirst + r0;
+            /* echo start of cell r0: the filter output r0 of the row (padFront zeros,
+             * segment) peaks for the echo starting mfShift samples into its input */
+            const int first = pc->ddcFirst - pc->padFront + r0 + pc->mfShift;
             for (int ch = 0; ch < cfg.nCh; ch++) {
                 const double cr = amp * (steerRe[ch] * cos(ph) - steerIm[ch] * sin(ph));
                 const double ci = amp * (steerRe[ch] * sin(ph) + steerIm[ch] * cos(ph));
-                for (int m = 0; m < pc->nTaps; m++) {
-                    /* waveform s[m] = conj(h[nTaps-1-m]) / |h|max */
-                    const double sr = pc->tapsRe[pc->nTaps - 1 - m], si = -pc->tapsIm[pc->nTaps - 1 - m];
+                for (int m = 0; m < nEcho; m++) {
+                    /* waveform s[m]: the pulse, or conj(h[nTaps-1-m]) */
+                    const double sr = pc->nPulse ? pc->pulseRe[m] / pulseNorm : pc->tapsRe[pc->nTaps - 1 - m];
+                    const double si = pc->nPulse ? pc->pulseIm[m] / pulseNorm : -pc->tapsIm[pc->nTaps - 1 - m];
                     int16_t *v = pri.iq + 2 * ((size_t)ch * cfg.nDdc + first + m);
                     v[0] = sat16(v[0] + cr * sr - ci * si);
                     v[1] = sat16(v[1] + cr * si + ci * sr);
@@ -235,6 +253,17 @@ static int test_end_to_end(const char *configPath, int mfDirect, Detection *plot
            sink.dets[0], sink.dets[1], sink.plots.n);
     CHECK(sink.updates[PULSE_LONG] == nPulses - cfg.cpiLength + 1 || cfg.updateEvery > 1,
           "CPI updates %d", sink.updates[PULSE_LONG]);
+    if (!isnan(threshold_dB)) {          /* a threshold above the target peak: nothing is detected */
+        CHECK(sink.dets[0] + sink.dets[1] == 0 && sink.plots.n == 0,
+              "CFAR threshold %.1f dB: %d detections, %d plots (expected none)", threshold_dB,
+              sink.dets[0] + sink.dets[1], sink.plots.n);
+        processor_destroy(proc);
+        free(steerRe);
+        free(steerIm);
+        free(pri.iq);
+        radar_config_free(&cfg);
+        return sink.plots.n == 0;
+    }
     int found = 0;
     for (int i = 0; i < sink.plots.n; i++) {
         const Detection *p = &sink.plots.plots[i];
@@ -258,6 +287,79 @@ static int test_end_to_end(const char *configPath, int mfDirect, Detection *plot
     return found == 1;
 }
 
+/* False alarm probability of the CFAR threshold (the inverse of cfar_alpha.m). */
+static void test_cfar_pfa(const char *configPath)
+{
+    /* one look: closed form (1 + alpha/N)^-N */
+    for (int n = 8; n <= 300; n *= 3) {
+        const double alpha = n * (pow(1e-6, -1.0 / n) - 1.0);
+        const double pfa = cfar_pfa(alpha, n, 1.0);
+        CHECK(fabs(pfa / 1e-6 - 1.0) < 1e-9, "cfar_pfa one look, N = %d: %.6e (expected 1e-6)", n, pfa);
+    }
+    CHECK(fabs(cfar_pfa(0.0, 100, 1.5) - 1.0) < 1e-12, "cfar_pfa(alpha = 0) = 1");
+    CHECK(isnan(cfar_pfa(10.0, 100, 0.0)), "cfar_pfa without nLooks is NaN");
+    /* the configuration: alpha was designed for cfg.cfar.pfa = 1e-8 with nLooks looks */
+    RadarConfig cfg;
+    char err[256];
+    if (radar_config_load(configPath, &cfg, err, sizeof err) != 0) return;
+    if (cfg.nLooks > 0) {
+        const double pfa = cfar_pfa(cfg.alpha, cfg.nTrain, cfg.nLooks);
+        printf("CFAR: alpha %.3f (%.2f dB), %d training cells, %.2f looks -> Pfa %.3e\n", cfg.alpha,
+               10 * log10(cfg.alpha), cfg.nTrain, cfg.nLooks, pfa);
+        CHECK(fabs(pfa / 1e-8 - 1.0) < 1e-3, "Pfa of the configured threshold %.4e (expected 1e-8)", pfa);
+        CHECK(cfar_pfa(cfg.alpha * 2.0, cfg.nTrain, cfg.nLooks) < pfa, "a higher threshold has a lower Pfa");
+    } else {
+        printf("configuration without nLooks: Pfa check skipped\n");
+    }
+    radar_config_free(&cfg);
+}
+
+/* Which PRIs the processor takes (pri_matches_config): those of the configured
+ * radar, also with a longer record (a sender with a larger instrumented range)
+ * and whatever its processing settings; not those of another radar or with
+ * fewer DDC samples than the configuration needs. */
+static void test_layout_check(const char *configPath)
+{
+    RadarConfig cfg;
+    char err[256];
+    if (radar_config_load(configPath, &cfg, err, sizeof err) != 0) {
+        CHECK(0, "configuration %s: %s", configPath, err);
+        return;
+    }
+    const int extra = 40;                                   /* samples of a longer record */
+    PriData pri;
+    memset(&pri, 0, sizeof pri);
+    pri.nCh = cfg.nCh;
+    pri.ddcFs_Hz = (float)cfg.fsOut_Hz;
+    pri.ddcT0_s = (float)cfg.ddcT0_s;
+    pri.staggerIndex = 1;
+    pri.iq = calloc(2 * (size_t)cfg.nCh * (cfg.nDdc + extra), sizeof(int16_t));
+    static const char *what[] = { "the configured layout", "a longer record", "a record one sample short",
+                                  "another short-pulse receive interval", "another long-pulse receive interval",
+                                  "another time of the first DDC sample", "another DDC rate",
+                                  "a stagger position outside the PRF" };
+    const int expectTaken[] = { 1, 1, 0, 0, 0, 0, 0, 0 };
+    for (int c = 0; c < 8; c++) {
+        pri.nSamples = cfg.nDdc + (c == 1 ? extra : c == 2 ? -1 : 0);
+        pri.shortIdx[0] = (uint32_t)cfg.pulse[PULSE_SHORT].rxFirst + 1 + (c == 3);
+        pri.longIdx[0] = (uint32_t)cfg.pulse[PULSE_LONG].rxFirst + 1 + (c == 4);
+        pri.ddcT0_s = (float)(cfg.ddcT0_s + (c == 5 ? 1.0 / cfg.fsOut_Hz : 0.0));
+        pri.ddcFs_Hz = (float)(cfg.fsOut_Hz * (c == 6 ? 2 : 1));
+        pri.staggerIndex = (uint16_t)(c == 7 ? cfg.nStagger + 1 : 1);
+        Processor *proc = processor_create(&cfg, 1);
+        pri.pulseNumber = 1;
+        processor_process(proc, &pri, NULL);
+        ProcessorTiming tm;
+        processor_timing(proc, &tm);
+        CHECK((tm.rejected == 0) == expectTaken[c], "PRI with %s: %s", what[c],
+              tm.rejected ? "ignored" : "processed");
+        processor_destroy(proc);
+    }
+    printf("layout check: PRIs of the configured radar taken (also with a longer record), others ignored\n");
+    free(pri.iq);
+    radar_config_free(&cfg);
+}
+
 int main(int argc, char **argv)
 {
     test_fft();
@@ -265,13 +367,17 @@ int main(int argc, char **argv)
     if (argc > 1) {
         /* fast convolution (where cheaper) and direct matched filter: same plot */
         Detection a, b;
-        if (test_end_to_end(argv[1], 0, &a) && test_end_to_end(argv[1], 1, &b)) {
+        if (test_end_to_end(argv[1], 0, NAN, &a) && test_end_to_end(argv[1], 1, NAN, &b)) {
             CHECK(a.rIdx == b.rIdx && a.dIdx == b.dIdx && a.beam == b.beam && a.hits == b.hits,
                   "fast and direct matched filter give different plots");
             CHECK(fabs(a.snr_dB - b.snr_dB) < 0.01 && fabs(a.power / b.power - 1) < 1e-4,
                   "fast and direct matched filter: SNR %.4f / %.4f dB, power ratio %.6f",
                   a.snr_dB, b.snr_dB, a.power / b.power);
         }
+        /* the same target with the CFAR threshold raised far above its peak (run-time change) */
+        test_end_to_end(argv[1], 0, 45.0, &a);
+        test_cfar_pfa(argv[1]);
+        test_layout_check(argv[1]);
     } else {
         printf("no configuration file given: end-to-end test skipped\n");
     }

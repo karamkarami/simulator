@@ -71,6 +71,17 @@ sys.nStagger  = numel(sys.pri);
 if size(sys.mtiCoeffs, 1) == 1
     sys.mtiCoeffs = repmat(sys.mtiCoeffs, sys.nStagger, 1);
 end
+% Clutter rejection: the MTI filter above, or a clutter map without a filter
+% (a single tap of 1: the Doppler processing gets the pulses themselves)
+switch lower(cfg.clutterRejection.method)
+    case 'mti'
+        sys.cmap.enabled = false;
+    case 'map'
+        sys.cmap.enabled = true;
+        sys.mtiCoeffs = ones(sys.nStagger, 1);
+    otherwise
+        error('cfg.clutterRejection.method must be ''mti'' or ''map''.');
+end
 
 %% DDC filters (signed 16-bit integers with coefFracBits fractional bits) and NCO
 D1 = ddcDecim(1);
@@ -136,11 +147,11 @@ if wl.tTx_s < ws.tTx_s + ws.width_s
 end
 filterSpan    = (L1-1)/fs + (L2-1)/fs1;                       % input span of one DDC output sample
 sys.rxStart_s = 0;                                            % the record starts with the PRI
-% (the CFAR tests the range cells up to the end of the window: its range
-% window is shifted inwards at the edges, so no extra cells are needed)
-% a mismatch filter also needs the samples after the end of the echo
-mfTail = max(0, numel(wl.mfTaps) - round(wl.width_s*sys.fsOut) - wl.mfShift) / sys.fsOut;
-rxEnd = wl.tTx_s + wl.width_s + 2*cfg.rx.maxRange_m/c + mfTail + filterSpan + 2/sys.fsOut;
+% The record ends with the echo of the long pulse from cfg.rx.maxRange_m. It
+% (and so the DDC output) depends only on the PRI timeline, the instrumented
+% range and the DDC filters, not on the processing of the receiver
+% (compression filter, CFAR, clutter rejection).
+rxEnd = wl.tTx_s + wl.width_s + 2*cfg.rx.maxRange_m/c + filterSpan + 2/sys.fsOut;
 if rxEnd > min(sys.pri)
     error(['Receive window (%.1f us) does not fit in the shortest PRI (%.1f us): reduce ', ...
            'cfg.rx.maxRange_m or start the long pulse earlier.'], rxEnd*1e6, min(sys.pri)*1e6);
@@ -162,27 +173,27 @@ k = (0:sys.nDdc-1)';
 firstAdc = k*D2*D1 + 1;
 lastAdc  = (k*D2 + L2 - 1)*D1 + L1;
 
-%% Receive interval, DDC segment and delay / range axes of every sub-pulse
+%% Receive interval and delay / range axes of every sub-pulse
+% rxIdx: the DDC samples whose whole input window lies inside the receive
+% interval of the sub-pulse. They follow from the timing alone; the header of
+% every PRI holds the first and last of them.
+% Range cell k holds the echo that starts at sample rxIdx(k): the cells of
+% the echoes that lie entirely inside the interval (the reference of the
+% matched filter holds the pulse at the mid-sample times, so the echo starts
+% half a sample before tDdc(rxIdx(k))).
 rxInterval.short = [ws.tTx_s + ws.width_s, wl.tTx_s];         % [start end) of the receive interval
 rxInterval.long  = [wl.tTx_s + wl.width_s, inf];
+oR = sys.cfar.guardRange + sys.cfar.trainRange;
 for i = 1:2
     wv = sys.wave.(names{i});
-    % DDC samples whose whole input window lies inside the receive interval of this sub-pulse
     iv = rxInterval.(names{i});
-    wv.ddcIdx = find(sys.tAdc(firstAdc) >= iv(1) & sys.tAdc(lastAdc) < iv(2)).';
-    L = numel(wv.mfTaps);                                     % compression filter length [samples]
-    if numel(wv.ddcIdx) < L + 2*(sys.cfar.guardRange + sys.cfar.trainRange) + 1
-        error(['The %s-pulse receive interval is too short for its compression filter and the CFAR ', ...
-               'window: move the long pulse later or increase cfg.rx.maxRange_m.'], wv.name);
+    wv.rxIdx = find(sys.tAdc(firstAdc) >= iv(1) & sys.tAdc(lastAdc) < iv(2)).';
+    wv.nRange = numel(wv.rxIdx) - round(wv.width_s * sys.fsOut) + 1;
+    if wv.nRange < 2*oR + 1
+        error(['The %s-pulse receive interval is too short for the pulse and the CFAR window: move ', ...
+               'the long pulse later or increase cfg.rx.maxRange_m.'], wv.name);
     end
-    % Output k of the valid convolution of the matched filter correlates the
-    % reference with the segment starting at sample k. The reference holds
-    % the pulse at the mid-sample times, so output k peaks for an echo that
-    % starts half a sample before tDdc(k). The peak of a mismatch filter
-    % comes mfShift samples earlier: output k belongs to the echo starting at
-    % sample k + mfShift.
-    wv.nRange  = numel(wv.ddcIdx) - L + 1;
-    wv.delay_s = sys.tDdc(wv.ddcIdx((1:wv.nRange) + wv.mfShift)).' - 0.5/sys.fsOut - wv.tTx_s;   % delay axis [s]
+    wv.delay_s = sys.tDdc(wv.rxIdx(1:wv.nRange)).' - 0.5/sys.fsOut - wv.tTx_s;   % delay axis [s]
     wv.range_m = c * wv.delay_s / 2;                              % range axis [m]
     sys.wave.(names{i}) = wv;
 end
@@ -190,7 +201,6 @@ end
 % first range cell, tested thanks to the shifted CFAR window), so a target is
 % not reported twice. The short pulse keeps oR more cells as training cells
 % (and at least one whole CFAR range window).
-oR = sys.cfar.guardRange + sys.cfar.trainRange;
 handover_m = sys.wave.long.range_m(1);
 ws = sys.wave.short;
 if ws.range_m(end) + abs(diff(ws.range_m(1:2))) < handover_m
@@ -199,14 +209,27 @@ if ws.range_m(end) + abs(diff(ws.range_m(1:2))) < handover_m
 end
 nKeep = max(find(ws.range_m < handover_m, 1, 'last') + oR, 2*oR + 1);   % + cells only used as CFAR training
 if nKeep < ws.nRange
-    Lp = numel(ws.mfTaps);
     ws.nRange  = nKeep;
-    ws.ddcIdx  = ws.ddcIdx(1:nKeep + Lp - 1);                 % the compression filter then gives nKeep cells
     ws.delay_s = ws.delay_s(1:nKeep);
     ws.range_m = ws.range_m(1:nKeep);
     sys.wave.short = ws;
 end
 sys.handover_m = handover_m;
+
+% DDC segment of every sub-pulse (ddcIdx) for its compression filter: the
+% output of cell k uses the L = numel(mfTaps) samples from rxIdx(k) - mfShift
+% on (a mismatch filter is longer than the pulse: mfShift of its samples come
+% before the echo). Samples outside the receive interval count as zeros:
+% wv.pad = [zeros before, zeros after] the segment. So every compression
+% filter gives the same range cells, up to both ends of the interval, and the
+% record does not depend on the filter.
+for i = 1:2
+    wv = sys.wave.(names{i});
+    need = wv.rxIdx(1) - wv.mfShift + (0:wv.nRange + numel(wv.mfTaps) - 2);
+    wv.ddcIdx = need(need >= wv.rxIdx(1) & need <= wv.rxIdx(end));
+    wv.pad = [nnz(need < wv.rxIdx(1)), nnz(need > wv.rxIdx(end))];
+    sys.wave.(names{i}) = wv;
+end
 
 % Range cells tested by the CFAR (both sub-pulses): cfg.cfar.<pulse>.min/maxRange_m
 % and, for the short pulse, the handover. testIdx = [first last] (1-based).
@@ -320,6 +343,17 @@ if ~any(tested)
           cfg.cfar.notchWidth, sys.dop.notchBins, nfft);
 end
 sys.dop.nLooks = min(nLooks(tested));
+if sys.cmap.enabled                                           % the band is tested against the map
+    cr = cfg.clutterRejection;
+    if ~(cr.mapWeight > 0 && cr.mapWeight <= 1) || ~(cr.mapAzCell_deg > 0 && cr.mapAzCell_deg <= 360)
+        error('cfg.clutterRejection: mapWeight must be in (0, 1] and mapAzCell_deg in (0, 360].');
+    end
+    sys.cmap.azCell_deg = cr.mapAzCell_deg;
+    sys.cmap.nAz    = ceil(360 / cr.mapAzCell_deg - 1e-9);       % azimuth cells of the map
+    sys.cmap.weight = cr.mapWeight;
+    sys.cmap.bins   = find(~tested);                          % Doppler bins of the band
+    sys.cmap.alpha  = clutter_map_alpha(cr.mapWeight, cr.mapPfa, cr.mapThreshold_dB);
+end
 % Median / mean of the noise power (used to estimate the noise floor of a beam)
 L = sys.dop.nLooks;
 sys.dop.medianToMean = fzero(@(x) gammainc(L*x, L) - 0.5, [0.1 2]);
@@ -399,6 +433,29 @@ q = k - 1;
 if k > 1 && k < numel(a)
     d = a(k-1) - 2*a(k) + a(k+1);
     if d < 0, q = q + 0.5*(a(k-1) - a(k+1)) / d; end
+end
+end
+
+function alpha = clutter_map_alpha(weight, pfa, threshold_dB)
+% Threshold factor of the clutter-map test after n = 1, 2, ... averaged scans
+% (the last value holds for all later scans). The map is a weighted sum of the
+% mean powers of n scans (weights c: the plain mean while n < 1/weight, then
+% exponential averaging). For independent exponentially distributed powers
+% P(power > alpha*map) = prod(1 ./ (1 + alpha*c)), which is set to pfa.
+nMax = min(ceil(5 / weight), 1000);                           % then the oldest scans weigh < exp(-5)
+if ~isempty(threshold_dB)
+    alpha = repmat(10^(threshold_dB/10), 1, nMax);
+    return
+end
+alpha = zeros(1, nMax);
+c = [];
+for n = 1:nMax
+    w = max(weight, 1/n);
+    c = [(1 - w)*c, w];
+    f = @(a) sum(log1p(a*c)) + log(pfa);
+    hi = 1;
+    while f(hi) < 0, hi = 2*hi; end
+    alpha(n) = fzero(f, [0 hi]);
 end
 end
 

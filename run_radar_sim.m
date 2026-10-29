@@ -19,9 +19,12 @@ function results = run_radar_sim(cfg)
 %     6. CPI buffers       : circular buffers holding the pulses of one CPI (the
 %                            time a target stays in the 3 dB azimuth beam)
 %     7. MTI + Doppler     : 3-pulse canceller + FFT over the CPI (fixed PRF), or
-%                            stagger MTI + de-interleaving + FFT + NCI (staggered PRF)
+%                            stagger MTI + de-interleaving + FFT + NCI (staggered PRF);
+%                            with cfg.clutterRejection.method = 'map' no MTI
 %     8. CFAR              : on every range-Doppler map (2-D, 1-D range or 1-D
-%                            Doppler window, cfg.cfar.method)
+%                            Doppler window, cfg.cfar.method); with the clutter map
+%                            also the zero-Doppler band, against the map of the
+%                            earlier scans (exponential averaging, clutter_map_*.m)
 %     9. Pruning           : local peaks only, then azimuth peak picking (plots)
 %    10. Tracking          : EKF on the plots, 2-D or 3-D, constant velocity or
 %                            constant acceleration, GNN association (optional, cfg.track)
@@ -34,6 +37,8 @@ function results = run_radar_sim(cfg)
 %   results.plots holds the extracted plots (time, azimuth, range, elevation,
 %   ambiguous radial velocity, SNR, pulse type). results.tracker holds the
 %   tracks at the end and the log of all track updates (track_update.m).
+%   results.clutterMap holds the clutter maps of both sub-pulses at the end
+%   ([] with the MTI).
 %   results.timing_us is the mean time per PRI of DBF, matched filter, MTI,
 %   Doppler, detection (CFAR + pruning), plot extractor, tracking, console
 %   output (progress lines) and display (PPI updates) [us].
@@ -84,10 +89,14 @@ if showPpi
     detLog = detection_log_init(cfg.display.maxDetections);   % CFAR detections for the PPI
 end
 
+cmap = [];
 for i = 1:2
     p = names{i};
     buf.(p) = cpi_buffer_init(sys.nBeams, sys.wave.(p).nRange, sys.cpi.length);
     ext.(p) = plot_extractor_init(sys.dop.nfft);
+    if sys.cmap.enabled
+        cmap.(p) = clutter_map_init(sys, sys.wave.(p));     % clutter map of the zero-Doppler band
+    end
 end
 plots = [];
 tracker = track_init(sys.track);
@@ -114,6 +123,9 @@ for k = 1:sched.nPulses
             for i = 1:2
                 p = names{i};
                 buf.(p) = cpi_buffer_init(sys.nBeams, sys.wave.(p).nRange, sys.cpi.length);
+                if sys.cmap.enabled
+                    cmap.(p) = clutter_map_fold(cmap.(p), sys);   % the pass over the azimuth cell ends
+                end
                 [ext.(p), newPlots] = plot_extractor(ext.(p), [], flushOpt);
                 plots = [plots, newPlots]; %#ok<AGROW>
                 gapPlots = [gapPlots, newPlots]; %#ok<AGROW>
@@ -181,6 +193,9 @@ for k = 1:sched.nPulses
             blockUs(4) = blockUs(4) + 1e6*toc(tb);
             tb = tic;
             [isDet, noise] = cfar_detect(rd, sys, wv);
+            if sys.cmap.enabled
+                [isDet, cmap.(p)] = clutter_map_detect(cmap.(p), isDet, rd, info.az_deg(end), sys);
+            end
             dets = prune_peaks(isDet, rd, noise, sys, wv);
             reports = detection_reports(dets, rd, sys, wv, info);
             blockUs(5) = blockUs(5) + 1e6*toc(tb);
@@ -221,6 +236,9 @@ end
 endPlots = [];
 for i = 1:2
     p = names{i};
+    if sys.cmap.enabled
+        cmap.(p) = clutter_map_fold(cmap.(p), sys);
+    end
     [ext.(p), newPlots] = plot_extractor(ext.(p), [], flushOpt);
     plots = [plots, newPlots]; %#ok<AGROW>
     endPlots = [endPlots, newPlots]; %#ok<AGROW>
@@ -237,6 +255,7 @@ end
 
 results.plots      = plots;
 results.tracker    = tracker;
+results.clutterMap = cmap;                          % clutter maps of both sub-pulses ([] with the MTI)
 results.timing_us  = blockUs / max(nProcessed, 1);
 results.sys        = sys;
 results.targets    = targets;                       % incl. the RCS of every scan (rcsScan)
@@ -282,6 +301,15 @@ fprintf('CPI: %.1f ms in the beam -> %d pulses = %d row(s) x %d samples, FFT %d,
     sys.lambda/(4*sys.dop.rowPri_s));
 fprintf('CFAR %s: Pfa = %.0e, %d training cells, %.1f looks, alpha = %.2f (%.1f dB)\n', sys.cfar.label, ...
     sys.cfar.pfa, sys.cfar.nTrain, sys.dop.nLooks, sys.cfar.alpha, 10*log10(sys.cfar.alpha));
+if sys.cmap.enabled
+    a = 10*log10(sys.cmap.alpha);
+    fprintf(['Clutter rejection: clutter map of the +-%d Doppler bins around zero, %g deg azimuth cells, ', ...
+             'weight %g per scan; threshold %.1f dB after 2 scans, %.1f dB after %d scans\n'], ...
+        sys.dop.notchBins, sys.cmap.azCell_deg, sys.cmap.weight, a(min(2, end)), a(end), numel(a));
+else
+    fprintf('Clutter rejection: MTI filter of %d taps, the +-%d Doppler bins around zero are not tested\n', ...
+        size(sys.mtiCoeffs, 2), sys.dop.notchBins);
+end
 fprintf('Simulated pulses: %d of %d (%.1f s of radar time)\n', sum(sched.active), sched.nPulses, sched.time_s(end));
 end
 

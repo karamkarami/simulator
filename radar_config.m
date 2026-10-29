@@ -70,9 +70,9 @@ cfg.adc.fIF_Hz           = 30e6;   % IF carrier of the received signal (receiver
 % Pulse compression: LFM with the Taylor-windowed matched filter; a phase
 % code (chips from cfg.files.phaseCode, default P4) with its matched filter
 % or with the mismatch filter of the same file (lower range sidelobes for a
-% small SNR loss; the filter is longer than the pulse, so the first and last
-% range cells of each receive interval move inwards and the receive window
-% gets longer).
+% small SNR loss). A mismatch filter is longer than the pulse; the samples
+% outside the receive interval count as zeros, so every filter gives the same
+% range cells and the record (the DDC output) does not depend on the filter.
 cfg.wave.short.type         = 'lfm';    % 'lfm' or 'phasecode' (code from cfg.files.phaseCode)
 cfg.wave.short.width_s      = 25e-6;    % pulse width [s]
 cfg.wave.short.bandwidth_Hz = 1e6;      % LFM sweep bandwidth [Hz]
@@ -111,6 +111,31 @@ cfg.proc.nfft         = [];    % Doppler FFT length ([] = next power of 2: of th
                                % with a fixed PRF (114 -> 128), of the samples per row when staggered (28 -> 32))
 cfg.proc.updateEvery  = 1;     % run MTI/Doppler/CFAR every N new pulses (1 = every pulse)
 
+%% Clutter rejection: MTI filter or clutter map
+% 'mti' : clutter filter along slow time before the Doppler FFT: with a fixed
+%         PRF the three-pulse canceller [1 -2 1], with a staggered PRF the FIR
+%         filters of cfg.files.stagger. The zero-Doppler band (+-notch bins,
+%         cfg.cfar.notchWidth) holds the clutter residue and is not tested.
+% 'map' : no clutter filter; a clutter map of the zero-Doppler band instead. It
+%         holds the mean power of every cell of the band (azimuth cell x beam x
+%         range cell x Doppler bin), updated once per scan by exponential
+%         averaging: map = (1 - mapWeight)*map + mapWeight*power, with power
+%         the mean over the CPI updates of this scan in the azimuth cell (the
+%         plain mean while fewer than 1/mapWeight scans have been averaged).
+%         A cell of the band is a detection when it passes the CFAR and its
+%         power exceeds mapThreshold times the map of the earlier scans. So
+%         targets stronger than the clutter are detected also at zero radial
+%         velocity; the band is not tested until its azimuth cell has been
+%         observed in an earlier scan. The other Doppler bins are tested by the
+%         CFAR alone. A target that stays in the same cell for several scans
+%         (hovering) enters the map and is suppressed, as with every clutter map.
+cfg.clutterRejection.method          = 'mti';   % 'mti' or 'map'
+cfg.clutterRejection.mapAzCell_deg   = 1;       % azimuth size of a map cell [deg]
+cfg.clutterRejection.mapWeight       = 0.125;   % weight of a new scan (1/8: time constant about 8 scans)
+cfg.clutterRejection.mapPfa          = 1e-8;    % design false alarm probability of the map test (exponential
+                                                % power): the threshold falls as more scans are averaged
+cfg.clutterRejection.mapThreshold_dB = [];      % [] = from mapPfa; else a fixed threshold above the map [dB]
+
 %% Detection: cell-averaging CFAR on every range-Doppler map
 % method: '2d'      window in range and Doppler around the cell under test
 %         'range'   1-D window along range (same Doppler bin)
@@ -142,8 +167,9 @@ cfg.cfar.doppler.train        = 8;  % training bins on each side (2*(guard+train
 cfg.cfar.doppler.pfa          = 1e-8;
 cfg.cfar.doppler.threshold_dB = [];
 
-cfg.cfar.notchWidth   = 1;     % half-width of the zero-Doppler band that is not tested (MTI notch,
-                               % clutter residue), in Doppler window mainlobes (1 -> +-2 bins)
+cfg.cfar.notchWidth   = 1;     % half-width of the zero-Doppler band, in Doppler window mainlobes
+                               % (1 -> +-2 bins): not tested with the MTI (clutter residue), tested
+                               % against the clutter map with cfg.clutterRejection.method = 'map'
 % Range interval in which each sub-pulse is tested (all methods); the cells
 % outside it are only used as training cells. The short pulse also stops
 % where the long pulse starts (handover).

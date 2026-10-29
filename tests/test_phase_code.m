@@ -5,9 +5,8 @@ function ok = test_phase_code()
 %   2. A target without noise through signal generation, ADC, DDC and pulse
 %      compression (1 element, 2 and 4 MHz DDC output, both sub-pulses): with
 %      the matched and with the mismatch filter the peak is on the range cell
-%      of the target (the range axis takes the earlier peak of the longer
-%      mismatch filter into account); the mismatch filter has lower range
-%      sidelobes and loses less than 1.5 dB of SNR.
+%      of the target (both filters have the same range cells); the mismatch
+%      filter has lower range sidelobes and loses less than 1.5 dB of SNR.
 %   3. A user file (no 'madeFor') with a long-pulse mismatch filter designed
 %      at the DDC output rate on the pulse after the DDC, for 4 sampling
 %      phases (<pulse>MismatchRate_Hz, mismatch_filter.m): used as it is,

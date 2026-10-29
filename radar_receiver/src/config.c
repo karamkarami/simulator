@@ -207,6 +207,7 @@ int radar_config_load(const char *path, RadarConfig *cfg, char *err, size_t errL
         cfg->maxRange_m      = get_scalar(&rs, "maxRange_m");
         cfg->nDdc            = get_int(&rs, "nDdc");
         cfg->fsOut_Hz        = get_scalar(&rs, "fsOut_Hz");
+        cfg->ddcT0_s         = get_optional(&rs, "ddcT0_s", NAN);
 
         static const char *names[N_PULSES] = { "short", "long" };
         for (int p = 0; p < N_PULSES; p++) {
@@ -214,6 +215,10 @@ int radar_config_load(const char *path, RadarConfig *cfg, char *err, size_t errL
             char key[48];
             snprintf(key, sizeof key, "%s_ddcFirst", names[p]);  pc->ddcFirst = get_int(&rs, key);
             snprintf(key, sizeof key, "%s_ddcCount", names[p]);  pc->ddcCount = get_int(&rs, key);
+            /* older files: the segment starts the receive interval, no zeros */
+            snprintf(key, sizeof key, "%s_rxFirst", names[p]);   pc->rxFirst = (int)get_optional(&rs, key, pc->ddcFirst);
+            snprintf(key, sizeof key, "%s_padFront", names[p]);  pc->padFront = (int)get_optional(&rs, key, 0);
+            snprintf(key, sizeof key, "%s_padBack", names[p]);   pc->padBack = (int)get_optional(&rs, key, 0);
             snprintf(key, sizeof key, "%s_nTaps", names[p]);     pc->nTaps    = get_int(&rs, key);
             snprintf(key, sizeof key, "%s_nRange", names[p]);    pc->nRange   = get_int(&rs, key);
             snprintf(key, sizeof key, "%s_taps", names[p]);
@@ -241,8 +246,10 @@ int radar_config_load(const char *path, RadarConfig *cfg, char *err, size_t errL
                                (pc->compression == COMPRESSION_MISMATCH && pc->waveform != WAVE_PHASE_CODE) ||
                                pc->mfShift < 0 || pc->mfShift >= pc->nTaps))
                 set_error(&rs, "invalid pulse compression of the %s pulse", names[p]);
-            if (!rs.failed && (pc->ddcCount != pc->nRange + pc->nTaps - 1 ||
-                               pc->ddcFirst < 0 || pc->ddcFirst + pc->ddcCount > cfg->nDdc))
+            if (!rs.failed && (pc->padFront < 0 || pc->padBack < 0 || pc->ddcCount < 1 ||
+                               pc->padFront + pc->ddcCount + pc->padBack != pc->nRange + pc->nTaps - 1 ||
+                               pc->rxFirst < 0 || pc->ddcFirst < pc->rxFirst ||
+                               pc->ddcFirst + pc->ddcCount > cfg->nDdc))
                 set_error(&rs, "inconsistent DDC segment of the %s pulse", names[p]);
         }
 
@@ -268,6 +275,20 @@ int radar_config_load(const char *path, RadarConfig *cfg, char *err, size_t errL
         cfg->noiseGain    = get_floats(&rs, "noiseGain", cfg->nfft);
         cfg->dopFreq_Hz   = get_doubles(&rs, "dopFreq_Hz", cfg->nfft, NULL);
         cfg->notchBins    = get_int(&rs, "notchBins");
+        cfg->clutterMap   = (int)get_optional(&rs, "clutterMap", 0);     /* older files: MTI */
+        if (cfg->clutterMap) {
+            cfg->mapAzCell_deg = get_scalar(&rs, "mapAzCell_deg");
+            cfg->mapWeight     = get_scalar(&rs, "mapWeight");
+            const Record *r = find(&rs, "mapAlpha");
+            if (r) {
+                cfg->mapNAlpha = (int)(r->rows * r->cols);
+                cfg->mapAlpha = get_doubles(&rs, "mapAlpha", cfg->mapNAlpha, NULL);
+            }
+            if (!rs.failed && (cfg->clutterMap != 1 || !(cfg->mapAzCell_deg > 0 && cfg->mapAzCell_deg <= 360) ||
+                               !(cfg->mapWeight > 0 && cfg->mapWeight <= 1) || cfg->mapNAlpha < 1 ||
+                               cfg->nMtiTaps != 1 || 2 * cfg->notchBins + 1 >= cfg->nfft))
+                set_error(&rs, "invalid clutter map settings in the configuration");
+        }
         cfg->medianToMean = get_scalar(&rs, "medianToMean");
         cfg->guardRange   = get_int(&rs, "guardRange");
         cfg->trainRange   = get_int(&rs, "trainRange");
@@ -355,6 +376,7 @@ void radar_config_free(RadarConfig *cfg)
         free(pc->pulseRe);  free(pc->pulseIm);
     }
     free(cfg->mtiCoeffs);  free(cfg->dopWindow);  free(cfg->noiseGain);  free(cfg->dopFreq_Hz);
+    free(cfg->mapAlpha);
     memset(cfg, 0, sizeof(*cfg));
 }
 

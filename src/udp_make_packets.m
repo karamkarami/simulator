@@ -14,7 +14,8 @@ function packets = udp_make_packets(hdr, I, Q, payloadBytes)
 %     bytes 24-31  uint32  samples per channel, first sample in this packet (0-based)
 %     bytes 32-39  double  PRI start time [s]
 %     bytes 40-47  single  DDC sample rate [Hz], time of the first DDC sample in the PRI [s]
-%     bytes 48-63  uint32  short pulse first/last DDC sample, long pulse first/last DDC sample (1-based)
+%     bytes 48-63  uint32  receive interval of the short pulse: first/last DDC sample, of the
+%                          long pulse: first/last DDC sample (1-based; they follow from the timing)
 %   Payload: int16 pairs (I, Q), channel after channel (column-major order).
 iq = [reshape(int16(I), 1, []); reshape(int16(Q), 1, [])];
 bytes = typecast(iq(:).', 'uint8');

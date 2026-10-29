@@ -149,7 +149,7 @@ static int16_t sat16(double v)
  * configuration, or else from the matched filter taps; scaled to the energy
  * of the unit-norm taps), steered to one elevation beam, moving with vr. With
  * a mismatch filter the echo starts mfShift samples after the start of the
- * target cell (its range axis). Noise 16 LSB rms per component like the
+ * filter input of the target cell. Noise 16 LSB rms per component like the
  * simulator's DDC output. */
 static int test_end_to_end(const char *configPath, int mfDirect, double threshold_dB, Detection *plotOut)
 {
@@ -187,10 +187,11 @@ static int test_end_to_end(const char *configPath, int mfDirect, double threshol
     pri.nCh = cfg.nCh;
     pri.nSamples = cfg.nDdc;
     pri.ddcFs_Hz = (float)cfg.fsOut_Hz;
-    pri.shortIdx[0] = (uint32_t)cfg.pulse[PULSE_SHORT].ddcFirst + 1;
+    pri.shortIdx[0] = (uint32_t)cfg.pulse[PULSE_SHORT].rxFirst + 1;          /* receive intervals */
     pri.shortIdx[1] = (uint32_t)(cfg.pulse[PULSE_SHORT].ddcFirst + cfg.pulse[PULSE_SHORT].ddcCount);
-    pri.longIdx[0] = (uint32_t)cfg.pulse[PULSE_LONG].ddcFirst + 1;
-    pri.longIdx[1] = (uint32_t)(cfg.pulse[PULSE_LONG].ddcFirst + cfg.pulse[PULSE_LONG].ddcCount);
+    pri.longIdx[0] = (uint32_t)cfg.pulse[PULSE_LONG].rxFirst + 1;
+    pri.longIdx[1] = (uint32_t)cfg.nDdc;
+    pri.ddcT0_s = (float)cfg.ddcT0_s;
     pri.iq = malloc(sizeof(int16_t) * 2 * (size_t)cfg.nCh * cfg.nDdc);
     double *steerRe = malloc(sizeof(double) * cfg.nCh), *steerIm = malloc(sizeof(double) * cfg.nCh);
     for (int ch = 0; ch < cfg.nCh; ch++) {               /* matched to the beam weights */
@@ -219,7 +220,9 @@ static int test_end_to_end(const char *configPath, int mfDirect, double threshol
         for (size_t i = 0; i < 2 * (size_t)cfg.nCh * cfg.nDdc; i++) pri.iq[i] = sat16(16.0 * gauss());
         if (k < nWith) {
             const double ph = -4 * PI * vr * pri.time_s / pc->lambda_m;   /* baseband phase -4*pi*R/lambda */
-            const int first = pc->ddcFirst + r0 + pc->mfShift;
+            /* echo start of cell r0: the filter output r0 of the row (padFront zeros,
+             * segment) peaks for the echo starting mfShift samples into its input */
+            const int first = pc->ddcFirst - pc->padFront + r0 + pc->mfShift;
             for (int ch = 0; ch < cfg.nCh; ch++) {
                 const double cr = amp * (steerRe[ch] * cos(ph) - steerIm[ch] * sin(ph));
                 const double ci = amp * (steerRe[ch] * sin(ph) + steerIm[ch] * cos(ph));
@@ -311,6 +314,52 @@ static void test_cfar_pfa(const char *configPath)
     radar_config_free(&cfg);
 }
 
+/* Which PRIs the processor takes (pri_matches_config): those of the configured
+ * radar, also with a longer record (a sender with a larger instrumented range)
+ * and whatever its processing settings; not those of another radar or with
+ * fewer DDC samples than the configuration needs. */
+static void test_layout_check(const char *configPath)
+{
+    RadarConfig cfg;
+    char err[256];
+    if (radar_config_load(configPath, &cfg, err, sizeof err) != 0) {
+        CHECK(0, "configuration %s: %s", configPath, err);
+        return;
+    }
+    const int extra = 40;                                   /* samples of a longer record */
+    PriData pri;
+    memset(&pri, 0, sizeof pri);
+    pri.nCh = cfg.nCh;
+    pri.ddcFs_Hz = (float)cfg.fsOut_Hz;
+    pri.ddcT0_s = (float)cfg.ddcT0_s;
+    pri.staggerIndex = 1;
+    pri.iq = calloc(2 * (size_t)cfg.nCh * (cfg.nDdc + extra), sizeof(int16_t));
+    static const char *what[] = { "the configured layout", "a longer record", "a record one sample short",
+                                  "another short-pulse receive interval", "another long-pulse receive interval",
+                                  "another time of the first DDC sample", "another DDC rate",
+                                  "a stagger position outside the PRF" };
+    const int expectTaken[] = { 1, 1, 0, 0, 0, 0, 0, 0 };
+    for (int c = 0; c < 8; c++) {
+        pri.nSamples = cfg.nDdc + (c == 1 ? extra : c == 2 ? -1 : 0);
+        pri.shortIdx[0] = (uint32_t)cfg.pulse[PULSE_SHORT].rxFirst + 1 + (c == 3);
+        pri.longIdx[0] = (uint32_t)cfg.pulse[PULSE_LONG].rxFirst + 1 + (c == 4);
+        pri.ddcT0_s = (float)(cfg.ddcT0_s + (c == 5 ? 1.0 / cfg.fsOut_Hz : 0.0));
+        pri.ddcFs_Hz = (float)(cfg.fsOut_Hz * (c == 6 ? 2 : 1));
+        pri.staggerIndex = (uint16_t)(c == 7 ? cfg.nStagger + 1 : 1);
+        Processor *proc = processor_create(&cfg, 1);
+        pri.pulseNumber = 1;
+        processor_process(proc, &pri, NULL);
+        ProcessorTiming tm;
+        processor_timing(proc, &tm);
+        CHECK((tm.rejected == 0) == expectTaken[c], "PRI with %s: %s", what[c],
+              tm.rejected ? "ignored" : "processed");
+        processor_destroy(proc);
+    }
+    printf("layout check: PRIs of the configured radar taken (also with a longer record), others ignored\n");
+    free(pri.iq);
+    radar_config_free(&cfg);
+}
+
 int main(int argc, char **argv)
 {
     test_fft();
@@ -328,6 +377,7 @@ int main(int argc, char **argv)
         /* the same target with the CFAR threshold raised far above its peak (run-time change) */
         test_end_to_end(argv[1], 0, 45.0, &a);
         test_cfar_pfa(argv[1]);
+        test_layout_check(argv[1]);
     } else {
         printf("no configuration file given: end-to-end test skipped\n");
     }

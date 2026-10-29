@@ -268,8 +268,9 @@ static void print_timing(const App *app, const Processor *proc, const UdpInput *
         fprintf(stderr, "Overload: %llu CPI updates skipped, %llu PRIs dropped because the queue was full\n",
                 (unsigned long long)t.skipped, (unsigned long long)queueDrops);
     if (t.rejected)
-        fprintf(stderr, "PRIs ignored: %llu (their DDC layout differs from the configuration: export it again "
-                "with export_receiver_config.m)\n", (unsigned long long)t.rejected);
+        fprintf(stderr, "PRIs ignored: %llu (another radar: channels, DDC rate, PRI timeline or stagger differ, or fewer "
+                "DDC samples than the configuration needs: export it from the configuration of the sender, "
+                "with cfg.rx.maxRange_m not larger than the sender's)\n", (unsigned long long)t.rejected);
 }
 
 /* Prints the CFAR threshold in use and shows it in the PPI. */
@@ -449,6 +450,13 @@ int main(int argc, char **argv)
         fprintf(stderr, "tracking: EKF %d-D, %s model, GNN association\n", app.cfg.trackDim,
                 app.cfg.trackModel == TRACK_CA ? "constant-acceleration" : "constant-velocity");
     else fprintf(stderr, "tracking off\n");
+    if (app.cfg.clutterMap)
+        fprintf(stderr, "clutter rejection: clutter map of the +-%d Doppler bins around zero (%g deg azimuth cells, "
+                "weight %g per scan; threshold %.1f dB after %d scans)\n", app.cfg.notchBins, app.cfg.mapAzCell_deg,
+                app.cfg.mapWeight, 10 * log10(app.cfg.mapAlpha[app.cfg.mapNAlpha - 1]), app.cfg.mapNAlpha);
+    else
+        fprintf(stderr, "clutter rejection: MTI filter of %d taps, the +-%d Doppler bins around zero are not tested\n",
+                app.cfg.nMtiTaps, app.cfg.notchBins);
 
     app.plotsFile = open_csv(app.opt.plotsCsv,
                              "time_s,az_deg,range_m,el_deg,vr_mps,snr_dB,pulse,hits,beam,rangeCell,dopplerBin,pulseNumber");

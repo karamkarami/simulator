@@ -119,12 +119,11 @@ end
 % sent first. shortMismatch, longMismatch [nChips + 2*pad x 1]: mismatch
 % filter with one coefficient per chip, as a convolution filter
 % (output = conv(code, filter)); its main peak is in the middle of the full
-% convolution. pad = min(5, nChips/2) chips on each side keeps the range
-% handover between the sub-pulses (with a longer filter the short pulse
-% ends before the long pulse starts) and the receive window of the
-% staggered PRF; more padding gives little here (25 chips: PSL -25.9 dB with
-% 5, -26.0 dB with 10). The filter minimises the peak sidelobe for a unit
-% main peak (mismatch_filter.m). A filter with
+% convolution. pad = min(5, nChips/2) chips on each side: more padding gives
+% little here (25 chips: PSL -25.9 dB with 5, -26.0 dB with 10), and any
+% length works (the samples outside the receive interval count as zeros, see
+% setup_radar.m). The filter minimises the peak sidelobe for a unit main
+% peak (mismatch_filter.m). A filter with
 % another sample rate (e.g. designed at the DDC output rate on the received
 % pulse) can be given with <pulse>MismatchRate_Hz (setup_radar.m).
 if doAll || strcmpi(which, 'phaseCode')

@@ -11,9 +11,10 @@ function [isDet, noise] = cfar_detect(P, sys, wv)
 %   first and last range cells the range window is shifted inwards to stay
 %   inside the data: it keeps its length, the cell under test is no longer in
 %   its middle and its guard cells are cut at the edge (so it has a few more
-%   training cells there). The sys.dop.notchBins Doppler bins on each side of
-%   zero (MTI notch, clutter residue) are not tested. noise holds the noise
-%   estimate of the tested cells (0 elsewhere).
+%   training cells there). With the MTI the sys.dop.notchBins Doppler bins on
+%   each side of zero (MTI notch, clutter residue) are not tested; with the
+%   clutter map they are, and clutter_map_detect.m adds the map test. noise
+%   holds the noise estimate of the tested cells (0 elsewhere).
 
 c  = sys.cfar;
 gR = c.guardRange;    oR = gR + c.trainRange;      % half sizes of the guard and outer windows
@@ -37,8 +38,10 @@ nTrain = (2*oR + 1) * (2*oD + 1) - nGuard;          % = sys.cfar.nTrain away fro
 est = (sumOuter(:, rc - lo + 1, :) - sumGuard(:, r - lo + 1, :)) ./ reshape(nTrain, 1, [], 1);
 isDet(:, r, :) = P(:, r, :) > c.alpha * est;
 noise(:, r, :) = est;
-zeroBin = floor(nD/2) + 1;                         % zero Doppler after fftshift
-isDet(:, :, max(1, zeroBin-sys.dop.notchBins):min(nD, zeroBin+sys.dop.notchBins)) = false;
+if ~sys.cmap.enabled                               % MTI: the zero-Doppler band (clutter residue) is not tested
+    zeroBin = floor(nD/2) + 1;                     % zero Doppler after fftshift
+    isDet(:, :, max(1, zeroBin-sys.dop.notchBins):min(nD, zeroBin+sys.dop.notchBins)) = false;
+end                                                % (clutter map: clutter_map_detect.m tests it)
 end
 
 function S = box_sum(P, hr, hd)

@@ -4,11 +4,18 @@ function export_receiver_config(cfg, fileName)
 %   EXPORT_RECEIVER_CONFIG(cfg, fileName) runs setup_radar(cfg) and writes
 %   everything the C receiver needs to process the DDC output that the
 %   simulator streams over UDP (DBF matrix, pulse compression filters:
-%   matched or, for a phase code, mismatch; range axes, CPI length, MTI
-%   weights, Doppler window and noise gains, CFAR method, window, factor and
-%   tested range cells, plot extraction and tracker settings). Export again
-%   whenever cfg changes, before starting the C receiver. Default file:
+%   matched or, for a phase code, mismatch; the DDC segments and range axes
+%   of both sub-pulses, CPI length, MTI weights or clutter map, Doppler
+%   window and noise gains, CFAR method, window, factor and tested range
+%   cells, plot extraction and tracker settings). Export again whenever cfg
+%   changes, before starting the C receiver. Default file:
 %   radar_receiver/config/radar_config.bin.
+%   The receiver accepts the DDC stream of a simulator run with other
+%   processing settings (compression filter, CFAR, clutter rejection,
+%   tracking, ...): the stream only has to come from the same radar (elements,
+%   DDC rate, PRI timeline and PRF mode) and hold at least the DDC samples
+%   that this configuration needs (cfg.rx.maxRange_m of the sender at least
+%   that of the receiver).
 %
 %   File format (little-endian): 8 bytes 'RADRXCFG', uint32 version (1),
 %   uint32 number of records, then per record: char name[32] (zero padded),
@@ -34,13 +41,17 @@ r{end+1} = {'height_m', sys.ant.height_m};
 r{end+1} = {'rate_dps', sys.ant.rate_dps};
 r{end+1} = {'azBeamwidth_deg', sys.ant.azBeamwidth_deg};
 r{end+1} = {'maxRange_m', cfg.rx.maxRange_m};
-r{end+1} = {'nDdc', sys.nDdc};
+r{end+1} = {'nDdc', sys.nDdc};                       % DDC samples of the PRI (a stream may have more)
 r{end+1} = {'fsOut_Hz', sys.fsOut};
+r{end+1} = {'ddcT0_s', sys.tDdc(1)};                 % time of the first DDC sample in the PRI
 names = {'short', 'long'};
 for i = 1:2
     wv = sys.wave.(names{i});
-    r{end+1} = {[names{i} '_ddcFirst'], wv.ddcIdx(1) - 1};      % 0-based
+    r{end+1} = {[names{i} '_rxFirst'], wv.rxIdx(1) - 1};        % receive interval starts here (0-based)
+    r{end+1} = {[names{i} '_ddcFirst'], wv.ddcIdx(1) - 1};      % DDC segment of the compression filter
     r{end+1} = {[names{i} '_ddcCount'], numel(wv.ddcIdx)};
+    r{end+1} = {[names{i} '_padFront'], wv.pad(1)};             % zeros before and after the segment
+    r{end+1} = {[names{i} '_padBack'], wv.pad(2)};
     r{end+1} = {[names{i} '_nTaps'], numel(wv.mfTaps)};
     r{end+1} = {[names{i} '_nRange'], wv.nRange};
     r{end+1} = {[names{i} '_taps'], complex(wv.mfTaps)};
@@ -68,6 +79,12 @@ r{end+1} = {'dopWindow', sys.dop.window};
 r{end+1} = {'noiseGain', reshape(sys.dop.noiseGain, 1, [])};
 r{end+1} = {'dopFreq_Hz', sys.dop.f_Hz};
 r{end+1} = {'notchBins', sys.dop.notchBins};
+r{end+1} = {'clutterMap', double(sys.cmap.enabled)};    % 0: MTI (band not tested), 1: clutter map of the band
+if sys.cmap.enabled                                  % (mtiCoeffs above are then a single tap of 1)
+    r{end+1} = {'mapAzCell_deg', sys.cmap.azCell_deg};
+    r{end+1} = {'mapWeight', sys.cmap.weight};
+    r{end+1} = {'mapAlpha', sys.cmap.alpha};         % threshold factor after 1, 2, ... averaged scans
+end
 r{end+1} = {'medianToMean', sys.dop.medianToMean};
 r{end+1} = {'cfarMethod', find(strcmp(sys.cfar.method, {'2d', 'range', 'doppler'})) - 1};   % 0 2-D, 1 range, 2 Doppler
 r{end+1} = {'guardRange', sys.cfar.guardRange};      % window of the selected method (0 = none in that dimension)

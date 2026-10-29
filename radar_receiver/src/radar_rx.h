@@ -35,13 +35,18 @@ enum { COMPRESSION_MATCHED = 0, COMPRESSION_MISMATCH = 1 };
 const char *cfar_method_name(int method);   /* "2-D", "1-D range", "1-D Doppler" */
 
 typedef struct {
-    int     ddcFirst;      /* first DDC sample of this sub-pulse (0-based)            */
-    int     ddcCount;      /* DDC samples of this sub-pulse (= nRange + nTaps - 1)    */
+    int     rxFirst;       /* first DDC sample of the receive interval (0-based; the
+                              header of every PRI has it: checks the timing)          */
+    int     ddcFirst;      /* first DDC sample the compression filter uses (0-based)  */
+    int     ddcCount;      /* DDC samples it uses                                     */
+    int     padFront, padBack;  /* zeros before and after them (samples outside the
+                              receive interval): padFront + ddcCount + padBack
+                              = nRange + nTaps - 1                                    */
     int     nTaps;         /* pulse compression filter length                         */
     int     nRange;        /* range cells                                             */
     float  *tapsRe;        /* compression filter taps [nTaps]: y[r] = sum_j h[j]*x[r+nTaps-1-j]
-                              (matched filter, or the mismatch filter of a phase code;
-                              range_m/delay_s already hold the earlier peak of the latter) */
+                              (matched filter, or the mismatch filter of a phase code:
+                              thanks to the zeros, both give the same range cells)    */
     float  *tapsIm;
     double *range_m;       /* range axis [nRange]                                     */
     double *delay_s;       /* delay axis [nRange]                                     */
@@ -70,8 +75,10 @@ typedef struct {
     double  maxRange_m;    /* instrumented range (for the display)                    */
 
     /* DDC output */
-    int     nDdc;          /* DDC samples per PRI and channel                         */
+    int     nDdc;          /* DDC samples per PRI and channel of the exported radar (a
+                              stream may have more: the segments must be inside)       */
     double  fsOut_Hz;      /* DDC output rate                                         */
+    double  ddcT0_s;       /* time of the first DDC sample in the PRI (NaN: unknown)  */
     PulseConfig pulse[N_PULSES];
 
     /* slow time */
@@ -86,8 +93,20 @@ typedef struct {
     float  *dopWindow;     /* [rowLen] Hamming window, unit energy                    */
     float  *noiseGain;     /* [nfft] noise gain of every Doppler bin (after fftshift) */
     double *dopFreq_Hz;    /* [nfft] Doppler axis (after fftshift)                    */
-    int     notchBins;     /* bins on each side of zero Doppler that are not tested   */
+    int     notchBins;     /* bins on each side of zero Doppler: the band that is not
+                              tested (MTI), or that has a clutter map                 */
     double  medianToMean;  /* median / mean of the noise power (noise floor estimate) */
+
+    /* clutter rejection: the MTI weights above, or (clutterMap = 1, the MTI is then
+     * a single tap of 1) a clutter map of the zero-Doppler band: the mean power of
+     * every band cell per azimuth cell, updated once per scan by exponential
+     * averaging; a band cell is a detection when it passes the CFAR and exceeds
+     * mapAlpha[n-1] times the map of the n earlier scans (as clutter_map_*.m) */
+    int     clutterMap;
+    double  mapAzCell_deg; /* azimuth size of a map cell                              */
+    double  mapWeight;     /* weight of a new scan                                    */
+    int     mapNAlpha;     /* threshold factors after 1 ... mapNAlpha averaged scans  */
+    double *mapAlpha;
 
     /* CFAR, pruning, plot extraction */
     int     cfarMethod;    /* CFAR_2D, CFAR_RANGE or CFAR_DOPPLER: the window below   */
@@ -232,8 +251,10 @@ typedef struct {
      * messages) and the data handed to the PPI display */
     double console_ms, display_ms;
     uint64_t pris, updates;
-    uint64_t rejected;   /* PRIs whose layout (channels, DDC samples, sub-pulse samples,
-                            DDC rate) differs from the configuration: not processed */
+    uint64_t rejected;   /* PRIs of another radar (channels, DDC rate, sub-pulse timing,
+                            a stagger position outside the configured PRF) or with
+                            fewer DDC samples than the configuration needs: not
+                            processed                                              */
     uint64_t skipped;    /* CPI updates skipped (processor_set_slow_time(p, 0))      */
 } ProcessorTiming;     /* accumulated times */
 

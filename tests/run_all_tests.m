@@ -38,6 +38,8 @@ tests(end+1, :) = {'CFAR methods (2-D, range, Doppler), edges, range interval', 
 tests(end+1, :) = {'EKF tracker 3-D and 2-D (and the C tracker when built)', @test_tracker};
 tests(end+1, :) = {'Interactive PPI (data tips, zoom, pan, filters)', @test_ppi_interactive};
 tests(end+1, :) = {'No ghost of the short-pulse echo (same IF)', @test_short_pulse_ghost};
+tests(end+1, :) = {'DDC stream independent of the receiver settings (and the C receiver)', @test_stream_independence};
+tests(end+1, :) = {'Clutter map instead of the MTI, 6 scans (and the C receiver)', @test_clutter_map};
 for mode = {'fixed', 'staggered'}
     tests(end+1, :) = {sprintf('Six targets with clutter (%s PRF)', mode{1}), ...
                        @() test_six_targets(mode{1}, true, false)}; %#ok<SAGROW>

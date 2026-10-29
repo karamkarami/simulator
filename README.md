@@ -32,10 +32,12 @@ optional Qt PPI and serial output (see `radar_receiver/README.md`).
  Pulse compression (valid convolution): matched filter (Taylor for LFM) or, for a phase code,
          the mismatch filter of inputs/phase_code.mat      -> [21 beams x nRange]   (range/delay axes)
  CPI buffer (circular, the pulses of one CPI)              -> [21 x nRange x 114], short and long
- MTI  fixed PRF: 3-pulse canceller | staggered: weights from file
+ Clutter rejection (cfg.clutterRejection.method): 'mti' fixed PRF: 3-pulse canceller |
+         staggered: weights from file; or 'map': no MTI, a clutter map of the zero-Doppler band
  Doppler fixed: Hamming + FFT 128 (next power of 2 of 114) | staggered: de-interleave, Hamming, FFT 32, NCI
  CA-CFAR on every range-Doppler map: 2-D, 1-D range or 1-D Doppler window (cfg.cfar.method),
-         in a selectable range interval per sub-pulse, range window shifted inwards at the edges
+         in a selectable range interval per sub-pulse, range window shifted inwards at the edges;
+         zero-Doppler band: not tested (MTI) or also against the clutter map (exponential averaging)
  Pruning (local peaks + sidelobe blanking) -> plot extraction (azimuth peak picking)
  Tracking (optional): EKF, 2-D (range, azimuth) or 3-D (+ elevation), constant velocity or
           constant acceleration, global nearest neighbour (GNN) association
@@ -102,6 +104,7 @@ file was built for other values (for example after you change
 | `src/matched_filter.m`, `plot_range_profile.m` | pulse compression, range/delay/index plots |
 | `src/cpi_buffer_*.m` | circular CPI buffers |
 | `src/mti_filter.m`, `doppler_process.m` | clutter filter, Doppler processing |
+| `src/clutter_map_init.m`, `clutter_map_detect.m`, `clutter_map_fold.m` | clutter map of the zero-Doppler band (instead of the MTI) |
 | `src/cfar_detect.m`, `cfar_alpha.m` | CA-CFAR (2-D, 1-D range, 1-D Doppler window) |
 | `src/track_setup.m`, `track_init.m`, `track_update.m`, `track_report.m` | EKF tracker (2-D / 3-D, CV / CA model, GNN association) |
 | `src/prune_peaks.m`, `detection_reports.m`, `plot_extractor*.m` | pruning and plot extraction |
@@ -143,7 +146,14 @@ time. The ADC records one continuous block from the start of the PRI to the
 end of the long window, Tx leakage included. The DDC processes the whole
 block, and its output is then split: a DDC sample belongs to a sub-pulse
 when its whole filter input lies inside that sub-pulse's receive interval.
-The leakage samples are therefore never processed. The short pulse covers
+The leakage samples are therefore never processed. The header of every PRI
+gives the first and last DDC sample of both receive intervals. The record,
+and so the DDC output, depends only on the radar: the PRI timeline,
+`cfg.rx.maxRange_m` and the DDC filters, not on the processing (compression
+filter, CFAR, clutter rejection, tracking). A receiver with other processing
+settings can therefore process the stream; the C receiver needs only the same
+radar and at least the DDC samples of its own configuration (see
+`tests/test_stream_independence.m`). The short pulse covers
 4.2 - 23.7 km and the long pulse 22.9 - 80.6 km (the long pulse is blind up
 to c x 150 us / 2 = 22.5 km). The CFAR tests every range cell of a window
 (its range window is shifted inwards at the edges, see CFAR below), so the
@@ -152,7 +162,7 @@ its cells beyond that are only CFAR training cells. `cfg.cfar.short` and
 `cfg.cfar.long` (`minRange_m`, `maxRange_m`) restrict the tested ranges of
 each sub-pulse further. The latest long-pulse start, and with it the
 instrumented range, is limited by the shortest PRI; `setup_radar` stops with
-an error when a receive interval is too short for the filters and the CFAR
+an error when a receive interval is too short for the pulse and the CFAR
 window.
 
 Because both sub-pulses share the IF, the short-pulse echo of a target
@@ -268,10 +278,15 @@ there, at the same beam and Doppler, behind very strong far targets.
   filter taps and range axes from `export_receiver_config.m` and needs no
   other setting.
 * **Axes:** the delay and range of every pulse-compression output cell are
-  computed in `setup_radar.m` (`wv.delay_s`, `wv.range_m`). They follow from
-  the ADC sample times, the valid convolutions of the DDC and pulse
-  compression filters (and the earlier peak of a mismatch filter), and the
-  transmit time of the sub-pulse.
+  computed in `setup_radar.m` (`wv.delay_s`, `wv.range_m`). Cell k holds the
+  echo that starts at DDC sample k of the receive interval (the echoes that
+  lie entirely inside it); they follow from the ADC sample times, the valid
+  convolution of the DDC filters and the transmit time of the sub-pulse. The
+  compression filter of cell k uses the samples from that echo start minus
+  the samples by which the filter peaks later (a mismatch filter is longer
+  than the pulse); the samples outside the receive interval count as zeros.
+  So every compression filter gives the same cells, up to both ends of the
+  interval.
   `plot_range_profile(rp, wv, 'range'|'delay'|'index')` plots against any
   of them. Set `cfg.display.rangeProfilePulse = <pulse number>` to plot it
   during a run.
@@ -288,6 +303,38 @@ there, at the same beam and Doppler, behind very strong far targets.
   de-interleaving into 4 rows of 28 samples. Each row is sampled every
   sum(PRI); it gets a Hamming window and a 32-point FFT (the next power of 2
   of 28), and |X|^2 is averaged over the rows.
+* **Clutter rejection** (`cfg.clutterRejection.method`): `'mti'` (default)
+  is the clutter filter above; the zero-Doppler band (+-2 bins, the clutter
+  residue) is not tested. `'map'` uses a clutter map instead and no filter
+  (the CPI goes to the Doppler processing as it is: 114 pulses, or 4 rows of
+  29 with the stagger). Without the MTI the ground clutter is up to about
+  85 dB above the noise at zero Doppler and stays in the band (+-2 bins);
+  the Hamming sidelobes put it about 50 dB lower into the other bins, which
+  the CFAR handles (no false alarm in the tests). The map holds the mean
+  power of every cell of the band, per azimuth cell (`mapAzCell_deg`, 1 deg),
+  beam, range cell and Doppler bin (40 MB for the short and 117 MB for the
+  long pulse of the default radar). It is updated once per scan by
+  exponential averaging, map = map + w (power - map), with power the mean
+  over the CPI updates of the scan in the azimuth cell: w = 1/n for the n-th
+  scan of a cell (the plain mean) until n = 1/`mapWeight`, then `mapWeight`
+  (1/8). A pass over an azimuth cell enters the map only when the antenna
+  has left the cell, so the CPI updates are always compared with the map of
+  the earlier scans and a target does not raise its own threshold. A cell of
+  the band is a detection when it passes the CFAR and its power exceeds
+  alpha(n) times the map, n = the scans averaged: alpha follows from
+  `mapPfa` (1e-8) for exponentially distributed powers, P(power > alpha map)
+  = prod 1/(1 + alpha c_k) with c_k the weights of the scans in the map:
+  80 dB after one scan, 26 dB after 4, 18.6 dB after 8, 15.0 dB for 40 and
+  more scans (`mapThreshold_dB` sets a fixed value instead). Without a map
+  (an azimuth cell not observed in an earlier scan) the band is not tested.
+  So the map detects targets stronger than the clutter of their cell, also
+  at zero radial velocity (tangential flight, blind speeds), once the cells
+  they fly into have been observed in earlier scans. A target that stays in
+  the same cells for several scans (hovering) enters the map and is then
+  suppressed, as with every clutter map. The other Doppler bins are tested
+  by the CFAR alone, as with the MTI. `test_clutter_map` shows a target at a
+  blind speed (3 x 50 m/s): the MTI never sees it, the clutter map from the
+  4th scan on.
 * **CFAR:** cell-averaging CFAR with one of three windows (`cfg.cfar.method`),
   each with its own guard and training cells and Pfa (or a fixed threshold
   `threshold_dB`):
@@ -522,7 +569,7 @@ With `cfg.udp.enable = true`, the **DDC output** of every PRI (signed
 `cfg.udp.host:port`. Each datagram has a 64-byte little-endian header
 followed by int16 (I, Q) pairs, channel after channel. The default payload
 of 1400 bytes keeps each datagram within a standard 1500-byte Ethernet MTU.
-One PRI of the default radar is 48 x 1781 x 4 bytes = 342 kB in 245
+One PRI of the default radar is 48 x 1770 x 4 bytes = 340 kB in 243
 datagrams.
 
 | Bytes | Type | Field |
@@ -535,7 +582,7 @@ datagrams.
 | 24-27, 28-31 | uint32 | samples per channel, first sample in this packet (0-based) |
 | 32-39 | double | PRI start time [s] |
 | 40-43, 44-47 | single | DDC sample rate [Hz], time of the first DDC sample in the PRI [s] |
-| 48-63 | uint32 | short pulse first/last DDC sample, long pulse first/last DDC sample (1-based) |
+| 48-63 | uint32 | receive interval of the short pulse: first/last DDC sample; of the long pulse: first/last DDC sample (1-based; they follow from the timing) |
 
 `src/udp_receive_pulse.m` is a reference receiver that reassembles one PRI.
 
@@ -577,9 +624,12 @@ budget.
 | `test_cfar` | the three CFAR methods on exponential noise: false alarm rate 1e-3 in the interior and at the range edges (shifted window), targets in the first and last range cell detected, only the tested range interval is tested, the noise estimate equals the direct sums over the (shifted) window, also when the whole tested interval lies within the edge cells |
 | `test_tracker` | EKF tracker on synthetic plots of the six targets over 5 scans with false plots, 3-D and 2-D, CV and CA: one confirmed track per target, close to it, no false track; GNN with two targets 200 m apart (nearest neighbour would merge them); CA against CV on a target accelerating at 4 m/s^2; when built, the C tracker gives the same track updates |
 | `test_c_receiver(mode, ..., cfarMethod)` | the six-target scenario streamed over UDP to the C receiver (`radar_receiver/`): its plots and track updates must match MATLAB; the recorded stream is replayed to check repeatability and speed |
+| `test_stream_independence` | the DDC output (ADC record, I/Q, header) is bit-identical whatever the processing settings (CFAR method, matched or mismatch filters three times the code length, MTI or clutter map); mismatch filters three times the code length give the range cells of the matched filter (targets at the first and last cell of both receive intervals, 50 and 80 km); when built, the C receiver gets the recorded stream of a sender with the 2-D CFAR, matched filters and the MTI, and gives the MATLAB plots with the 1-D Doppler CFAR, the 1-D range CFAR with the mismatch filters, the clutter map and a smaller instrumented range, and ignores every PRI when it needs a longer record |
+| `test_clutter_map` | clutter map instead of the MTI: threshold factors against a Monte Carlo of exponential powers (1 - 40 scans), the map logic on synthetic data (no test without a map, the pass of a cell enters the map only when the antenna leaves it, mean then exponential averaging, CFAR and map test together), and 6 scans of a target at a blind speed and one at another speed with ground clutter: the MTI only sees the second, the clutter map both (the first once its cells are mapped), no false plot; when built, the C receiver gives the same plots |
 
-Latest results (Octave 8.4 on a 4-vCPU VM, every test of `run_all_tests`
-passed): the SNR budget checks agree within 0.45 dB (ADC, DDC and DBF within
+Latest full run (Octave 8.4 on a 4-vCPU VM, every test of `run_all_tests`
+passed; `test_stream_independence` and `test_clutter_map` were added later
+and pass on their own): the SNR budget checks agree within 0.45 dB (ADC, DDC and DBF within
 0.25 dB). The six-target tests find all 6 targets with no false plot, for
 both the fixed and the staggered PRF. In `test_c_receiver` the C receiver
 gives the same 6 plots as MATLAB (same cells, range, azimuth, elevation,

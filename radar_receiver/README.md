@@ -14,10 +14,12 @@ at 921600 baud.
  DBF (21 x 48 matrix, off for 1 element)
  Pulse compression: matched filter, or the mismatch filter of a phase code
          (valid convolution; FFT fast convolution when it is faster)
- CPI ring buffer (the pulses of one CPI) -> MTI ring (MTI output of each pulse computed once)
+ CPI ring buffer (the pulses of one CPI) -> MTI ring (MTI output of each pulse computed once;
+          with the clutter map the MTI is a single tap of 1)
  Doppler: fixed PRF Hamming + FFT 128 | staggered: de-interleave, Hamming, FFT 32, NCI;
           division by the noise gain of every bin
- CA-CFAR (2-D, 1-D range or 1-D Doppler window, tested range interval, shifted range window at the edges)
+ CA-CFAR (2-D, 1-D range or 1-D Doppler window, tested range interval, shifted range window at the edges);
+          zero-Doppler band: not tested (MTI) or tested also against the clutter map
    -> pruning (local peaks, sidelobe blanking) -> reports -> plot extraction -> EKF tracking (optional)
         |                                   |                         |                |
         |                                   +-> serial (detections)   +-> CSV, console, Qt PPI,
@@ -25,7 +27,15 @@ at 921600 baud.
 ```
 
 The algorithms are the same as in the MATLAB simulator (`../src/*.m`, see
-`../README.md`). The C receiver reads every number that MATLAB derives
+`../README.md`). With `cfg.clutterRejection.method = 'map'` in the exported
+configuration the receiver uses a clutter map of the zero-Doppler band
+instead of the MTI (as `clutter_map_*.m`): the mean band power of every cell
+per azimuth cell, updated once per scan by exponential averaging when the
+antenna leaves the cell; a band cell is a detection when it passes the CFAR
+and exceeds the exported threshold factor (by the number of averaged scans)
+times the map. The map lives in the receiver (about 160 MB for the default
+radar) and starts empty; Doppler/CFAR updates skipped under overload do not
+enter it. The C receiver reads every number that MATLAB derives
 (DBF matrix, pulse compression filters, range axes, CPI length, MTI
 weights, Doppler window and noise gains, CFAR method, window, threshold
 factor and tested range cells, extraction and tracker settings) from a
@@ -35,12 +45,15 @@ therefore always use the same values.
 **Phase codes and mismatch filters** (`cfg.wave.<pulse>.type =
 'phasecode'`, `cfg.wave.<pulse>.compression = 'matched' | 'mismatch'`,
 codes and filters in `../inputs/phase_code.mat`): the exported taps are the
-matched or the mismatch filter at the DDC rate, and the exported range axis
-already holds the earlier peak of the longer mismatch filter. The receiver
-filters with whatever taps the file has (direct or FFT, as for LFM), so it
-needs no setting of its own; it prints the waveform and the filter of each
-sub-pulse at the start, e.g. `long pulse: phase code of 150 chips, mismatch
-filter of 320 taps (23.65 ... 80.61 km)`. The file also holds the pulse
+matched or the mismatch filter at the DDC rate. A mismatch filter is longer
+than the pulse: the receiver puts the exported number of zeros before and
+after the DDC samples of the sub-pulse (the samples outside its receive
+interval), so every filter gives the range cells of the matched filter, up
+to both ends of the interval, whatever its length (also three times the
+code). The receiver filters with whatever taps the file has (direct or FFT,
+as for LFM), so it needs no setting of its own; it prints the waveform and
+the filter of each sub-pulse at the start, e.g. `long pulse: phase code of
+150 chips, mismatch filter of 320 taps (22.90 ... 80.61 km)`. The file also holds the pulse
 itself at the DDC rate (`<pulse>_pulse`), which `test_core` uses as the
 echo. `config/radar_config_phasecode.bin` is such a configuration (both
 sub-pulses with mismatch filters) for the `core_phasecode` test.
@@ -141,9 +154,20 @@ order. It ignores duplicates and foreign datagrams, drops PRIs with missing
 packets (counted as incomplete), and follows the sender when it restarts.
 A jump in the pulse numbers (a PRI lost, or a skipped azimuth sector)
 restarts the CPI buffers and closes the open plots, as the MATLAB simulator
-does between simulated sectors. A PRI whose layout (channels, DDC samples,
-samples of each sub-pulse, DDC rate) differs from the configuration is
-ignored and counted: export the configuration again.
+does between simulated sectors.
+
+The DDC stream depends only on the radar (PRI timeline, instrumented range,
+DDC filters), not on the processing settings of the sender, and the receiver
+processes the stream of its radar whatever those settings are (compression
+filter, CFAR method and window, clutter rejection, tracking): a PRI must
+have the configured channels and DDC rate, a stagger position of the
+configured PRF, the same timing (the first DDC sample of both receive
+intervals in its header, and the time of its first DDC sample), and at least
+the DDC samples that the configuration needs. A
+longer record (a sender with a larger `cfg.rx.maxRange_m`) is fine: the
+receiver uses the samples it needs. Other PRIs are ignored and counted
+(`PRIs ignored` at the end): export the configuration from the settings of
+the sender's radar, with an instrumented range not larger than the sender's.
 
 The datagrams are read in a thread of their own, which puts the complete
 PRIs into a queue (`--queue`). The socket is therefore emptied also while a
@@ -377,7 +401,7 @@ Timing:
 | Test | What it checks |
 |---|---|
 | `tracker` (`tests/test_tracker.c`) | two crossing targets over 6 scans, 3-D and 2-D: two confirmed tracks that stay on their targets; GNN with two targets 200 m apart: each track stays on its own target; with plots, a configuration and the track log from `../tests/test_tracker.m` (CV and CA, 2-D and 3-D), every C track update equals MATLAB's (same plot, state within 1e-6) |
-| `core` (`tests/test_core.c`) | batched FFT against a direct DFT; plot extractor; a moving target through the whole chain with the exported configuration (one plot at the right range, velocity and beam); direct and fast-convolution matched filters give the same plot; the same target with the CFAR threshold raised to 45 dB at run time gives no detection; `cfar_pfa()` against the closed form (one look) and the Pfa 1e-8 of the configured threshold |
+| `core` (`tests/test_core.c`) | batched FFT against a direct DFT; plot extractor; a moving target through the whole chain with the exported configuration (one plot at the right range, velocity and beam); direct and fast-convolution matched filters give the same plot; the same target with the CFAR threshold raised to 45 dB at run time gives no detection; `cfar_pfa()` against the closed form (one look) and the Pfa 1e-8 of the configured threshold; the PRIs of the configured radar are processed, also with a longer record, and PRIs with fewer DDC samples, another receive interval, time of the first DDC sample, DDC rate or stagger position are ignored |
 | `core_phasecode` | the same core test with `config/radar_config_phasecode.bin` (both sub-pulses P4 phase codes with mismatch filters): the echo is the real code, the plot lies on the target cell |
 | `cfar` (`tests/test_cfar.c`) | the CA-CFAR of `processor.c` against direct sums over the training cells: every decision, for the 2-D, 1-D range and 1-D Doppler windows and tested range intervals in the middle, at both range edges (also when the whole interval lies within the cells of the shifted windows) and over all cells |
 | `udp_input` | reassembly with shuffled, duplicate, missing and foreign datagrams; timeouts; record and replay; fuzzing |
